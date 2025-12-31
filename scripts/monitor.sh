@@ -29,9 +29,21 @@ ssh -o StrictHostKeyChecking=no root@$DB_IP "docker exec \$(docker-compose -f /o
 # Client servers status
 echo ""
 echo "🌐 Client Servers:"
+
+# Check Germany client on database server
+echo "📍 germany ($DB_IP):"
+ssh -o StrictHostKeyChecking=no root@$DB_IP "docker ps --format 'table {{.Names}}\t{{.Status}}'" | grep -E "(NAMES|soulseek-germany-client)" || echo "  No Germany client running"
+
+# Check remote client servers
 terraform output -json client_ips | jq -r 'to_entries[] | "\(.key): \(.value)"' | while read line; do
     region=$(echo $line | cut -d: -f1)
     ip=$(echo $line | cut -d: -f2 | tr -d ' ')
     echo "📍 $region ($ip):"
-    ssh -o StrictHostKeyChecking=no root@$ip "docker ps --format 'table {{.Names}}\t{{.Status}}'" | grep -E "(NAMES|soulseek)" || echo "  No client running"
+    
+    # Try to connect and check status
+    if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@$ip "docker ps --format 'table {{.Names}}\t{{.Status}}'" 2>/dev/null | grep -E "(NAMES|soulseek)"; then
+        true  # Status shown above
+    else
+        echo "  ⚠️  Connection failed or no client running"
+    fi
 done
