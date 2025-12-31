@@ -290,12 +290,6 @@ terraform.tfvars
 *.tfstate*
 .terraform/
 
-# Infrastructure scripts (contain deployment details)
-infrastructure.tf
-setup-*.sh
-deploy-*.sh
-test-*.sh
-monitor-*.sh
 maintenance-*.md
 
 # Python
@@ -310,3 +304,4 @@ venv/
 *.swp
 .DS_Store
 /.terraform.lock.hcl
+/.claude/
