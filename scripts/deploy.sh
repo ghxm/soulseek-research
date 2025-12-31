@@ -13,11 +13,12 @@ fi
 
 # Initialize and apply Terraform
 terraform init
-terraform plan
+terraform plan -out=tfplan
 echo "Press Enter to proceed with deployment, Ctrl+C to cancel..."
 read
 
-terraform apply -auto-approve
+terraform apply tfplan
+rm -f tfplan
 
 echo "✅ Infrastructure deployed successfully!"
 echo "Database IP: $(terraform output -raw database_ip)"

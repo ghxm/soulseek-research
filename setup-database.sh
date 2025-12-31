@@ -29,8 +29,8 @@ services:
   database:
     image: postgres:15
     environment:
-      POSTGRES_DB: research
-      POSTGRES_USER: research
+      POSTGRES_DB: soulseek
+      POSTGRES_USER: soulseek
       POSTGRES_PASSWORD: $${DB_PASSWORD:-changeme123}
     volumes:
       - db_data:/var/lib/postgresql/data
@@ -50,7 +50,7 @@ services:
   client:
     image: soulseek-research:latest
     environment:
-      DATABASE_URL: postgresql+asyncpg://research:$${DB_PASSWORD}@localhost:5432/research
+      DATABASE_URL: postgresql+asyncpg://soulseek:$${DB_PASSWORD}@localhost:5432/soulseek
       SOULSEEK_USERNAME: $${SOULSEEK_USERNAME}
       SOULSEEK_PASSWORD: $${SOULSEEK_PASSWORD}
       CLIENT_ID: $${CLIENT_ID:-client}
@@ -66,18 +66,47 @@ EOF
 # Start database
 docker-compose -f database.yml up -d
 
-# Also start Germany client on same server
-cat > client.env << EOF
-DB_HOST=localhost
-DB_PASSWORD=${db_password}
+# Wait for database to be ready
+sleep 10
+
+# Create database tables  
+docker exec $(docker-compose -f database.yml ps -q database) psql -U soulseek -d soulseek -c "
+CREATE TABLE IF NOT EXISTS searches (
+    id SERIAL PRIMARY KEY,
+    client_id VARCHAR(255), 
+    timestamp TIMESTAMPTZ,
+    username TEXT,
+    query TEXT
+);
+CREATE TABLE IF NOT EXISTS archives (
+    id SERIAL PRIMARY KEY,
+    month VARCHAR(7),
+    file_path TEXT,
+    record_count INTEGER,
+    file_size BIGINT,
+    archived_at TIMESTAMPTZ,
+    deleted BOOLEAN DEFAULT FALSE
+);"
+
+# Clone repo and build image for Germany client
+git clone https://github.com/ghxm/soulseek-research.git repo
+docker build -t soulseek-research:latest repo
+
+# Create Germany client environment
+cat > germany-client.env << EOF
+DATABASE_URL=postgresql+asyncpg://soulseek:${db_password}@localhost:5432/soulseek
 SOULSEEK_USERNAME=${germany_username}
 SOULSEEK_PASSWORD=${germany_password}
 CLIENT_ID=germany
+ENCRYPTION_KEY=research_encryption_2025
 EOF
 
-# Clone client config and start
-cp client.yml database-client.yml
-docker-compose -f database-client.yml --env-file client.env up -d
+# Start Germany client with restart policy
+docker run -d \
+  --name soulseek-germany-client \
+  --restart unless-stopped \
+  --env-file /opt/soulseek-research/germany-client.env \
+  soulseek-research:latest
 
 # Create archive script
 cat > /usr/local/bin/monthly-archive.sh << 'ARCHIVE_SCRIPT'
@@ -85,7 +114,7 @@ cat > /usr/local/bin/monthly-archive.sh << 'ARCHIVE_SCRIPT'
 cd /opt/soulseek-research
 
 # Build archive command
-DB_URL="postgresql://research:${db_password}@localhost:5432/research"
+DB_URL="postgresql://soulseek:${db_password}@localhost:5432/soulseek"
 
 # Run archive using Docker
 docker run --rm \

@@ -296,3 +296,5 @@ docker-compose.override.yml
 # Temporary files
 maintenance-*.md
 !/scripts/test-local.sh
+/.terraform.lock.hcl
+/tfplan

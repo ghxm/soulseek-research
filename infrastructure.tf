@@ -43,19 +43,18 @@ variable "germany_credentials" {
   })
 }
 
-# SSH Key
-resource "hcloud_ssh_key" "default" {
-  name       = "soulseek-research"
-  public_key = file("~/.ssh/id_rsa.pub")
+# SSH Key - use existing key by name
+data "hcloud_ssh_key" "default" {
+  name = "soulseek-research"
 }
 
 # Database Server
 resource "hcloud_server" "database" {
   name        = "soulseek-db"
   image       = "ubuntu-22.04"
-  server_type = "cpx11"
+  server_type = "cx33"
   location    = "nbg1"
-  ssh_keys    = [hcloud_ssh_key.default.id]
+  ssh_keys    = [data.hcloud_ssh_key.default.id]
 
   user_data = templatefile("${path.module}/setup-database.sh", {
     db_password = var.db_password
@@ -74,9 +73,9 @@ resource "hcloud_server" "client" {
 
   name        = "soulseek-client-${each.key}"
   image       = "ubuntu-22.04" 
-  server_type = each.key == "singapore" ? "cpx12" : "cpx11"
-  location    = each.key == "us-west" ? "ash" : "fsn1"
-  ssh_keys    = [hcloud_ssh_key.default.id]
+  server_type = each.key == "singapore" ? "cpx11" : "cpx11"
+  location    = each.key == "us-west" ? "ash" : (each.key == "singapore" ? "sin" : "fsn1")
+  ssh_keys    = [data.hcloud_ssh_key.default.id]
 
   user_data = templatefile("${path.module}/setup-client.sh", {
     db_host           = hcloud_server.database.ipv4_address

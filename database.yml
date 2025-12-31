@@ -7,8 +7,8 @@ services:
   database:
     image: postgres:15
     environment:
-      POSTGRES_DB: research
-      POSTGRES_USER: research
+      POSTGRES_DB: soulseek
+      POSTGRES_USER: soulseek
       POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme123}
     volumes:
       - db_data:/var/lib/postgresql/data

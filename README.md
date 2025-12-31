@@ -20,6 +20,28 @@ soulseek-research start \
 
 ### Production Deployment
 
+**Prerequisites**
+- Hetzner Cloud account with SSH key named "soulseek-research"
+- Multiple Soulseek accounts for geographic distribution
+
+**Automated Infrastructure (Recommended)**
+```bash
+# Configure credentials
+cp terraform.tfvars.example terraform.tfvars
+# Edit terraform.tfvars with your tokens and credentials
+
+# Deploy everything
+make deploy
+
+# Monitor deployment  
+make monitor
+
+# Destroy when done
+make destroy
+```
+
+**Manual Deployment**
+
 **1. Database Server**
 ```bash
 git clone <repository>

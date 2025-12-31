@@ -20,11 +20,11 @@ ssh -o StrictHostKeyChecking=no root@$DB_IP "docker-compose -f /opt/soulseek-res
 
 echo ""
 echo "📈 Search Count (last 24h):"
-ssh -o StrictHostKeyChecking=no root@$DB_IP "docker exec \$(docker-compose -f /opt/soulseek-research/database.yml ps -q database) psql -U research -d research -c \"SELECT client_id, COUNT(*) as searches FROM searches WHERE timestamp > NOW() - INTERVAL '24 hours' GROUP BY client_id ORDER BY searches DESC;\""
+ssh -o StrictHostKeyChecking=no root@$DB_IP "docker exec \$(docker-compose -f /opt/soulseek-research/database.yml ps -q database) psql -U soulseek -d soulseek -c \"SELECT client_id, COUNT(*) as searches FROM searches WHERE timestamp > NOW() - INTERVAL '24 hours' GROUP BY client_id ORDER BY searches DESC;\""
 
 echo ""
 echo "📋 Recent Searches:"
-ssh -o StrictHostKeyChecking=no root@$DB_IP "docker exec \$(docker-compose -f /opt/soulseek-research/database.yml ps -q database) psql -U research -d research -c \"SELECT client_id, timestamp, query FROM searches ORDER BY timestamp DESC LIMIT 10;\""
+ssh -o StrictHostKeyChecking=no root@$DB_IP "docker exec \$(docker-compose -f /opt/soulseek-research/database.yml ps -q database) psql -U soulseek -d soulseek -c \"SELECT client_id, timestamp, query FROM searches ORDER BY timestamp DESC LIMIT 10;\""
 
 # Client servers status
 echo ""
@@ -33,5 +33,5 @@ terraform output -json client_ips | jq -r 'to_entries[] | "\(.key): \(.value)"' 
     region=$(echo $line | cut -d: -f1)
     ip=$(echo $line | cut -d: -f2 | tr -d ' ')
     echo "📍 $region ($ip):"
-    ssh -o StrictHostKeyChecking=no root@$ip "docker ps --format 'table {{.Names}}\t{{.Status}}'" | grep -E "(NAMES|client)" || echo "  No client running"
+    ssh -o StrictHostKeyChecking=no root@$ip "docker ps --format 'table {{.Names}}\t{{.Status}}'" | grep -E "(NAMES|soulseek)" || echo "  No client running"
 done

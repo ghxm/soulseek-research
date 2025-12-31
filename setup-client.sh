@@ -7,22 +7,32 @@ sh get-docker.sh
 systemctl enable docker
 systemctl start docker
 
-# Clone repo and start client
-cd /opt
-git clone https://github.com/your-repo/soulseek-research.git
-cd soulseek-research
+# Install docker-compose
+curl -L "https://github.com/docker/compose/releases/download/v2.24.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+chmod +x /usr/local/bin/docker-compose
+ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
 
-# Create environment file
+# Clone repo and build image
+cd /opt
+git clone https://github.com/ghxm/soulseek-research.git
+cd soulseek-research
+docker build -t soulseek-research:latest .
+
+# Create environment file with all required vars
 cat > .env << EOF
-DB_HOST=${db_host}
-DB_PASSWORD=${db_password}
+DATABASE_URL=postgresql+asyncpg://soulseek:${db_password}@${db_host}:5432/soulseek
 SOULSEEK_USERNAME=${soulseek_username}
 SOULSEEK_PASSWORD=${soulseek_password}
 CLIENT_ID=${client_id}
+ENCRYPTION_KEY=research_encryption_2025
 EOF
 
-# Start client
-docker-compose -f client.yml up -d
+# Start client with restart policy
+docker run -d \
+  --name soulseek-client \
+  --restart unless-stopped \
+  --env-file /opt/soulseek-research/.env \
+  soulseek-research:latest
 
 # Set up log rotation
 cat > /etc/logrotate.d/docker << EOF
