@@ -1,0 +1,26 @@
+# Copy this to terraform.tfvars and fill in your values
+
+# Hetzner Cloud API token
+hcloud_token = "your_hetzner_api_token"
+
+# Database password
+db_password = "secure_database_password"
+
+# Soulseek credentials for remote client regions
+# (Germany client runs on database server)
+soulseek_credentials = {
+  "us-west" = {
+    username = "soulseek_us_user" 
+    password = "soulseek_us_pass"
+  }
+  "singapore" = {
+    username = "soulseek_asia_user"
+    password = "soulseek_asia_pass"
+  }
+}
+
+# Germany client credentials (runs on database server)
+germany_credentials = {
+  username = "soulseek_germany_user"
+  password = "soulseek_germany_pass"
+}
