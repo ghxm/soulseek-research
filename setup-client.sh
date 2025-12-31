@@ -27,10 +27,12 @@ CLIENT_ID=${client_id}
 ENCRYPTION_KEY=research_encryption_2025
 EOF
 
-# Start client with restart policy
+# Start client with restart policy and port mapping
 docker run -d \
   --name soulseek-client \
   --restart unless-stopped \
+  -p 60000:60000 \
+  -p 60001:60001 \
   --env-file /opt/soulseek-research/.env \
   soulseek-research:latest
 

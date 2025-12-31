@@ -48,6 +48,32 @@ data "hcloud_ssh_key" "default" {
   name = "soulseek-research"
 }
 
+# Firewall for Soulseek clients
+resource "hcloud_firewall" "soulseek_firewall" {
+  name = "soulseek-research-firewall"
+  
+  rule {
+    direction = "in"
+    source_ips = ["0.0.0.0/0", "::/0"]
+    protocol = "tcp"
+    port = "22"
+  }
+  
+  rule {
+    direction = "in"
+    source_ips = ["0.0.0.0/0", "::/0"]
+    protocol = "tcp"
+    port = "5432"
+  }
+  
+  rule {
+    direction = "in"
+    source_ips = ["0.0.0.0/0", "::/0"] 
+    protocol = "tcp"
+    port = "60000-60001"
+  }
+}
+
 # Database Server
 resource "hcloud_server" "database" {
   name        = "soulseek-db"
@@ -55,6 +81,7 @@ resource "hcloud_server" "database" {
   server_type = "cx33"
   location    = "nbg1"
   ssh_keys    = [data.hcloud_ssh_key.default.id]
+  firewall_ids = [hcloud_firewall.soulseek_firewall.id]
 
   user_data = templatefile("${path.module}/setup-database.sh", {
     db_password = var.db_password
@@ -76,6 +103,7 @@ resource "hcloud_server" "client" {
   server_type = each.key == "singapore" ? "cpx11" : "cpx11"
   location    = each.key == "us-west" ? "ash" : (each.key == "singapore" ? "sin" : "fsn1")
   ssh_keys    = [data.hcloud_ssh_key.default.id]
+  firewall_ids = [hcloud_firewall.soulseek_firewall.id]
 
   user_data = templatefile("${path.module}/setup-client.sh", {
     db_host           = hcloud_server.database.ipv4_address

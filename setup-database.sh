@@ -101,10 +101,12 @@ CLIENT_ID=germany
 ENCRYPTION_KEY=research_encryption_2025
 EOF
 
-# Start Germany client with restart policy
+# Start Germany client with restart policy and port mapping
 docker run -d \
   --name soulseek-germany-client \
   --restart unless-stopped \
+  -p 60000:60000 \
+  -p 60001:60001 \
   --env-file /opt/soulseek-research/germany-client.env \
   soulseek-research:latest
 
