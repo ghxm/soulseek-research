@@ -126,13 +126,14 @@ class ResearchClient:
         self.fernet = Fernet(self.encryption_key)
     
     def encrypt_username(self, username: str) -> str:
-        """Encrypt username for storage"""
+        """Hash username for storage (SHA-256 for compact 64-char output vs 200+ for Fernet)"""
         try:
-            encrypted_bytes = self.fernet.encrypt(username.encode())
-            return base64.urlsafe_b64encode(encrypted_bytes).decode()
+            # Use SHA-256 hash with salt for privacy - much more storage efficient
+            salted = f"{self.encryption_key.decode()}{username}".encode()
+            return hashlib.sha256(salted).hexdigest()
         except Exception as e:
-            logger.error(f"Failed to encrypt username: {e}")
-            # Return a hash as fallback
+            logger.error(f"Failed to hash username: {e}")
+            # Fallback to simple hash
             return hashlib.sha256(username.encode()).hexdigest()
     
     async def _setup_database(self):
