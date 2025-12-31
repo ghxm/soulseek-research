@@ -94,7 +94,7 @@ docker build -t soulseek-research:latest repo
 
 # Create client environment file
 cat > client.env << EOF
-DATABASE_URL=postgresql+asyncpg://soulseek:${db_password}@$(curl -s http://169.254.169.254/metadata/v1/public_ipv4):5432/soulseek
+DATABASE_URL=postgresql+asyncpg://soulseek:${db_password}@172.17.0.1:5432/soulseek
 SOULSEEK_USERNAME=${germany_username}
 SOULSEEK_PASSWORD=${germany_password}
 CLIENT_ID=germany
