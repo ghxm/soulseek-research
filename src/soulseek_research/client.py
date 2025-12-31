@@ -168,8 +168,13 @@ class ResearchClient:
         
         # Keep running
         try:
+            heartbeat_counter = 0
             while self._running:
                 await asyncio.sleep(1)
+                heartbeat_counter += 1
+                # Log heartbeat every 5 minutes (300 seconds) 
+                if heartbeat_counter % 300 == 0:
+                    logger.info(f"💓 Client {self.client_id} heartbeat - {self.searches_logged} searches logged")
         except KeyboardInterrupt:
             pass
         finally:
@@ -195,6 +200,8 @@ class ResearchClient:
     
     async def _on_search_received(self, event: SearchRequestReceivedEvent):
         """Handle search events"""
+        logger.info(f"🔍 Search received: {event.query[:50]}... from {event.username[:10]}...")
+        
         # Encrypt username for privacy
         encrypted_username = self.encrypt_username(event.username)
         
@@ -206,6 +213,7 @@ class ResearchClient:
         )
         
         self._search_queue.append(search)
+        self.searches_logged += 1
         
         # Immediate flush if queue full
         if len(self._search_queue) >= self.batch_size:
