@@ -1,30 +1,27 @@
-"""Simple Soulseek research client"""
+"""Simple Soulseek research client - FIXED VERSION"""
 
 import asyncio
 import base64
 import datetime
-import gzip
 import hashlib
 import logging
 import os
-import tempfile
 from collections import deque
-from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional
 
 from cryptography.fernet import Fernet
 
 from aioslsk.client import SoulSeekClient
 from aioslsk.events import SearchRequestReceivedEvent
-from aioslsk.settings import Settings
+from aioslsk.settings import Settings, CredentialsSettings
 
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.orm import declarative_base, Mapped, mapped_column
-from sqlalchemy import Integer, String, Text, DateTime, Boolean, func, select, delete
+from sqlalchemy import Integer, String, Text, DateTime, func
 
 logger = logging.getLogger(__name__)
 
-# Simple database models
+# Simple database models (no archival here)
 Base = declarative_base()
 
 class SearchRecord(Base):
@@ -37,21 +34,9 @@ class SearchRecord(Base):
     username: Mapped[str] = mapped_column(String(255), nullable=False)
     query: Mapped[str] = mapped_column(Text, nullable=False)
 
-class ArchiveRecord(Base):
-    """Archive tracking"""
-    __tablename__ = 'archives'
-    
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    month: Mapped[str] = mapped_column(String(7), nullable=False)  # YYYY-MM
-    file_path: Mapped[str] = mapped_column(Text, nullable=False)
-    record_count: Mapped[int] = mapped_column(Integer, nullable=False)
-    file_size: Mapped[int] = mapped_column(Integer, nullable=False)
-    archived_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=func.now())
-    deleted: Mapped[bool] = mapped_column(Boolean, default=False)
-
 
 class ResearchClient:
-    """Simple research client for collecting Soulseek searches"""
+    """Simple research client - focus only on search collection"""
     
     def __init__(self, 
                  username: str,
@@ -70,21 +55,42 @@ class ResearchClient:
         # Setup encryption for usernames
         self._setup_encryption(encryption_key)
         
-        # Create aioslsk settings with manual configuration
+        # Configure Settings for distributed network participation
+        from aioslsk.settings import (
+            SharesSettings, DirectoryShareMode, SharedDirectorySettingEntry,
+            NetworkSettings, UpnpSettings
+        )
+
+        # Create a minimal share directory (empty is fine, we just need to show willingness to share)
+        share_dir = "/tmp/soulseek_share"
+        os.makedirs(share_dir, exist_ok=True)
+
         settings = Settings(
-            credentials={
-                'username': username,
-                'password': password
-            },
-            network={'port': 60000}
+            credentials=CredentialsSettings(
+                username=username,
+                password=password
+            ),
+            shares=SharesSettings(
+                directories=[
+                    SharedDirectorySettingEntry(
+                        path=share_dir,
+                        share_mode=DirectoryShareMode.EVERYONE
+                    )
+                ],
+                scan_on_start=True
+            ),
+            network=NetworkSettings(
+                upnp=UpnpSettings(enabled=False)  # Disable UPnP for cloud servers
+            )
         )
         
         # Soulseek client
         self.soulseek_client = SoulSeekClient(settings)
         
-        # Database
+        # Database (will be setup when needed, not blocking startup)
         self.engine = None
         self.session_maker = None
+        self._db_ready = False
         
         # Search queue for batching
         self._search_queue = deque()
@@ -129,42 +135,58 @@ class ResearchClient:
             # Return a hash as fallback
             return hashlib.sha256(username.encode()).hexdigest()
     
-    def decrypt_username(self, encrypted_username: str) -> str:
-        """Decrypt username (for analysis/debugging only)"""
+    async def _setup_database(self):
+        """Setup database connection asynchronously after Soulseek starts"""
+        if self._db_ready:
+            return
+            
         try:
-            encrypted_bytes = base64.urlsafe_b64decode(encrypted_username.encode())
-            decrypted_bytes = self.fernet.decrypt(encrypted_bytes)
-            return decrypted_bytes.decode()
+            logger.info("Setting up database connection...")
+            
+            # Setup database
+            self.engine = create_async_engine(self.database_url)
+            self.session_maker = async_sessionmaker(self.engine)
+            
+            # Create tables
+            async with self.engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            
+            self._db_ready = True
+            logger.info("✅ Database connection ready")
+            
         except Exception as e:
-            logger.error(f"Failed to decrypt username: {e}")
-            return "<encrypted>"
+            logger.error(f"❌ Failed to setup database: {e}")
+            # Continue without database - better than crashing
+            self._db_ready = False
     
     async def start(self):
-        """Start the client"""
+        """Start the client - Soulseek first, database after"""
         logger.info(f"Starting research client {self.client_id}")
         
-        # Setup database
-        self.engine = create_async_engine(self.database_url)
-        self.session_maker = async_sessionmaker(self.engine)
-        
-        # Create tables
-        async with self.engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        
-        # Subscribe to search events
+        # Subscribe to search events FIRST (before starting)
         self.soulseek_client.events.register(
             SearchRequestReceivedEvent,
             self._on_search_received
         )
         
-        # Start soulseek
+        # Start soulseek FIRST - don't let database block this
+        logger.info("Starting Soulseek client...")
         await self.soulseek_client.start()
+        logger.info("✅ Soulseek client connected to server")
+
+        # CRITICAL: Must login to join distributed network and receive searches
+        logger.info("Logging in to Soulseek...")
+        await self.soulseek_client.login()
+        logger.info("✅ Logged in - distributed network active")
+        
+        # Now setup database connection asynchronously
+        await self._setup_database()
         
         # Start batch processor
         self._running = True
         self._batch_task = asyncio.create_task(self._batch_worker())
         
-        logger.info(f"Client {self.client_id} started")
+        logger.info(f"Client {self.client_id} fully started")
         
         # Keep running
         try:
@@ -172,9 +194,10 @@ class ResearchClient:
             while self._running:
                 await asyncio.sleep(1)
                 heartbeat_counter += 1
-                # Log heartbeat every 5 minutes (300 seconds) 
-                if heartbeat_counter % 300 == 0:
-                    logger.info(f"💓 Client {self.client_id} heartbeat - {self.searches_logged} searches logged")
+                # Log heartbeat every 30 seconds for debugging
+                if heartbeat_counter % 30 == 0:
+                    received_count = len(self.soulseek_client.searches.received_searches)
+                    logger.info(f"💓 Client {self.client_id} - logged: {self.searches_logged}, received_searches deque: {received_count}")
         except KeyboardInterrupt:
             pass
         finally:
@@ -228,7 +251,7 @@ class ResearchClient:
     
     async def _flush_searches(self):
         """Flush search queue to database"""
-        if not self._search_queue:
+        if not self._search_queue or not self._db_ready:
             return
             
         batch = list(self._search_queue)
@@ -239,134 +262,9 @@ class ResearchClient:
                 session.add_all(batch)
                 await session.commit()
                 
-            self.searches_logged += len(batch)
             logger.debug(f"Saved {len(batch)} searches (total: {self.searches_logged})")
             
         except Exception as e:
             logger.error(f"Failed to save searches: {e}")
             # Put them back in queue
             self._search_queue.extendleft(reversed(batch))
-    
-    async def archive_month(self, year: int, month: int, 
-                           archive_dir: str = "/tmp/archives", 
-                           delete_after: bool = True) -> Optional[str]:
-        """Archive a month of data to compressed file"""
-        
-        # Date boundaries
-        start_date = datetime.datetime(year, month, 1, tzinfo=datetime.timezone.utc)
-        if month == 12:
-            end_date = datetime.datetime(year + 1, 1, 1, tzinfo=datetime.timezone.utc)
-        else:
-            end_date = datetime.datetime(year, month + 1, 1, tzinfo=datetime.timezone.utc)
-        
-        month_str = f"{year:04d}-{month:02d}"
-        
-        # Check if already archived
-        async with self.session_maker() as session:
-            result = await session.execute(
-                select(ArchiveRecord).where(ArchiveRecord.month == month_str)
-            )
-            if result.scalar_one_or_none():
-                logger.info(f"Month {month_str} already archived")
-                return None
-        
-        # Count records
-        async with self.session_maker() as session:
-            result = await session.execute(
-                select(func.count(SearchRecord.id)).where(
-                    SearchRecord.timestamp >= start_date,
-                    SearchRecord.timestamp < end_date
-                )
-            )
-            record_count = result.scalar() or 0
-        
-        if record_count == 0:
-            logger.info(f"No records found for {month_str}")
-            return None
-        
-        # Export to compressed file
-        Path(archive_dir).mkdir(parents=True, exist_ok=True)
-        archive_path = Path(archive_dir) / f"searches_{month_str}.csv.gz"
-        
-        # Create temporary CSV
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as temp_file:
-            temp_path = Path(temp_file.name)
-            
-            # Export data
-            async with self.session_maker() as session:
-                result = await session.execute(
-                    select(SearchRecord).where(
-                        SearchRecord.timestamp >= start_date,
-                        SearchRecord.timestamp < end_date
-                    ).order_by(SearchRecord.timestamp)
-                )
-                
-                # Write header
-                temp_file.write("client_id,timestamp,username,query\\n")
-                
-                # Write data
-                for record in result.scalars():
-                    # Escape quotes in query
-                    query_escaped = record.query.replace('"', '""')
-                    temp_file.write(f'{record.client_id},{record.timestamp.isoformat()},{record.username},"{query_escaped}"\\n')
-        
-        # Compress
-        with open(temp_path, 'rb') as f_in:
-            with gzip.open(archive_path, 'wb') as f_out:
-                f_out.writelines(f_in)
-        
-        temp_path.unlink()  # Delete temp file
-        
-        file_size = archive_path.stat().st_size
-        
-        # Save archive record
-        archive_record = ArchiveRecord(
-            month=month_str,
-            file_path=str(archive_path),
-            record_count=record_count,
-            file_size=file_size
-        )
-        
-        async with self.session_maker() as session:
-            session.add(archive_record)
-            await session.commit()
-        
-        logger.info(f"Archived {record_count:,} records to {archive_path} ({file_size:,} bytes)")
-        
-        # Delete from main table if requested
-        if delete_after:
-            async with self.session_maker() as session:
-                await session.execute(
-                    delete(SearchRecord).where(
-                        SearchRecord.timestamp >= start_date,
-                        SearchRecord.timestamp < end_date
-                    )
-                )
-                await session.commit()
-                
-                # Mark as deleted
-                archive_record.deleted = True
-                session.add(archive_record)
-                await session.commit()
-            
-            logger.info(f"Deleted {record_count:,} records from main table")
-        
-        return str(archive_path)
-    
-    async def get_stats(self) -> Dict[str, Any]:
-        """Get client stats"""
-        async with self.session_maker() as session:
-            result = await session.execute(select(func.count(SearchRecord.id)))
-            total_in_db = result.scalar() or 0
-            
-            result = await session.execute(select(func.count(ArchiveRecord.id)))
-            total_archives = result.scalar() or 0
-        
-        return {
-            "client_id": self.client_id,
-            "running": self._running,
-            "searches_logged": self.searches_logged,
-            "pending_batch": len(self._search_queue),
-            "total_in_database": total_in_db,
-            "total_archives": total_archives
-        }
