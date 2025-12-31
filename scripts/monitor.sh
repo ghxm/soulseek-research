@@ -32,7 +32,7 @@ echo "🌐 Client Servers:"
 
 # Check Germany client on database server
 echo "📍 germany ($DB_IP):"
-ssh -o StrictHostKeyChecking=no root@$DB_IP "docker ps --format 'table {{.Names}}\t{{.Status}}'" | grep -E "(NAMES|soulseek-germany-client)" || echo "  No Germany client running"
+ssh -o StrictHostKeyChecking=no root@$DB_IP "docker ps --format 'table {{.Names}}\t{{.Status}}'" | grep -E "(NAMES|soulseek-client)" || echo "  No Germany client running"
 
 # Check remote client servers
 terraform output -json client_ips | jq -r 'to_entries[] | "\(.key): \(.value)"' | while read line; do

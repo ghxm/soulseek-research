@@ -92,22 +92,22 @@ CREATE TABLE IF NOT EXISTS archives (
 git clone https://github.com/ghxm/soulseek-research.git repo
 docker build -t soulseek-research:latest repo
 
-# Create Germany client environment
-cat > germany-client.env << EOF
-DATABASE_URL=postgresql+asyncpg://soulseek:${db_password}@localhost:5432/soulseek
+# Create client environment file
+cat > client.env << EOF
+DATABASE_URL=postgresql+asyncpg://soulseek:${db_password}@$(curl -s http://169.254.169.254/metadata/v1/public_ipv4):5432/soulseek
 SOULSEEK_USERNAME=${germany_username}
 SOULSEEK_PASSWORD=${germany_password}
 CLIENT_ID=germany
 ENCRYPTION_KEY=research_encryption_2025
 EOF
 
-# Start Germany client with restart policy and port mapping
+# Start client with restart policy and port mapping
 docker run -d \
-  --name soulseek-germany-client \
+  --name soulseek-client \
   --restart unless-stopped \
   -p 60000:60000 \
   -p 60001:60001 \
-  --env-file /opt/soulseek-research/germany-client.env \
+  --env-file /opt/soulseek-research/client.env \
   soulseek-research:latest
 
 # Create archive script
