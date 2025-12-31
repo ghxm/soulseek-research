@@ -1,0 +1,16 @@
+# Client docker-compose  
+# Deploy this on each client server in different regions
+
+version: '3.8'
+
+services:
+  client:
+    build: .
+    env_file: .env
+    networks:
+      - soulseek-research_default
+    restart: unless-stopped
+
+networks:
+  soulseek-research_default:
+    external: true
