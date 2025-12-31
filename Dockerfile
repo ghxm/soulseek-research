@@ -12,11 +12,12 @@ RUN uv sync
 
 # Create entrypoint script
 RUN echo '#!/bin/bash\n\
-uv run soulseek-research start \\\n\
+uv run soulseek-research --log-level "${LOG_LEVEL:-INFO}" start \\\n\
   --username "$SOULSEEK_USERNAME" \\\n\
   --password "$SOULSEEK_PASSWORD" \\\n\
   --database-url "$DATABASE_URL" \\\n\
-  --client-id "${CLIENT_ID:-client}"' > /app/entrypoint.sh
+  --client-id "${CLIENT_ID:-client}" \\\n\
+  --encryption-key "$ENCRYPTION_KEY"' > /app/entrypoint.sh
 
 RUN chmod +x /app/entrypoint.sh
 
