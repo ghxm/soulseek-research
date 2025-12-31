@@ -290,18 +290,9 @@ terraform.tfvars
 *.tfstate*
 .terraform/
 
+# Docker
+docker-compose.override.yml
+
+# Temporary files
 maintenance-*.md
-
-# Python
-__pycache__/
-*.pyc
-.venv/
-venv/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-.DS_Store
-/.terraform.lock.hcl
-/.claude/
+!/scripts/test-local.sh
