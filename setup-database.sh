@@ -111,7 +111,7 @@ docker run -d \
   soulseek-research:latest
 
 # Create archive script
-cat > /usr/local/bin/monthly-archive.sh << 'ARCHIVE_SCRIPT'
+cat > /usr/local/bin/weekly-archive.sh << 'ARCHIVE_SCRIPT'
 #!/bin/bash
 cd /opt/soulseek-research
 
@@ -127,13 +127,13 @@ docker run --rm \
   soulseek-research archive --database-url "$DB_URL" --archive-path /archives
 
 # Log the result
-echo "$(date): Monthly archive completed" >> /var/log/soulseek-archive.log
+echo "$(date): Weekly archive completed" >> /var/log/soulseek-archive.log
 ARCHIVE_SCRIPT
 
-chmod +x /usr/local/bin/monthly-archive.sh
+chmod +x /usr/local/bin/weekly-archive.sh
 
-# Set up monthly cron job (runs on 1st of each month at 2 AM)
-echo "0 2 1 * * /usr/local/bin/monthly-archive.sh" | crontab -
+# Set up weekly cron job (runs every Sunday at 2 AM)
+echo "0 2 * * 0 /usr/local/bin/weekly-archive.sh" | crontab -
 
 # Set up log rotation
 cat > /etc/logrotate.d/docker << EOF
