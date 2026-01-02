@@ -46,14 +46,41 @@ def get_db_connection():
     )
 
 
+def get_deduplication_cte() -> str:
+    """
+    Returns a CTE that deduplicates searches within 5-minute windows.
+
+    This handles the case where the same search is distributed to multiple
+    clients, resulting in duplicate entries. We only keep the first occurrence
+    within each 5-minute window for the same username+query combination.
+    """
+    return """
+        WITH ranked_searches AS (
+            SELECT *,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY username, query,
+                                    FLOOR(EXTRACT(EPOCH FROM timestamp) / 300)
+                       ORDER BY timestamp
+                   ) as rn
+            FROM searches
+        ),
+        deduplicated_searches AS (
+            SELECT id, client_id, timestamp, username, query
+            FROM ranked_searches
+            WHERE rn = 1
+        )
+    """
+
+
 def query_daily_stats(conn, days: int = 7) -> pd.DataFrame:
-    """Query daily search counts per client for the last N days"""
-    query = """
+    """Query daily search counts per client for the last N days (deduplicated)"""
+    query = f"""
+        {get_deduplication_cte()}
         SELECT
             client_id,
             DATE(timestamp) as date,
             COUNT(*) as search_count
-        FROM searches
+        FROM deduplicated_searches
         WHERE timestamp >= NOW() - INTERVAL '%s days'
         GROUP BY client_id, DATE(timestamp)
         ORDER BY date DESC, client_id
@@ -62,18 +89,16 @@ def query_daily_stats(conn, days: int = 7) -> pd.DataFrame:
 
 
 def query_top_queries(conn, limit: int = 100) -> List[tuple]:
-    """Query most searched queries (deduplicated by user)"""
-    query = """
+    """Query most searched queries (deduplicated)"""
+    query = f"""
+        {get_deduplication_cte()}
         SELECT
             query,
             COUNT(DISTINCT username) as unique_users,
-            COUNT(*) as user_query_pairs
-        FROM (
-            SELECT DISTINCT username, query
-            FROM searches
-        ) AS unique_searches
+            COUNT(*) as total_searches
+        FROM deduplicated_searches
         GROUP BY query
-        ORDER BY user_query_pairs DESC
+        ORDER BY total_searches DESC
         LIMIT %s
     """
     cursor = conn.cursor()
@@ -84,16 +109,14 @@ def query_top_queries(conn, limit: int = 100) -> List[tuple]:
 
 
 def query_most_active_users(conn, limit: int = 50) -> List[tuple]:
-    """Query most active users by search count (deduplicated by client_id)"""
-    query = """
+    """Query most active users by search count (deduplicated)"""
+    query = f"""
+        {get_deduplication_cte()}
         SELECT
             username,
             COUNT(*) as search_count,
             COUNT(DISTINCT query) as unique_queries
-        FROM (
-            SELECT DISTINCT username, client_id, query
-            FROM searches
-        ) AS deduplicated
+        FROM deduplicated_searches
         GROUP BY username
         ORDER BY search_count DESC
         LIMIT %s
@@ -105,47 +128,14 @@ def query_most_active_users(conn, limit: int = 50) -> List[tuple]:
     return results
 
 
-def query_geographic_comparison(conn, limit: int = 30) -> Dict[str, List[tuple]]:
-    """Query top searches by geographic region"""
-    query = """
-        SELECT
-            query,
-            COUNT(DISTINCT username) as unique_users
-        FROM (
-            SELECT DISTINCT username, client_id, query
-            FROM searches
-            WHERE client_id = %s
-              AND timestamp >= NOW() - INTERVAL '7 days'
-        ) AS deduplicated
-        GROUP BY query
-        ORDER BY unique_users DESC
-        LIMIT %s
-    """
-    cursor = conn.cursor()
-
-    # Get unique client IDs
-    cursor.execute("SELECT DISTINCT client_id FROM searches")
-    clients = [row[0] for row in cursor.fetchall()]
-
-    results = {}
-    for client_id in clients:
-        cursor.execute(query, (client_id, limit))
-        results[client_id] = cursor.fetchall()
-
-    cursor.close()
-    return results
-
-
 def query_query_length_distribution(conn) -> pd.DataFrame:
-    """Query distribution of search query lengths"""
-    query = """
+    """Query distribution of search query lengths (deduplicated)"""
+    query = f"""
+        {get_deduplication_cte()}
         SELECT
             LENGTH(query) as query_length,
             COUNT(*) as count
-        FROM (
-            SELECT DISTINCT username, client_id, query
-            FROM searches
-        ) AS deduplicated
+        FROM deduplicated_searches
         GROUP BY LENGTH(query)
         ORDER BY query_length
     """
@@ -153,12 +143,13 @@ def query_query_length_distribution(conn) -> pd.DataFrame:
 
 
 def query_temporal_patterns(conn) -> pd.DataFrame:
-    """Query searches by hour of day"""
-    query = """
+    """Query searches by hour of day (deduplicated)"""
+    query = f"""
+        {get_deduplication_cte()}
         SELECT
             EXTRACT(HOUR FROM timestamp) as hour,
             COUNT(*) as search_count
-        FROM searches
+        FROM deduplicated_searches
         WHERE timestamp >= NOW() - INTERVAL '7 days'
         GROUP BY EXTRACT(HOUR FROM timestamp)
         ORDER BY hour
@@ -167,17 +158,15 @@ def query_temporal_patterns(conn) -> pd.DataFrame:
 
 
 def query_trending_searches(conn, days: int = 7) -> pd.DataFrame:
-    """Query trending searches over the last N days"""
-    query = """
+    """Query trending searches over the last N days (deduplicated)"""
+    query = f"""
+        {get_deduplication_cte()}
         SELECT
             DATE(timestamp) as date,
             query,
             COUNT(DISTINCT username) as unique_users
-        FROM (
-            SELECT DISTINCT username, client_id, timestamp, query
-            FROM searches
-            WHERE timestamp >= NOW() - INTERVAL '%s days'
-        ) AS deduplicated
+        FROM deduplicated_searches
+        WHERE timestamp >= NOW() - INTERVAL '%s days'
         GROUP BY DATE(timestamp), query
         HAVING COUNT(DISTINCT username) >= 3
         ORDER BY date DESC, unique_users DESC
@@ -186,10 +175,11 @@ def query_trending_searches(conn, days: int = 7) -> pd.DataFrame:
 
 
 def query_all_queries_sample(conn, limit: int = 10000) -> List[str]:
-    """Query sample of queries for pattern analysis"""
-    query = """
-        SELECT DISTINCT query
-        FROM searches
+    """Query sample of queries for pattern analysis (deduplicated)"""
+    query = f"""
+        {get_deduplication_cte()}
+        SELECT query
+        FROM deduplicated_searches
         WHERE timestamp >= NOW() - INTERVAL '7 days'
         LIMIT %s
     """
@@ -278,29 +268,31 @@ def analyze_term_cooccurrence(queries: List[str], min_freq: int = 5) -> List[Tup
 
 
 def query_total_stats(conn) -> Dict[str, Any]:
-    """Query overall statistics"""
+    """Query overall statistics (deduplicated)"""
     cursor = conn.cursor()
+    dedup_cte = get_deduplication_cte()
 
-    # Total searches
-    cursor.execute("SELECT COUNT(*) FROM searches")
+    # Total searches (deduplicated)
+    cursor.execute(f"{dedup_cte} SELECT COUNT(*) FROM deduplicated_searches")
     total_searches = cursor.fetchone()[0]
 
     # Total unique users
-    cursor.execute("SELECT COUNT(DISTINCT username) FROM searches")
+    cursor.execute(f"{dedup_cte} SELECT COUNT(DISTINCT username) FROM deduplicated_searches")
     total_users = cursor.fetchone()[0]
 
     # Total unique queries
-    cursor.execute("SELECT COUNT(DISTINCT query) FROM searches")
+    cursor.execute(f"{dedup_cte} SELECT COUNT(DISTINCT query) FROM deduplicated_searches")
     total_queries = cursor.fetchone()[0]
 
     # Date range
-    cursor.execute("SELECT MIN(timestamp), MAX(timestamp) FROM searches")
+    cursor.execute(f"{dedup_cte} SELECT MIN(timestamp), MAX(timestamp) FROM deduplicated_searches")
     date_range = cursor.fetchone()
 
     # Per-client totals
-    cursor.execute("""
+    cursor.execute(f"""
+        {dedup_cte}
         SELECT client_id, COUNT(*) as count
-        FROM searches
+        FROM deduplicated_searches
         GROUP BY client_id
         ORDER BY count DESC
     """)
@@ -430,50 +422,6 @@ def create_temporal_hourly_chart(df: pd.DataFrame) -> go.Figure:
         plot_bgcolor='white',
         paper_bgcolor='white',
         font=dict(color='black')
-    )
-
-    return fig
-
-
-def create_geographic_comparison_chart(geo_data: Dict[str, List[tuple]]) -> go.Figure:
-    """Create comparison of top searches across geographic regions"""
-    if not geo_data:
-        return None
-
-    # Create subplots for each region
-    num_regions = len(geo_data)
-    fig = make_subplots(
-        rows=1, cols=num_regions,
-        subplot_titles=list(geo_data.keys()),
-        horizontal_spacing=0.1
-    )
-
-    greys = ['#000000', '#333333', '#555555']
-
-    for idx, (region, queries) in enumerate(geo_data.items(), 1):
-        if queries:
-            top_10 = queries[:10]
-            query_names = [q[0][:30] for q in top_10][::-1]  # Truncate and reverse
-            counts = [q[1] for q in top_10][::-1]
-
-            fig.add_trace(
-                go.Bar(
-                    y=query_names,
-                    x=counts,
-                    orientation='h',
-                    marker=dict(color=greys[idx % len(greys)], line=dict(color='black', width=1)),
-                    showlegend=False
-                ),
-                row=1, col=idx
-            )
-
-    fig.update_layout(
-        title='Top Searches by Geographic Region (Last 7 Days)',
-        height=600,
-        template='plotly_white',
-        plot_bgcolor='white',
-        paper_bgcolor='white',
-        font=dict(color='black', size=10)
     )
 
     return fig
@@ -808,11 +756,22 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure]) -> str:
 
         <p class="timestamp">Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
 
+        <div style="background: #f5f5f5; padding: 20px; margin: 20px 0; border-left: 4px solid #333;">
+            <h3 style="margin-top: 0; color: #333;">Data Deduplication Note</h3>
+            <p style="margin-bottom: 0; color: #666;">
+                All statistics shown below are <strong>deduplicated within 5-minute windows</strong>.
+                Because Soulseek distributes searches across multiple clients, the same search from one user
+                can appear on 2-3 of our geographic clients simultaneously. Our analysis automatically removes
+                these duplicates by grouping searches with the same username and query within 5-minute intervals,
+                keeping only the first occurrence. This ensures accurate counts and prevents inflated statistics.
+            </p>
+        </div>
+
         <div class="stats-grid">
             <div class="stat-card">
                 <h3>Total Searches</h3>
                 <div class="value">{stats['total_searches']:,}</div>
-                <div class="label">Collected searches</div>
+                <div class="label">Deduplicated searches</div>
             </div>
             <div class="stat-card">
                 <h3>Unique Users</h3>
@@ -856,11 +815,6 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure]) -> str:
         <h2>Temporal Analysis</h2>
         <div class="chart">
             {chart_html.get('temporal_hourly', '<p>Not enough data</p>')}
-        </div>
-
-        <h2>Geographic Comparison</h2>
-        <div class="chart">
-            {chart_html.get('geographic_comparison', '<p>Not enough data</p>')}
         </div>
 
         <h2>Search Term Analysis</h2>
@@ -908,9 +862,6 @@ def main():
         query_sample = query_all_queries_sample(conn, limit=10000)
         query_patterns = analyze_query_patterns(query_sample)
 
-        print("Analyzing geographic patterns...")
-        geo_comparison = query_geographic_comparison(conn, limit=30)
-
         print("Analyzing temporal patterns...")
         temporal_data = query_temporal_patterns(conn)
         query_length_data = query_query_length_distribution(conn)
@@ -922,7 +873,7 @@ def main():
         print("Analyzing term co-occurrence...")
         cooccurrences = analyze_term_cooccurrence(query_sample, min_freq=10)
 
-        print(f"Found {stats['total_searches']:,} total searches")
+        print(f"Found {stats['total_searches']:,} total searches (deduplicated)")
         print(f"Creating visualizations...")
 
         # Create all figures
@@ -933,7 +884,6 @@ def main():
             'client_distribution': create_client_distribution_chart(stats['client_totals']),
             'query_patterns': create_query_pattern_chart(query_patterns),
             'temporal_hourly': create_temporal_hourly_chart(temporal_data),
-            'geographic_comparison': create_geographic_comparison_chart(geo_comparison),
             'query_length': create_query_length_chart(query_length_data),
             'ngrams': create_ngram_chart(bigrams, trigrams),
             'cooccurrence': create_cooccurrence_chart(cooccurrences)
