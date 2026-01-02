@@ -43,6 +43,12 @@ variable "germany_credentials" {
   })
 }
 
+variable "encryption_key" {
+  description = "Encryption key for username hashing (keep secret)"
+  type        = string
+  sensitive   = true
+}
+
 # SSH Key - use existing key by name
 data "hcloud_ssh_key" "default" {
   name = "soulseek-research"
@@ -87,6 +93,7 @@ resource "hcloud_server" "database" {
     db_password = var.db_password
     germany_username = var.germany_credentials.username
     germany_password = var.germany_credentials.password
+    encryption_key = var.encryption_key
   })
 
   labels = {
@@ -111,6 +118,7 @@ resource "hcloud_server" "client" {
     soulseek_username = each.value.username
     soulseek_password = each.value.password
     client_id         = each.key
+    encryption_key    = var.encryption_key
   })
 
   depends_on = [hcloud_server.database]

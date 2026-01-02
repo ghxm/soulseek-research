@@ -24,7 +24,7 @@ DATABASE_URL=postgresql+asyncpg://soulseek:${db_password}@${db_host}:5432/soulse
 SOULSEEK_USERNAME=${soulseek_username}
 SOULSEEK_PASSWORD=${soulseek_password}
 CLIENT_ID=${client_id}
-ENCRYPTION_KEY=research_encryption_2025
+ENCRYPTION_KEY=${encryption_key}
 EOF
 
 # Start client with restart policy and port mapping

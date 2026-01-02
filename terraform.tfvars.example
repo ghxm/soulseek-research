@@ -6,6 +6,9 @@ hcloud_token = "your_hetzner_api_token"
 # Database password
 db_password = "secure_database_password"
 
+# Encryption key for username hashing (KEEP SECRET - do not commit!)
+encryption_key = "your_encryption_key_here"
+
 # Soulseek credentials for remote client regions
 # (Germany client runs on database server)
 soulseek_credentials = {
