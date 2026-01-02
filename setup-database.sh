@@ -16,49 +16,12 @@ ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
 mkdir -p /opt/archives
 chmod 755 /opt/archives
 
-# Create project directory and files
+# Clone repo first to use existing files
 cd /opt
-mkdir -p soulseek-research
+git clone https://github.com/ghxm/soulseek-research.git
 cd soulseek-research
 
-# Create database.yml file directly
-cat > database.yml << 'DBCOMPOSE'
-version: '3.8'
-
-services:
-  database:
-    image: postgres:15
-    environment:
-      POSTGRES_DB: soulseek
-      POSTGRES_USER: soulseek
-      POSTGRES_PASSWORD: $${DB_PASSWORD:-changeme123}
-    volumes:
-      - db_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
-    restart: unless-stopped
-
-volumes:
-  db_data:
-DBCOMPOSE
-
-# Create client.yml file directly  
-cat > client.yml << 'CLIENTCOMPOSE'
-version: '3.8'
-
-services:
-  client:
-    image: soulseek-research:latest
-    environment:
-      DATABASE_URL: postgresql+asyncpg://soulseek:$${DB_PASSWORD}@localhost:5432/soulseek
-      SOULSEEK_USERNAME: $${SOULSEEK_USERNAME}
-      SOULSEEK_PASSWORD: $${SOULSEEK_PASSWORD}
-      CLIENT_ID: $${CLIENT_ID:-client}
-      ENCRYPTION_KEY: research_encryption_2025
-    restart: unless-stopped
-CLIENTCOMPOSE
-
-# Create environment file
+# Create environment file for database.yml
 cat > .env << EOF
 DB_PASSWORD=${db_password}
 EOF
@@ -88,9 +51,8 @@ CREATE TABLE IF NOT EXISTS archives (
     deleted BOOLEAN DEFAULT FALSE
 );"
 
-# Clone repo and build image for Germany client
-git clone https://github.com/ghxm/soulseek-research.git repo
-docker build -t soulseek-research:latest repo
+# Build image for Germany client (repo already cloned above)
+docker build -t soulseek-research:latest .
 
 # Create client environment file
 cat > client.env << EOF
