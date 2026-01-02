@@ -169,18 +169,19 @@ def create_daily_flow_chart(df: pd.DataFrame) -> go.Figure:
     """Create line chart showing daily search flow per client"""
     fig = go.Figure()
 
-    # Get unique clients
+    # Get unique clients with greyscale colors
     clients = df['client_id'].unique()
+    greys = ['#000000', '#555555', '#999999', '#333333', '#777777']
 
-    for client in clients:
+    for i, client in enumerate(clients):
         client_data = df[df['client_id'] == client].sort_values('date')
         fig.add_trace(go.Scatter(
             x=client_data['date'],
             y=client_data['search_count'],
             mode='lines+markers',
             name=client,
-            line=dict(width=2),
-            marker=dict(size=8)
+            line=dict(width=2, color=greys[i % len(greys)]),
+            marker=dict(size=8, color=greys[i % len(greys)])
         ))
 
     fig.update_layout(
@@ -189,7 +190,10 @@ def create_daily_flow_chart(df: pd.DataFrame) -> go.Figure:
         yaxis_title='Number of Searches',
         hovermode='x unified',
         height=500,
-        template='plotly_white'
+        template='plotly_white',
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        font=dict(color='black')
     )
 
     return fig
@@ -205,7 +209,7 @@ def create_top_queries_chart(top_queries: List[tuple]) -> go.Figure:
             y=queries[::-1],  # Reverse for better display
             x=counts[::-1],
             orientation='h',
-            marker=dict(color='steelblue')
+            marker=dict(color='#333333', line=dict(color='black', width=1))
         )
     ])
 
@@ -214,7 +218,10 @@ def create_top_queries_chart(top_queries: List[tuple]) -> go.Figure:
         xaxis_title='Number of Unique Users',
         yaxis_title='Query',
         height=600,
-        template='plotly_white'
+        template='plotly_white',
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        font=dict(color='black')
     )
 
     return fig
@@ -251,6 +258,9 @@ def create_query_clustering_chart(queries: List[str]) -> go.Figure:
             'cluster': clusters
         })
 
+        # Create greyscale color palette for clusters
+        grey_palette = ['#000000', '#333333', '#666666', '#999999', '#222222', '#555555', '#777777', '#444444']
+
         fig = px.scatter(
             df_plot,
             x='x',
@@ -259,11 +269,17 @@ def create_query_clustering_chart(queries: List[str]) -> go.Figure:
             hover_data=['query'],
             title='Query Clusters (Word Embedding Visualization)',
             labels={'x': 'PCA Component 1', 'y': 'PCA Component 2'},
-            height=600
+            height=600,
+            color_discrete_sequence=grey_palette
         )
 
-        fig.update_traces(marker=dict(size=8, opacity=0.6))
-        fig.update_layout(template='plotly_white')
+        fig.update_traces(marker=dict(size=8, opacity=0.6, line=dict(color='black', width=0.5)))
+        fig.update_layout(
+            template='plotly_white',
+            plot_bgcolor='white',
+            paper_bgcolor='white',
+            font=dict(color='black')
+        )
 
         return fig
 
@@ -283,7 +299,7 @@ def create_user_activity_chart(top_users: List[tuple]) -> go.Figure:
             y=user_labels[::-1],
             x=search_counts[::-1],
             orientation='h',
-            marker=dict(color='coral')
+            marker=dict(color='#555555', line=dict(color='black', width=1))
         )
     ])
 
@@ -292,7 +308,10 @@ def create_user_activity_chart(top_users: List[tuple]) -> go.Figure:
         xaxis_title='Total Searches',
         yaxis_title='User ID',
         height=600,
-        template='plotly_white'
+        template='plotly_white',
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        font=dict(color='black')
     )
 
     return fig
@@ -300,18 +319,24 @@ def create_user_activity_chart(top_users: List[tuple]) -> go.Figure:
 
 def create_client_distribution_chart(client_totals: Dict[str, int]) -> go.Figure:
     """Create pie chart of search distribution by client"""
+    # Greyscale palette for pie chart
+    grey_palette = ['#000000', '#555555', '#999999', '#333333', '#777777']
+
     fig = go.Figure(data=[
         go.Pie(
             labels=list(client_totals.keys()),
             values=list(client_totals.values()),
-            hole=0.3
+            hole=0.3,
+            marker=dict(colors=grey_palette, line=dict(color='white', width=2))
         )
     ])
 
     fig.update_layout(
         title='Search Distribution by Geographic Client',
         height=400,
-        template='plotly_white'
+        template='plotly_white',
+        paper_bgcolor='white',
+        font=dict(color='black')
     )
 
     return fig
@@ -340,26 +365,26 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure]) -> str:
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
             margin: 0;
             padding: 20px;
-            background: #f5f5f5;
+            background: white;
         }}
         .container {{
             max-width: 1400px;
             margin: 0 auto;
             background: white;
             padding: 30px;
-            border-radius: 8px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
         }}
         h1 {{
-            color: #333;
-            border-bottom: 3px solid #4CAF50;
+            color: black;
+            border-bottom: 2px solid black;
             padding-bottom: 10px;
+            font-weight: 600;
         }}
         h2 {{
-            color: #555;
+            color: black;
             margin-top: 40px;
-            border-left: 4px solid #4CAF50;
-            padding-left: 15px;
+            border-bottom: 1px solid #ccc;
+            padding-bottom: 8px;
+            font-weight: 600;
         }}
         .stats-grid {{
             display: grid;
@@ -368,29 +393,33 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure]) -> str:
             margin: 30px 0;
         }}
         .stat-card {{
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
+            background: white;
+            color: black;
             padding: 20px;
-            border-radius: 8px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            border: 1px solid #333;
         }}
         .stat-card h3 {{
             margin: 0;
             font-size: 14px;
-            opacity: 0.9;
-            font-weight: 500;
+            font-weight: 400;
+            color: #666;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
         }}
         .stat-card .value {{
             font-size: 32px;
-            font-weight: bold;
+            font-weight: 600;
             margin: 10px 0;
+            color: black;
         }}
         .stat-card .label {{
             font-size: 12px;
-            opacity: 0.8;
+            color: #999;
         }}
         .chart {{
             margin: 30px 0;
+            border: 1px solid #eee;
+            padding: 10px;
         }}
         .footer {{
             margin-top: 50px;
@@ -399,6 +428,11 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure]) -> str:
             font-size: 14px;
             border-top: 1px solid #eee;
             padding-top: 20px;
+        }}
+        .footer a {{
+            color: #666;
+            text-decoration: none;
+            border-bottom: 1px solid #666;
         }}
         .timestamp {{
             color: #666;
