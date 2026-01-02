@@ -86,13 +86,16 @@ def query_top_queries(conn, limit: int = 100) -> List[tuple]:
 
 
 def query_most_active_users(conn, limit: int = 50) -> List[tuple]:
-    """Query most active users by search count"""
+    """Query most active users by search count (deduplicated by client_id)"""
     query = """
         SELECT
             username,
             COUNT(*) as search_count,
             COUNT(DISTINCT query) as unique_queries
-        FROM searches
+        FROM (
+            SELECT DISTINCT username, client_id, query
+            FROM searches
+        ) AS deduplicated
         GROUP BY username
         ORDER BY search_count DESC
         LIMIT %s
@@ -104,24 +107,65 @@ def query_most_active_users(conn, limit: int = 50) -> List[tuple]:
     return results
 
 
-def query_all_queries_for_clustering(conn, limit: int = 5000) -> List[str]:
-    """Query recent queries for clustering analysis (deduplicated by user)"""
+def query_geographic_comparison(conn, limit: int = 30) -> Dict[str, List[tuple]]:
+    """Query top searches by geographic region"""
     query = """
-        SELECT query
+        SELECT
+            query,
+            COUNT(DISTINCT username) as unique_users
         FROM (
-            SELECT DISTINCT username, query
+            SELECT DISTINCT username, client_id, query
             FROM searches
-            WHERE timestamp >= NOW() - INTERVAL '7 days'
-        ) AS unique_searches
+            WHERE client_id = %s
+              AND timestamp >= NOW() - INTERVAL '7 days'
+        ) AS deduplicated
         GROUP BY query
-        ORDER BY COUNT(*) DESC
+        ORDER BY unique_users DESC
         LIMIT %s
     """
     cursor = conn.cursor()
-    cursor.execute(query, (limit,))
-    results = [row[0] for row in cursor.fetchall()]
+
+    # Get unique client IDs
+    cursor.execute("SELECT DISTINCT client_id FROM searches")
+    clients = [row[0] for row in cursor.fetchall()]
+
+    results = {}
+    for client_id in clients:
+        cursor.execute(query, (client_id, limit))
+        results[client_id] = cursor.fetchall()
+
     cursor.close()
     return results
+
+
+def query_query_length_distribution(conn) -> pd.DataFrame:
+    """Query distribution of search query lengths"""
+    query = """
+        SELECT
+            LENGTH(query) as query_length,
+            COUNT(*) as count
+        FROM (
+            SELECT DISTINCT username, client_id, query
+            FROM searches
+        ) AS deduplicated
+        GROUP BY LENGTH(query)
+        ORDER BY query_length
+    """
+    return pd.read_sql_query(query, conn)
+
+
+def query_temporal_patterns(conn) -> pd.DataFrame:
+    """Query searches by hour of day"""
+    query = """
+        SELECT
+            EXTRACT(HOUR FROM timestamp) as hour,
+            COUNT(*) as search_count
+        FROM searches
+        WHERE timestamp >= NOW() - INTERVAL '7 days'
+        GROUP BY EXTRACT(HOUR FROM timestamp)
+        ORDER BY hour
+    """
+    return pd.read_sql_query(query, conn)
 
 
 def query_total_stats(conn) -> Dict[str, Any]:
