@@ -64,15 +64,18 @@ def query_daily_stats(conn, days: int = 7) -> pd.DataFrame:
 
 
 def query_top_queries(conn, limit: int = 100) -> List[tuple]:
-    """Query most searched queries (deduplicated)"""
+    """Query most searched queries (deduplicated by user)"""
     query = """
         SELECT
             query,
             COUNT(DISTINCT username) as unique_users,
-            COUNT(*) as total_searches
-        FROM searches
+            COUNT(*) as user_query_pairs
+        FROM (
+            SELECT DISTINCT username, query
+            FROM searches
+        ) AS unique_searches
         GROUP BY query
-        ORDER BY total_searches DESC
+        ORDER BY user_query_pairs DESC
         LIMIT %s
     """
     cursor = conn.cursor()
@@ -102,11 +105,16 @@ def query_most_active_users(conn, limit: int = 50) -> List[tuple]:
 
 
 def query_all_queries_for_clustering(conn, limit: int = 5000) -> List[str]:
-    """Query recent queries for clustering analysis"""
+    """Query recent queries for clustering analysis (deduplicated by user)"""
     query = """
-        SELECT DISTINCT query
-        FROM searches
-        WHERE timestamp >= NOW() - INTERVAL '7 days'
+        SELECT query
+        FROM (
+            SELECT DISTINCT username, query
+            FROM searches
+            WHERE timestamp >= NOW() - INTERVAL '7 days'
+        ) AS unique_searches
+        GROUP BY query
+        ORDER BY COUNT(*) DESC
         LIMIT %s
     """
     cursor = conn.cursor()
@@ -202,8 +210,8 @@ def create_top_queries_chart(top_queries: List[tuple]) -> go.Figure:
     ])
 
     fig.update_layout(
-        title='Top 20 Most Searched Queries',
-        xaxis_title='Total Searches',
+        title='Top 20 Most Searched Queries (Unique Users)',
+        xaxis_title='Number of Unique Users',
         yaxis_title='Query',
         height=600,
         template='plotly_white'
