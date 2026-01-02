@@ -6,9 +6,10 @@ Queries the database and creates visualizations for GitHub Pages.
 
 import os
 import json
+import re
 from datetime import datetime, timedelta, timezone
-from collections import Counter
-from typing import List, Dict, Any
+from collections import Counter, defaultdict
+from typing import List, Dict, Any, Tuple
 
 import psycopg2
 import pandas as pd
@@ -16,9 +17,6 @@ import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.decomposition import PCA
-from sklearn.cluster import KMeans
 
 
 def get_db_connection():
@@ -168,6 +166,117 @@ def query_temporal_patterns(conn) -> pd.DataFrame:
     return pd.read_sql_query(query, conn)
 
 
+def query_trending_searches(conn, days: int = 7) -> pd.DataFrame:
+    """Query trending searches over the last N days"""
+    query = """
+        SELECT
+            DATE(timestamp) as date,
+            query,
+            COUNT(DISTINCT username) as unique_users
+        FROM (
+            SELECT DISTINCT username, client_id, timestamp, query
+            FROM searches
+            WHERE timestamp >= NOW() - INTERVAL '%s days'
+        ) AS deduplicated
+        GROUP BY DATE(timestamp), query
+        HAVING COUNT(DISTINCT username) >= 3
+        ORDER BY date DESC, unique_users DESC
+    """
+    return pd.read_sql_query(query, conn, params=(days,))
+
+
+def query_all_queries_sample(conn, limit: int = 10000) -> List[str]:
+    """Query sample of queries for pattern analysis"""
+    query = """
+        SELECT DISTINCT query
+        FROM searches
+        WHERE timestamp >= NOW() - INTERVAL '7 days'
+        LIMIT %s
+    """
+    cursor = conn.cursor()
+    cursor.execute(query, (limit,))
+    results = [row[0] for row in cursor.fetchall()]
+    cursor.close()
+    return results
+
+
+def analyze_query_patterns(queries: List[str]) -> Dict[str, int]:
+    """Classify queries by structure pattern"""
+    patterns = {
+        'Single Word': 0,
+        'Artist - Song': 0,
+        'Artist Album': 0,
+        'Multi-word (2-3)': 0,
+        'Long Query (4+)': 0,
+        'Contains Numbers': 0,
+        'Special Characters': 0
+    }
+
+    for query in queries:
+        query_lower = query.lower().strip()
+        word_count = len(query_lower.split())
+
+        # Check for specific patterns
+        if ' - ' in query_lower or ' – ' in query_lower:
+            patterns['Artist - Song'] += 1
+        elif word_count == 1:
+            patterns['Single Word'] += 1
+        elif word_count == 2:
+            # Could be artist + album/song
+            patterns['Artist Album'] += 1
+        elif word_count == 3:
+            patterns['Multi-word (2-3)'] += 1
+        elif word_count >= 4:
+            patterns['Long Query (4+)'] += 1
+
+        if re.search(r'\d', query):
+            patterns['Contains Numbers'] += 1
+        if re.search(r'[^\w\s-]', query):
+            patterns['Special Characters'] += 1
+
+    return patterns
+
+
+def analyze_ngrams(queries: List[str], n: int = 2, limit: int = 30) -> List[Tuple[str, int]]:
+    """Extract most common n-grams from queries"""
+    ngrams = Counter()
+
+    for query in queries:
+        words = query.lower().split()
+        if len(words) >= n:
+            for i in range(len(words) - n + 1):
+                ngram = ' '.join(words[i:i+n])
+                ngrams[ngram] += 1
+
+    return ngrams.most_common(limit)
+
+
+def analyze_term_cooccurrence(queries: List[str], min_freq: int = 5) -> List[Tuple[str, str, int]]:
+    """Analyze which terms frequently appear together in searches"""
+    # Build word frequency
+    word_freq = Counter()
+    for query in queries:
+        words = set(query.lower().split())
+        word_freq.update(words)
+
+    # Filter to common words
+    common_words = {word for word, count in word_freq.items() if count >= min_freq and len(word) > 2}
+
+    # Count co-occurrences
+    cooccurrence = Counter()
+    for query in queries:
+        words = [w for w in set(query.lower().split()) if w in common_words]
+        if len(words) >= 2:
+            # Create pairs
+            for i, w1 in enumerate(words):
+                for w2 in words[i+1:]:
+                    pair = tuple(sorted([w1, w2]))
+                    cooccurrence[pair] += 1
+
+    # Return top pairs as (word1, word2, count)
+    return [(w1, w2, count) for (w1, w2), count in cooccurrence.most_common(50)]
+
+
 def query_total_stats(conn) -> Dict[str, Any]:
     """Query overall statistics"""
     cursor = conn.cursor()
@@ -271,65 +380,273 @@ def create_top_queries_chart(top_queries: List[tuple]) -> go.Figure:
     return fig
 
 
-def create_query_clustering_chart(queries: List[str]) -> go.Figure:
-    """Create 2D visualization of query clusters using word embeddings"""
-    if len(queries) < 10:
-        # Not enough data for clustering
+def create_query_pattern_chart(patterns: Dict[str, int]) -> go.Figure:
+    """Create bar chart of query pattern distribution"""
+    # Sort by count
+    sorted_patterns = sorted(patterns.items(), key=lambda x: x[1], reverse=True)
+    pattern_names = [p[0] for p in sorted_patterns]
+    counts = [p[1] for p in sorted_patterns]
+
+    fig = go.Figure(data=[
+        go.Bar(
+            x=counts,
+            y=pattern_names,
+            orientation='h',
+            marker=dict(color='#333333', line=dict(color='black', width=1))
+        )
+    ])
+
+    fig.update_layout(
+        title='Search Query Patterns',
+        xaxis_title='Number of Queries',
+        yaxis_title='Pattern Type',
+        height=500,
+        template='plotly_white',
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        font=dict(color='black')
+    )
+
+    return fig
+
+
+def create_temporal_hourly_chart(df: pd.DataFrame) -> go.Figure:
+    """Create bar chart of searches by hour of day"""
+    fig = go.Figure(data=[
+        go.Bar(
+            x=df['hour'],
+            y=df['search_count'],
+            marker=dict(color='#555555', line=dict(color='black', width=1))
+        )
+    ])
+
+    fig.update_layout(
+        title='Search Activity by Hour of Day (Last 7 Days, UTC)',
+        xaxis_title='Hour (UTC)',
+        yaxis_title='Number of Searches',
+        xaxis=dict(tickmode='linear', tick0=0, dtick=2),
+        height=400,
+        template='plotly_white',
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        font=dict(color='black')
+    )
+
+    return fig
+
+
+def create_geographic_comparison_chart(geo_data: Dict[str, List[tuple]]) -> go.Figure:
+    """Create comparison of top searches across geographic regions"""
+    if not geo_data:
         return None
 
-    try:
-        # Create TF-IDF vectors
-        vectorizer = TfidfVectorizer(max_features=100, stop_words='english')
-        X = vectorizer.fit_transform(queries)
+    # Create subplots for each region
+    num_regions = len(geo_data)
+    fig = make_subplots(
+        rows=1, cols=num_regions,
+        subplot_titles=list(geo_data.keys()),
+        horizontal_spacing=0.1
+    )
 
-        # Reduce to 2D using PCA
-        pca = PCA(n_components=2, random_state=42)
-        X_2d = pca.fit_transform(X.toarray())
+    greys = ['#000000', '#333333', '#555555']
 
-        # Cluster queries
-        n_clusters = min(8, len(queries) // 50)  # Adaptive number of clusters
-        if n_clusters < 2:
-            n_clusters = 2
+    for idx, (region, queries) in enumerate(geo_data.items(), 1):
+        if queries:
+            top_10 = queries[:10]
+            query_names = [q[0][:30] for q in top_10][::-1]  # Truncate and reverse
+            counts = [q[1] for q in top_10][::-1]
 
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-        clusters = kmeans.fit_predict(X.toarray())
+            fig.add_trace(
+                go.Bar(
+                    y=query_names,
+                    x=counts,
+                    orientation='h',
+                    marker=dict(color=greys[idx % len(greys)], line=dict(color='black', width=1)),
+                    showlegend=False
+                ),
+                row=1, col=idx
+            )
 
-        # Create scatter plot
-        df_plot = pd.DataFrame({
-            'x': X_2d[:, 0],
-            'y': X_2d[:, 1],
-            'query': [q[:50] for q in queries],
-            'cluster': clusters
-        })
+    fig.update_layout(
+        title='Top Searches by Geographic Region (Last 7 Days)',
+        height=600,
+        template='plotly_white',
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        font=dict(color='black', size=10)
+    )
 
-        # Create greyscale color palette for clusters
-        grey_palette = ['#000000', '#333333', '#666666', '#999999', '#222222', '#555555', '#777777', '#444444']
+    return fig
 
-        fig = px.scatter(
-            df_plot,
-            x='x',
-            y='y',
-            color='cluster',
-            hover_data=['query'],
-            title='Query Clusters (Word Embedding Visualization)',
-            labels={'x': 'PCA Component 1', 'y': 'PCA Component 2'},
-            height=600,
-            color_discrete_sequence=grey_palette
+
+def create_query_length_chart(df: pd.DataFrame) -> go.Figure:
+    """Create histogram of query length distribution"""
+    # Filter to reasonable lengths for visualization
+    df_filtered = df[df['query_length'] <= 100]
+
+    fig = go.Figure(data=[
+        go.Bar(
+            x=df_filtered['query_length'],
+            y=df_filtered['count'],
+            marker=dict(color='#444444', line=dict(color='black', width=1))
+        )
+    ])
+
+    fig.update_layout(
+        title='Search Query Length Distribution (Characters)',
+        xaxis_title='Query Length',
+        yaxis_title='Number of Queries',
+        height=400,
+        template='plotly_white',
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        font=dict(color='black')
+    )
+
+    return fig
+
+
+def create_ngram_chart(bigrams: List[Tuple[str, int]], trigrams: List[Tuple[str, int]]) -> go.Figure:
+    """Create comparison chart of most common 2-grams and 3-grams"""
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=['Most Common 2-Word Phrases', 'Most Common 3-Word Phrases'],
+        horizontal_spacing=0.15
+    )
+
+    # Bigrams
+    if bigrams:
+        top_bigrams = bigrams[:15]
+        bigram_phrases = [b[0] for b in top_bigrams][::-1]
+        bigram_counts = [b[1] for b in top_bigrams][::-1]
+
+        fig.add_trace(
+            go.Bar(
+                y=bigram_phrases,
+                x=bigram_counts,
+                orientation='h',
+                marker=dict(color='#333333', line=dict(color='black', width=1)),
+                showlegend=False
+            ),
+            row=1, col=1
         )
 
-        fig.update_traces(marker=dict(size=8, opacity=0.6, line=dict(color='black', width=0.5)))
-        fig.update_layout(
-            template='plotly_white',
-            plot_bgcolor='white',
-            paper_bgcolor='white',
-            font=dict(color='black')
+    # Trigrams
+    if trigrams:
+        top_trigrams = trigrams[:15]
+        trigram_phrases = [t[0] for t in top_trigrams][::-1]
+        trigram_counts = [t[1] for t in top_trigrams][::-1]
+
+        fig.add_trace(
+            go.Bar(
+                y=trigram_phrases,
+                x=trigram_counts,
+                orientation='h',
+                marker=dict(color='#555555', line=dict(color='black', width=1)),
+                showlegend=False
+            ),
+            row=1, col=2
         )
 
-        return fig
+    fig.update_layout(
+        title='Common Multi-Word Phrases in Searches',
+        height=600,
+        template='plotly_white',
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        font=dict(color='black', size=10)
+    )
 
-    except Exception as e:
-        print(f"Warning: Could not create clustering visualization: {e}")
+    fig.update_xaxes(title_text='Frequency', row=1, col=1)
+    fig.update_xaxes(title_text='Frequency', row=1, col=2)
+
+    return fig
+
+
+def create_cooccurrence_chart(cooccurrences: List[Tuple[str, str, int]]) -> go.Figure:
+    """Create network visualization of term co-occurrence"""
+    if not cooccurrences or len(cooccurrences) < 3:
         return None
+
+    # Take top 30 pairs
+    top_pairs = cooccurrences[:30]
+
+    # Build edge list
+    edges_x = []
+    edges_y = []
+    edge_weights = []
+
+    # Get unique terms and assign positions in a circle
+    terms = set()
+    for w1, w2, count in top_pairs:
+        terms.add(w1)
+        terms.add(w2)
+
+    terms = list(terms)[:20]  # Limit to 20 terms for readability
+    n = len(terms)
+
+    # Position terms in a circle
+    term_positions = {}
+    for i, term in enumerate(terms):
+        angle = 2 * np.pi * i / n
+        term_positions[term] = (np.cos(angle), np.sin(angle))
+
+    # Create edges
+    edge_traces = []
+    for w1, w2, count in top_pairs:
+        if w1 in term_positions and w2 in term_positions:
+            x0, y0 = term_positions[w1]
+            x1, y1 = term_positions[w2]
+
+            # Edge thickness based on count
+            width = min(count / 3, 5)
+
+            edge_traces.append(go.Scatter(
+                x=[x0, x1, None],
+                y=[y0, y1, None],
+                mode='lines',
+                line=dict(width=width, color='#999999'),
+                hoverinfo='none',
+                showlegend=False
+            ))
+
+    # Create nodes
+    node_x = [term_positions[t][0] for t in terms]
+    node_y = [term_positions[t][1] for t in terms]
+
+    node_trace = go.Scatter(
+        x=node_x,
+        y=node_y,
+        mode='markers+text',
+        text=terms,
+        textposition='top center',
+        marker=dict(
+            size=15,
+            color='#333333',
+            line=dict(color='black', width=2)
+        ),
+        textfont=dict(size=10, color='black'),
+        hoverinfo='text',
+        showlegend=False
+    )
+
+    # Create figure
+    fig = go.Figure(data=edge_traces + [node_trace])
+
+    fig.update_layout(
+        title='Term Co-occurrence Network (Words Appearing Together)',
+        showlegend=False,
+        hovermode='closest',
+        height=700,
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        template='plotly_white',
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        font=dict(color='black')
+    )
+
+    return fig
 
 
 def create_user_activity_chart(top_users: List[tuple]) -> go.Figure:
@@ -529,7 +846,30 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure]) -> str:
         </div>
 
         <div class="chart">
-            {chart_html.get('query_clustering', '<p>Not enough data for clustering visualization</p>')}
+            {chart_html.get('query_patterns', '<p>Not enough data</p>')}
+        </div>
+
+        <div class="chart">
+            {chart_html.get('query_length', '<p>Not enough data</p>')}
+        </div>
+
+        <h2>Temporal Analysis</h2>
+        <div class="chart">
+            {chart_html.get('temporal_hourly', '<p>Not enough data</p>')}
+        </div>
+
+        <h2>Geographic Comparison</h2>
+        <div class="chart">
+            {chart_html.get('geographic_comparison', '<p>Not enough data</p>')}
+        </div>
+
+        <h2>Search Term Analysis</h2>
+        <div class="chart">
+            {chart_html.get('ngrams', '<p>Not enough data</p>')}
+        </div>
+
+        <div class="chart">
+            {chart_html.get('cooccurrence', '<p>Not enough data for network visualization</p>')}
         </div>
 
         <h2>User Activity</h2>
@@ -562,7 +902,25 @@ def main():
         daily_stats = query_daily_stats(conn, days=7)
         top_queries = query_top_queries(conn, limit=100)
         top_users = query_most_active_users(conn, limit=50)
-        clustering_queries = query_all_queries_for_clustering(conn, limit=5000)
+
+        # Music-specific analyses
+        print("Analyzing query patterns...")
+        query_sample = query_all_queries_sample(conn, limit=10000)
+        query_patterns = analyze_query_patterns(query_sample)
+
+        print("Analyzing geographic patterns...")
+        geo_comparison = query_geographic_comparison(conn, limit=30)
+
+        print("Analyzing temporal patterns...")
+        temporal_data = query_temporal_patterns(conn)
+        query_length_data = query_query_length_distribution(conn)
+
+        print("Extracting n-grams...")
+        bigrams = analyze_ngrams(query_sample, n=2, limit=30)
+        trigrams = analyze_ngrams(query_sample, n=3, limit=30)
+
+        print("Analyzing term co-occurrence...")
+        cooccurrences = analyze_term_cooccurrence(query_sample, min_freq=10)
 
         print(f"Found {stats['total_searches']:,} total searches")
         print(f"Creating visualizations...")
@@ -573,7 +931,12 @@ def main():
             'top_queries': create_top_queries_chart(top_queries),
             'user_activity': create_user_activity_chart(top_users),
             'client_distribution': create_client_distribution_chart(stats['client_totals']),
-            'query_clustering': create_query_clustering_chart(clustering_queries)
+            'query_patterns': create_query_pattern_chart(query_patterns),
+            'temporal_hourly': create_temporal_hourly_chart(temporal_data),
+            'geographic_comparison': create_geographic_comparison_chart(geo_comparison),
+            'query_length': create_query_length_chart(query_length_data),
+            'ngrams': create_ngram_chart(bigrams, trigrams),
+            'cooccurrence': create_cooccurrence_chart(cooccurrences)
         }
 
         print("Generating HTML...")
