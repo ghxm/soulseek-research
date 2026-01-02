@@ -73,14 +73,13 @@ def get_deduplication_cte() -> str:
 
 
 def query_daily_stats(conn, days: int = 7) -> pd.DataFrame:
-    """Query daily search counts per client for the last N days (deduplicated)"""
-    query = f"""
-        {get_deduplication_cte()}
+    """Query daily search counts per client for the last N days (RAW - not deduplicated)"""
+    query = """
         SELECT
             client_id,
             DATE(timestamp) as date,
             COUNT(*) as search_count
-        FROM deduplicated_searches
+        FROM searches
         WHERE timestamp >= NOW() - INTERVAL '%s days'
         GROUP BY client_id, DATE(timestamp)
         ORDER BY date DESC, client_id
@@ -268,7 +267,7 @@ def analyze_term_cooccurrence(queries: List[str], min_freq: int = 5) -> List[Tup
 
 
 def query_total_stats(conn) -> Dict[str, Any]:
-    """Query overall statistics (deduplicated)"""
+    """Query overall statistics (deduplicated for main stats, raw for client collection)"""
     cursor = conn.cursor()
     dedup_cte = get_deduplication_cte()
 
@@ -288,11 +287,10 @@ def query_total_stats(conn) -> Dict[str, Any]:
     cursor.execute(f"{dedup_cte} SELECT MIN(timestamp), MAX(timestamp) FROM deduplicated_searches")
     date_range = cursor.fetchone()
 
-    # Per-client totals
-    cursor.execute(f"""
-        {dedup_cte}
+    # Per-client totals (RAW - not deduplicated, shows actual data collection)
+    cursor.execute("""
         SELECT client_id, COUNT(*) as count
-        FROM deduplicated_searches
+        FROM searches
         GROUP BY client_id
         ORDER BY count DESC
     """)
@@ -330,9 +328,9 @@ def create_daily_flow_chart(df: pd.DataFrame) -> go.Figure:
         ))
 
     fig.update_layout(
-        title='Daily Search Volume by Client (Last 7 Days)',
+        title='Daily Search Volume by Client - Raw Data Collection (Last 7 Days)',
         xaxis_title='Date',
-        yaxis_title='Number of Searches',
+        yaxis_title='Number of Searches (Raw)',
         hovermode='x unified',
         height=500,
         template='plotly_white',
@@ -641,7 +639,7 @@ def create_client_distribution_chart(client_totals: Dict[str, int]) -> go.Figure
     ])
 
     fig.update_layout(
-        title='Search Distribution by Geographic Client',
+        title='Search Distribution by Geographic Client - Raw Data Collection',
         height=400,
         template='plotly_white',
         paper_bgcolor='white',
@@ -759,11 +757,11 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure]) -> str:
         <div style="background: #f5f5f5; padding: 20px; margin: 20px 0; border-left: 4px solid #333;">
             <h3 style="margin-top: 0; color: #333;">Data Deduplication Note</h3>
             <p style="margin-bottom: 0; color: #666;">
-                All statistics shown below are <strong>deduplicated within 5-minute windows</strong>.
                 Because Soulseek distributes searches across multiple clients, the same search from one user
-                can appear on 2-3 of our geographic clients simultaneously. Our analysis automatically removes
-                these duplicates by grouping searches with the same username and query within 5-minute intervals,
-                keeping only the first occurrence. This ensures accurate counts and prevents inflated statistics.
+                can appear on 2-3 of our geographic clients simultaneously. <strong>Analysis statistics are
+                deduplicated within 5-minute windows</strong> to prevent inflated counts, keeping only the first
+                occurrence of each username+query combination. However, <strong>data collection metrics show
+                raw counts</strong> to accurately represent what each client receives from the network.
             </p>
         </div>
 
@@ -790,7 +788,7 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure]) -> str:
             </div>
         </div>
 
-        <h2>Data Collection Overview</h2>
+        <h2>Data Collection Overview <span style="font-weight: normal; font-size: 14px; color: #999;">(Raw Counts)</span></h2>
         <div class="chart">
             {chart_html['daily_flow']}
         </div>
@@ -799,7 +797,7 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure]) -> str:
             {chart_html['client_distribution']}
         </div>
 
-        <h2>Search Patterns Analysis</h2>
+        <h2>Search Patterns Analysis <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
         <div class="chart">
             {chart_html['top_queries']}
         </div>
@@ -812,12 +810,12 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure]) -> str:
             {chart_html.get('query_length', '<p>Not enough data</p>')}
         </div>
 
-        <h2>Temporal Analysis</h2>
+        <h2>Temporal Analysis <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
         <div class="chart">
             {chart_html.get('temporal_hourly', '<p>Not enough data</p>')}
         </div>
 
-        <h2>Search Term Analysis</h2>
+        <h2>Search Term Analysis <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
         <div class="chart">
             {chart_html.get('ngrams', '<p>Not enough data</p>')}
         </div>
@@ -826,7 +824,7 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure]) -> str:
             {chart_html.get('cooccurrence', '<p>Not enough data for network visualization</p>')}
         </div>
 
-        <h2>User Activity</h2>
+        <h2>User Activity <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
         <div class="chart">
             {chart_html['user_activity']}
         </div>
