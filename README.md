@@ -57,16 +57,14 @@ soulseek-research start --username user --password pass --database-url sqlite://
 
 ## Statistics Dashboard
 
-View live statistics and visualizations of collected data:
-- Daily search volume per client
-- Top searched queries (deduplicated)
-- Word embedding cluster visualization
-- Most active users (anonymized)
-- Geographic distribution
+Auto-generated stats page with daily search volume, top queries, word embedding clusters, and user activity.
 
-**Setup**: See [docs/GITHUB_PAGES_SETUP.md](docs/GITHUB_PAGES_SETUP.md) for instructions.
+**Setup:**
+1. Add `DATABASE_URL` secret in repo Settings → Secrets
+2. Enable Pages in Settings → Pages → Source: GitHub Actions
+3. Run workflow: Actions → Update Statistics Dashboard → Run workflow
 
-The dashboard updates automatically daily at 3 AM UTC via GitHub Actions.
+Updates daily at 3 AM UTC. View at `https://[username].github.io/[repo]/`
 
 ## Requirements
 

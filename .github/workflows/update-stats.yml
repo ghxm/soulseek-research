@@ -2,42 +2,46 @@ name: Update Statistics Dashboard
 
 on:
   schedule:
-    # Run daily at 3 AM UTC
-    - cron: '0 3 * * *'
-  workflow_dispatch:  # Allow manual trigger
+    - cron: '0 3 * * *'  # Daily at 3 AM UTC
+  workflow_dispatch:
 
 permissions:
-  contents: write  # Required to push to gh-pages
+  contents: read
+  pages: write
+  id-token: write
 
 jobs:
-  update-stats:
+  build:
     runs-on: ubuntu-latest
-
+    environment: github-pages
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install dependencies
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements-dashboard.txt
+        run: pip install -r requirements-dashboard.txt
 
       - name: Generate statistics
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
-        run: |
-          python scripts/generate_stats.py
+        run: python scripts/generate_stats.py
 
-      - name: Deploy to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v3
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./docs
-          publish_branch: gh-pages
-          force_orphan: true
+          path: ./docs
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
