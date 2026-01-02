@@ -298,3 +298,7 @@ maintenance-*.md
 !/scripts/test-local.sh
 /.terraform.lock.hcl
 /tfplan
+
+# Generated docs (except setup guide)
+/docs/index.html
+/docs/stats.json

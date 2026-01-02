@@ -55,6 +55,19 @@ pip install -e .
 soulseek-research start --username user --password pass --database-url sqlite:///data.db
 ```
 
+## Statistics Dashboard
+
+View live statistics and visualizations of collected data:
+- Daily search volume per client
+- Top searched queries (deduplicated)
+- Word embedding cluster visualization
+- Most active users (anonymized)
+- Geographic distribution
+
+**Setup**: See [docs/GITHUB_PAGES_SETUP.md](docs/GITHUB_PAGES_SETUP.md) for instructions.
+
+The dashboard updates automatically daily at 3 AM UTC via GitHub Actions.
+
 ## Requirements
 
 - Python 3.11+
