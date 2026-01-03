@@ -27,6 +27,10 @@ dependencies = [
     # Statistics and visualization (for generate_stats.py)
     "mistune>=3.0.0",
     "pyyaml>=6.0.0",
+    "pandas>=2.1.4",
+    "plotly>=5.18.0",
+    "scikit-learn>=1.3.2",
+    "numpy>=1.26.2",
 
     # Development and testing
     "pytest>=7.0.0",
