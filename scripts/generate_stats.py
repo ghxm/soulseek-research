@@ -50,38 +50,63 @@ def get_db_connection():
     )
 
 
-def get_deduplication_cte(start_date=None, end_date=None) -> str:
+def load_search_data(conn, start_date=None, end_date=None) -> pd.DataFrame:
     """
-    Returns a CTE that deduplicates searches within 5-minute windows.
+    Load search data from database into pandas DataFrame.
 
-    This handles the case where the same search is distributed to multiple
-    clients, resulting in duplicate entries. We only keep the first occurrence
-    within each 5-minute window for the same username+query combination.
-
-    CRITICAL PERFORMANCE: Filters by date range BEFORE window function to avoid
-    scanning the entire table (20M+ rows). Without this, queries take 15+ minutes.
+    Uses date filtering in SQL (leverages timestamp index) for performance.
+    Returns all columns needed for analysis.
     """
     date_filter = ""
     if start_date and end_date:
         date_filter = f"WHERE timestamp >= '{start_date.isoformat()}' AND timestamp <= '{end_date.isoformat()}'"
 
-    return f"""
-        WITH ranked_searches AS (
-            SELECT *,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY username, query,
-                                    FLOOR(EXTRACT(EPOCH FROM timestamp) / 300)
-                       ORDER BY timestamp
-                   ) as rn
-            FROM searches
-            {date_filter}
-        ),
-        deduplicated_searches AS (
-            SELECT id, client_id, timestamp, username, query
-            FROM ranked_searches
-            WHERE rn = 1
-        )
+    query = f"""
+        SELECT id, client_id, timestamp, username, query
+        FROM searches
+        {date_filter}
+        ORDER BY timestamp
     """
+
+    print(f"  Loading data from database...")
+    df = pd.read_sql_query(query, conn, parse_dates=['timestamp'])
+    print(f"  Loaded {len(df):,} raw records")
+    return df
+
+
+def deduplicate_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Deduplicate searches within 5-minute windows using pandas.
+
+    This handles the case where the same search is distributed to multiple
+    clients, resulting in duplicate entries. We only keep the first occurrence
+    within each 5-minute window for the same username+query combination.
+
+    Performance: Much faster than SQL window functions on large datasets.
+    Uses pandas vectorized operations and efficient hashing.
+    """
+    if df.empty:
+        return df
+
+    # Create 5-minute time bucket column (floor to nearest 5 minutes)
+    df = df.copy()
+    df['time_bucket'] = df['timestamp'].dt.floor('5min')
+
+    # Sort by timestamp to ensure we keep the first occurrence
+    df = df.sort_values('timestamp')
+
+    # Keep first occurrence of each (username, query, time_bucket) combination
+    df_dedup = df.drop_duplicates(
+        subset=['username', 'query', 'time_bucket'],
+        keep='first'
+    )
+
+    # Remove time_bucket column
+    df_dedup = df_dedup.drop(columns=['time_bucket'])
+
+    print(f"  Deduplicated: {len(df):,} → {len(df_dedup):,} records ({100*(1-len(df_dedup)/len(df)):.1f}% reduction)")
+
+    return df_dedup
 
 
 def get_archived_months(conn) -> List[Dict[str, Any]]:
@@ -178,38 +203,40 @@ def compute_cumulative_stats(conn) -> Dict[str, Any]:
 
     print("Processing live database...")
 
-    # Apply deduplication to live data
-    dedup_cte = get_deduplication_cte()
+    # Load live data into pandas and deduplicate
     query = f"""
-        {dedup_cte}
         SELECT timestamp, username, query
-        FROM deduplicated_searches
+        FROM searches
         WHERE 1=1 {archived_months_condition}
         ORDER BY timestamp
     """
 
-    cursor.execute(query)
+    df_live = pd.read_sql_query(query, conn, parse_dates=['timestamp'])
+    cursor.close()
+
+    print(f"  Loaded {len(df_live):,} raw live records")
+
+    # Deduplicate using pandas
+    df_live_dedup = deduplicate_dataframe(df_live)
 
     live_count = 0
-    for row in cursor.fetchall():
+    for _, row in df_live_dedup.iterrows():
         live_count += 1
         total_searches += 1
 
-        normalized_query = row[2].lower().strip()
+        normalized_query = row['query'].lower().strip()
 
-        all_users.add(row[1])
+        all_users.add(row['username'])
         all_queries.add(normalized_query)
-        all_pairs.add((row[1], normalized_query))
+        all_pairs.add((row['username'], normalized_query))
 
-        ts = row[0].isoformat()
+        ts = row['timestamp'].isoformat()
         if first_timestamp is None or ts < first_timestamp:
             first_timestamp = ts
         if last_timestamp is None or ts > last_timestamp:
             last_timestamp = ts
 
-    print(f"  Processed {live_count:,} live records")
-
-    cursor.close()
+    print(f"  Processed {live_count:,} deduplicated live records")
 
     return {
         'all_time_searches': total_searches,
@@ -1597,9 +1624,8 @@ def get_available_periods(conn) -> Dict[str, List[Dict]]:
     """Get all available weeks and months from the database"""
     cursor = conn.cursor()
 
-    # Get date range
-    dedup_cte = get_deduplication_cte()
-    cursor.execute(f"{dedup_cte} SELECT MIN(timestamp), MAX(timestamp) FROM deduplicated_searches")
+    # Get date range - simple query, no deduplication needed for date range
+    cursor.execute("SELECT MIN(timestamp), MAX(timestamp) FROM searches")
     min_date, max_date = cursor.fetchone()
 
     if not min_date or not max_date:
@@ -1727,18 +1753,17 @@ def query_period_data(conn, start_date=None, end_date=None):
 
 def generate_period_page(conn, period_type: str, period_info: Optional[Dict] = None) -> str:
     """
-    Generate a dashboard page for a specific period.
+    Generate a dashboard page for a specific period using pandas-based processing.
 
     period_type: 'all', 'month', or 'week'
     period_info: Dict with 'id', 'label', 'start', 'end' (None for all-time)
     """
     if period_type == 'all':
-        print("Querying all-time statistics...")
+        print("Generating all-time statistics...")
         start_date, end_date = None, None
         period_label = "All Time"
         page_title = "Soulseek Research Dashboard - All Time"
         output_file = "docs/index.html"
-        date_filter = ""
     else:
         start_date = period_info['start']
         end_date = period_info['end']
@@ -1751,143 +1776,110 @@ def generate_period_page(conn, period_type: str, period_info: Optional[Dict] = N
             page_title = f"Soulseek Research Dashboard - {period_label}"
             output_file = f"docs/months/{period_info['id']}.html"
 
-        date_filter = f"AND timestamp >= '{start_date.isoformat()}' AND timestamp <= '{end_date.isoformat()}'"
-        print(f"Querying statistics for {period_label}...")
+        print(f"Generating statistics for {period_label}...")
 
-    # Query period stats
-    stats = query_period_data(conn, start_date, end_date)
+    # Load raw data for this period
+    df_raw = load_search_data(conn, start_date, end_date)
 
-    if stats['total_searches'] == 0:
+    if df_raw.empty:
         print(f"  No data for {period_label}, skipping")
         return None
 
-    # Calculate days for time-series queries
-    if start_date and end_date:
-        days = (end_date - start_date).days + 1
-    else:
-        # For all-time, use full range
-        if stats['first_search'] and stats['last_search']:
-            first = datetime.fromisoformat(stats['first_search'])
-            last = datetime.fromisoformat(stats['last_search'])
-            days = (last - first).days + 1
-        else:
-            days = 365  # fallback
+    # Deduplicate using pandas (much faster than SQL window functions)
+    df_dedup = deduplicate_dataframe(df_raw)
 
-    # PERFORMANCE OPTIMIZATION: Create temp table with deduplicated data ONCE
-    # This avoids running the expensive deduplication CTE 10+ times per page
-    print(f"  Creating deduplicated temp table for {period_label}...")
-    cursor = conn.cursor()
-    dedup_cte = get_deduplication_cte(start_date, end_date)
-    cursor.execute(f"""
-        CREATE TEMP TABLE temp_deduplicated AS
-        {dedup_cte}
-        SELECT id, client_id, timestamp, username, query
-        FROM deduplicated_searches
-    """)
-    conn.commit()
-    print(f"  Temp table created, querying metrics...")
+    print(f"  Computing statistics for {period_label}...")
 
-    # Query time-series data (with date filter for performance)
-    daily_stats = pd.read_sql_query(f"""
-        SELECT
-            client_id,
-            DATE(timestamp) as date,
-            COUNT(*) as search_count
-        FROM searches
-        WHERE 1=1 {date_filter}
-        GROUP BY client_id, DATE(timestamp)
-        ORDER BY date DESC, client_id
-    """, conn)
-    daily_unique_users = pd.read_sql_query(f"""
-        SELECT
-            DATE(timestamp) as date,
-            COUNT(DISTINCT username) as unique_users
-        FROM temp_deduplicated
-        GROUP BY DATE(timestamp)
-        ORDER BY date DESC
-    """, conn)
+    # Calculate summary statistics from deduplicated data
+    total_searches = len(df_dedup)
+    total_users = df_dedup['username'].nunique()
+    total_queries = df_dedup['query'].nunique()
+    unique_search_pairs = df_dedup.groupby(['username', 'query']).ngroups
 
-    client_convergence = pd.read_sql_query(f"""
-        WITH search_coverage AS (
-            SELECT
-                DATE(timestamp) as date,
-                username,
-                query,
-                COUNT(DISTINCT client_id) as client_count
-            FROM searches
-            WHERE 1=1 {date_filter}
-            GROUP BY DATE(timestamp), username, query
-        )
-        SELECT
-            date,
-            SUM(CASE WHEN client_count = 1 THEN 1 ELSE 0 END) as single_client,
-            SUM(CASE WHEN client_count = 2 THEN 1 ELSE 0 END) as two_clients,
-            SUM(CASE WHEN client_count >= 3 THEN 1 ELSE 0 END) as all_clients
-        FROM search_coverage
-        GROUP BY date
-        ORDER BY date
-    """, conn)
+    avg_searches_per_user = total_searches / total_users if total_users > 0 else 0
+    avg_unique_queries_per_user = unique_search_pairs / total_users if total_users > 0 else 0
 
-    # Query aggregate data (from temp table)
-    cursor.execute(f"""
-        SELECT
-            LOWER(TRIM(query)) as query,
-            COUNT(DISTINCT username) as unique_users,
-            COUNT(*) as total_searches
-        FROM temp_deduplicated
-        GROUP BY LOWER(TRIM(query))
-        ORDER BY unique_users DESC
-        LIMIT 100
-    """)
-    top_queries = cursor.fetchall()
+    first_search = df_dedup['timestamp'].min().isoformat()
+    last_search = df_dedup['timestamp'].max().isoformat()
 
-    cursor.execute(f"""
-        SELECT
-            username,
-            COUNT(*) as search_count,
-            COUNT(DISTINCT query) as unique_queries
-        FROM temp_deduplicated
-        GROUP BY username
-        ORDER BY search_count DESC
-        LIMIT 50
-    """)
-    top_users = cursor.fetchall()
+    # Per-client totals (from raw data, not deduplicated)
+    client_totals = df_raw.groupby('client_id').size().to_dict()
 
-    cursor.execute(f"""
-        SELECT query
-        FROM temp_deduplicated
-        LIMIT 10000
-    """)
-    query_sample = [row[0] for row in cursor.fetchall()]
+    stats = {
+        'total_searches': total_searches,
+        'total_users': total_users,
+        'total_queries': total_queries,
+        'unique_search_pairs': unique_search_pairs,
+        'avg_searches_per_user': avg_searches_per_user,
+        'avg_unique_queries_per_user': avg_unique_queries_per_user,
+        'first_search': first_search,
+        'last_search': last_search,
+        'client_totals': client_totals
+    }
 
-    cursor.close()
+    print(f"  Generating time-series data...")
 
-    # Analyze patterns
+    # Daily stats by client (raw data)
+    df_raw['date'] = df_raw['timestamp'].dt.date
+    daily_stats = df_raw.groupby(['client_id', 'date']).size().reset_index(name='search_count')
+
+    # Daily unique users (deduplicated)
+    df_dedup['date'] = df_dedup['timestamp'].dt.date
+    daily_unique_users = df_dedup.groupby('date')['username'].nunique().reset_index(name='unique_users')
+
+    # Client convergence analysis (how many clients see each search)
+    df_raw['query_normalized'] = df_raw['query'].str.lower().str.strip()
+    search_coverage = df_raw.groupby(['date', 'username', 'query_normalized'])['client_id'].nunique().reset_index(name='client_count')
+    client_convergence = pd.DataFrame({
+        'date': search_coverage['date'].unique()
+    })
+    client_convergence = client_convergence.merge(
+        search_coverage[search_coverage['client_count'] == 1].groupby('date').size().reset_index(name='single_client'),
+        on='date', how='left'
+    ).merge(
+        search_coverage[search_coverage['client_count'] == 2].groupby('date').size().reset_index(name='two_clients'),
+        on='date', how='left'
+    ).merge(
+        search_coverage[search_coverage['client_count'] >= 3].groupby('date').size().reset_index(name='all_clients'),
+        on='date', how='left'
+    ).fillna(0)
+
+    print(f"  Analyzing search patterns...")
+
+    # Top queries (normalized, deduplicated)
+    df_dedup['query_normalized'] = df_dedup['query'].str.lower().str.strip()
+    top_queries_df = df_dedup.groupby('query_normalized').agg(
+        unique_users=('username', 'nunique'),
+        total_searches=('query', 'size')
+    ).sort_values('unique_users', ascending=False).head(100)
+    top_queries = [(q, row['unique_users'], row['total_searches']) for q, row in top_queries_df.iterrows()]
+
+    # Top users
+    top_users_df = df_dedup.groupby('username').agg(
+        search_count=('query', 'size'),
+        unique_queries=('query', 'nunique')
+    ).sort_values('search_count', ascending=False).head(50)
+    top_users = [(u, row['search_count'], row['unique_queries']) for u, row in top_users_df.iterrows()]
+
+    # Sample queries for pattern analysis
+    query_sample = df_dedup['query'].head(10000).tolist()
     query_patterns = analyze_query_patterns(query_sample)
 
-    temporal_data = pd.read_sql_query(f"""
-        SELECT
-            EXTRACT(HOUR FROM timestamp) as hour,
-            COUNT(*) as search_count
-        FROM temp_deduplicated
-        GROUP BY EXTRACT(HOUR FROM timestamp)
-        ORDER BY hour
-    """, conn)
+    # Temporal patterns (by hour)
+    df_dedup['hour'] = df_dedup['timestamp'].dt.hour
+    temporal_data = df_dedup.groupby('hour').size().reset_index(name='search_count')
 
-    query_length_data = pd.read_sql_query(f"""
-        SELECT
-            array_length(string_to_array(LOWER(TRIM(query)), ' '), 1) as query_length,
-            COUNT(DISTINCT LOWER(TRIM(query))) as count
-        FROM temp_deduplicated
-        GROUP BY array_length(string_to_array(LOWER(TRIM(query)), ' '), 1)
-        ORDER BY query_length
-    """, conn)
+    # Query length distribution
+    df_dedup['query_length'] = df_dedup['query_normalized'].str.split().str.len()
+    query_length_data = df_dedup.groupby('query_length')['query_normalized'].nunique().reset_index(name='count')
+    query_length_data = query_length_data[query_length_data['query_length'] <= 100]  # Filter outliers
 
+    # N-grams analysis
     bigrams = analyze_ngrams(query_sample, n=2, limit=30)
     trigrams = analyze_ngrams(query_sample, n=3, limit=30)
     cooccurrences = analyze_term_cooccurrence(query_sample, min_freq=10)
 
-    print(f"  Found {stats['total_searches']:,} searches for {period_label}")
+    print(f"  Found {total_searches:,} searches for {period_label}")
     print(f"  Creating visualizations...")
 
     # Create figures
@@ -1897,7 +1889,7 @@ def generate_period_page(conn, period_type: str, period_info: Optional[Dict] = N
         'daily_unique_users': create_daily_unique_users_chart(daily_unique_users) if not daily_unique_users.empty else None,
         'top_queries': create_top_queries_chart(top_queries) if top_queries else None,
         'user_activity': create_user_activity_chart(top_users) if top_users else None,
-        'client_distribution': create_client_distribution_chart(stats['client_totals']) if stats['client_totals'] else None,
+        'client_distribution': create_client_distribution_chart(client_totals) if client_totals else None,
         'query_patterns': create_query_pattern_chart(query_patterns) if query_patterns else None,
         'temporal_hourly': create_temporal_hourly_chart(temporal_data) if not temporal_data.empty else None,
         'query_length': create_query_length_chart(query_length_data) if not query_length_data.empty else None,
@@ -1925,12 +1917,6 @@ def generate_period_page(conn, period_type: str, period_info: Optional[Dict] = N
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, 'w', encoding='utf-8') as f:
         f.write(html)
-
-    # Cleanup temp table
-    cursor = conn.cursor()
-    cursor.execute("DROP TABLE IF EXISTS temp_deduplicated")
-    conn.commit()
-    cursor.close()
 
     print(f"  ✅ Generated {output_file}")
     return output_file
@@ -2195,9 +2181,8 @@ def main():
         generate_jekyll_data_files(periods)
         print("✅ Generated Jekyll navigation data files")
 
-        # TEMPORARILY SKIPPED: all-time page (20M rows, takes 10+ min)
-        # TODO: Add materialized view or other optimization for all-time stats
-        # generate_period_page(conn, 'all', None)
+        # Generate all-time page (now fast with pandas!)
+        generate_period_page(conn, 'all', None)
 
         # Generate monthly pages
         for month in periods['months']:
@@ -2207,10 +2192,10 @@ def main():
         for week in periods['weeks']:
             generate_period_page(conn, 'week', week)
 
-        print(f"\n✅ Generated {len(periods['months']) + len(periods['weeks'])} dashboard pages")
+        print(f"\n✅ Generated {1 + len(periods['months']) + len(periods['weeks'])} dashboard pages")
+        print(f"   - 1 all-time page")
         print(f"   - {len(periods['months'])} monthly pages")
         print(f"   - {len(periods['weeks'])} weekly pages")
-        print(f"   - All-time page skipped (TODO: optimize for 20M+ rows)")
 
     finally:
         conn.close()
