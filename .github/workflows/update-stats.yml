@@ -57,12 +57,12 @@ jobs:
               uv run python /app/scripts/generate_stats.py
           "
 
-          # Poll until container finishes (10 min timeout)
+          # Poll until container finishes (20 min timeout)
           echo "Waiting for stats generation to complete..."
           SECONDS=0
           while ssh -o StrictHostKeyChecking=no root@$DB_HOST "docker ps --filter name=stats-gen --format '{{.Names}}' | grep -q stats-gen"; do
-            if [ $SECONDS -ge 600 ]; then
-              echo "ERROR: Timeout after 10 minutes"
+            if [ $SECONDS -ge 1200 ]; then
+              echo "ERROR: Timeout after 20 minutes"
               ssh -o StrictHostKeyChecking=no root@$DB_HOST "docker logs stats-gen" || true
               exit 1
             fi
