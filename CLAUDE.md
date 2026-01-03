@@ -34,10 +34,12 @@ src/soulseek_research/
 ├── __init__.py    # Package exports
 
 scripts/
-├── deploy.sh      # Terraform deployment
-├── destroy.sh     # Infrastructure teardown
-├── monitor.sh     # Live monitoring
-└── test-local.sh  # Local testing
+├── deploy.sh         # Terraform deployment
+├── destroy.sh        # Infrastructure teardown
+├── monitor.sh        # Live monitoring
+├── test-local.sh     # Local testing
+├── archive.py        # Monthly data archival script
+└── generate_stats.py # Dashboard generation with cumulative stats
 
 Infrastructure:
 ├── database.yml       # PostgreSQL container
@@ -157,11 +159,39 @@ Each client connects to the central database server using external IP addressing
 ## Data Management
 
 ### Archival System
-Built-in monthly archival to handle 2B+ searches/year:
-- Exports month data to compressed files using PostgreSQL COPY
-- Tracks archive metadata in database
-- Automatic cron job on database server (1st of month, 2AM)
-- 90% storage savings through compression
+**Status**: IMPLEMENTED - Full working archival system with cumulative statistics
+
+**Monthly Archival Process** (`scripts/archive.py`):
+- Finds complete months (7+ days old) ready for archival
+- Exports data to gzip-compressed CSV files (`/opt/archives/searches_YYYY-MM.csv.gz`)
+- Records archive metadata in `archives` table
+- Optionally deletes archived data from live `searches` table
+- Automatic weekly cron job (Sundays, 2 AM)
+- 90%+ storage savings through gzip compression
+
+**Archive Format**:
+```csv
+client_id,timestamp,username,query
+germany,2025-01-01T00:00:01Z,abc123hash,artist name album
+```
+
+**Cumulative Statistics** (`scripts/generate_stats.py`):
+- Streams through all archived CSV.gz files
+- Combines with live database data
+- Computes all-time totals: searches, users, queries, (user, query) pairs
+- Displays on dashboard with "All-Time Statistics" section
+- Minor cross-archive boundary duplicates accepted (~0.01% of data)
+
+**Dashboard Features**:
+- All-time cumulative metrics shown prominently
+- Current period stats separate from historical
+- Plotly range sliders on all time-series charts for interactive filtering
+- GitHub Actions downloads archives via SSH/SCP for stats generation
+
+**GitHub Secrets Required**:
+- `DB_SERVER_SSH_KEY`: SSH private key for database server access
+- `DB_SERVER_IP`: Database server IP address
+- `DATABASE_URL`: PostgreSQL connection string
 
 ### Privacy & Compliance
 - Usernames encrypted at write time with consistent key

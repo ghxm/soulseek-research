@@ -25,9 +25,24 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements-dashboard.txt
 
+      - name: Download archives from server
+        env:
+          SSH_KEY: ${{ secrets.DB_SERVER_SSH_KEY }}
+          DB_HOST: ${{ secrets.DB_SERVER_IP }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H $DB_HOST >> ~/.ssh/known_hosts
+
+          # Download all archive files
+          mkdir -p archives
+          scp -o StrictHostKeyChecking=no root@$DB_HOST:/opt/archives/*.csv.gz archives/ || echo "No archives found or error downloading"
+
       - name: Generate statistics
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ARCHIVE_PATH: archives
         run: python scripts/generate_stats.py
 
       - name: Upload artifact

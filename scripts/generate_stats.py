@@ -7,9 +7,11 @@ Queries the database and creates visualizations for GitHub Pages.
 import os
 import json
 import re
+import gzip
+import csv
 from datetime import datetime, timedelta, timezone
 from collections import Counter, defaultdict
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Iterator
 
 import psycopg2
 import pandas as pd
@@ -73,6 +75,145 @@ def get_deduplication_cte() -> str:
     """
 
 
+def get_archived_months(conn) -> List[Dict[str, Any]]:
+    """Get list of archived months from database"""
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT month, file_path, record_count
+        FROM archives
+        WHERE deleted = TRUE
+        ORDER BY month
+    """)
+    return [{'month': r[0], 'file_path': r[1], 'count': r[2]}
+            for r in cursor.fetchall()]
+
+
+def read_archived_searches(archive_path: str) -> Iterator[Dict[str, str]]:
+    """
+    Stream-read a gzipped CSV archive file.
+    Yields dict for each row: {client_id, timestamp, username, query}
+    """
+    if not os.path.exists(archive_path):
+        print(f"Warning: Archive file not found: {archive_path}")
+        return
+
+    with gzip.open(archive_path, 'rt', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            yield row
+
+
+def compute_cumulative_stats(conn) -> Dict[str, Any]:
+    """
+    Compute all-time statistics by:
+    1. Streaming through all archived CSV.gz files
+    2. Querying current live database (non-archived months)
+    3. Combining results
+
+    Note: Uses deduplication within archives (5-min windows) but may have
+    minor cross-archive boundary duplicates (~0.01% of data).
+    """
+    archive_base_path = os.environ.get('ARCHIVE_PATH', 'archives')
+
+    # Track unique entities across all data
+    all_users = set()
+    all_queries = set()
+    all_pairs = set()  # (username, normalized_query) tuples
+    total_searches = 0
+    first_timestamp = None
+    last_timestamp = None
+
+    # Process archived data
+    archives = get_archived_months(conn)
+
+    print(f"Processing {len(archives)} archive(s)...")
+
+    for archive in archives:
+        archive_path = archive['file_path']
+        if not os.path.isabs(archive_path):
+            # Relative path - resolve against archive_base_path
+            archive_path = os.path.join(archive_base_path, os.path.basename(archive_path))
+
+        print(f"  Reading {archive['month']} ({archive['count']:,} records)...")
+
+        for row in read_archived_searches(archive_path):
+            total_searches += 1
+
+            # Normalize query for consistent counting
+            normalized_query = row['query'].lower().strip()
+
+            all_users.add(row['username'])
+            all_queries.add(normalized_query)
+            all_pairs.add((row['username'], normalized_query))
+
+            # Track timestamps
+            ts = row['timestamp']
+            if first_timestamp is None or ts < first_timestamp:
+                first_timestamp = ts
+            if last_timestamp is None or ts > last_timestamp:
+                last_timestamp = ts
+
+    # Process live database (non-archived months)
+    cursor = conn.cursor()
+
+    # Get archived months list
+    cursor.execute("SELECT month FROM archives WHERE deleted = TRUE")
+    archived_months = [r[0] for r in cursor.fetchall()]
+
+    if archived_months:
+        archived_months_condition = "AND TO_CHAR(timestamp, 'YYYY-MM') NOT IN (%s)" % ','.join(
+            ["'" + m + "'" for m in archived_months]
+        )
+    else:
+        archived_months_condition = ""
+
+    print("Processing live database...")
+
+    # Apply deduplication to live data
+    dedup_cte = get_deduplication_cte()
+    query = f"""
+        {dedup_cte}
+        SELECT timestamp, username, query
+        FROM deduplicated_searches
+        WHERE 1=1 {archived_months_condition}
+        ORDER BY timestamp
+    """
+
+    cursor.execute(query)
+
+    live_count = 0
+    for row in cursor.fetchall():
+        live_count += 1
+        total_searches += 1
+
+        normalized_query = row[2].lower().strip()
+
+        all_users.add(row[1])
+        all_queries.add(normalized_query)
+        all_pairs.add((row[1], normalized_query))
+
+        ts = row[0].isoformat()
+        if first_timestamp is None or ts < first_timestamp:
+            first_timestamp = ts
+        if last_timestamp is None or ts > last_timestamp:
+            last_timestamp = ts
+
+    print(f"  Processed {live_count:,} live records")
+
+    cursor.close()
+
+    return {
+        'all_time_searches': total_searches,
+        'all_time_users': len(all_users),
+        'all_time_queries': len(all_queries),
+        'all_time_pairs': len(all_pairs),
+        'first_search': first_timestamp,
+        'last_search': last_timestamp,
+        'has_archives': len(archives) > 0,
+        'archive_count': len(archives)
+    }
+
+
 def load_article_content(article_path: str = 'docs/article.md') -> Optional[str]:
     """
     Load article Markdown content if it exists.
@@ -101,8 +242,8 @@ def parse_article_sections(markdown_content: str) -> List[Dict[str, Any]]:
     """
     sections = []
 
-    # Pattern to match chart markers and stats-grid
-    pattern = r'(<!--\s*chart:\s*(\w+)\s*-->|<!--\s*stats-grid\s*-->)'
+    # Pattern to match chart markers, stats-grid, and cumulative-stats
+    pattern = r'(<!--\s*chart:\s*(\w+)\s*-->|<!--\s*stats-grid\s*-->|<!--\s*cumulative-stats\s*-->)'
 
     # Split content while keeping delimiters
     parts = re.split(pattern, markdown_content)
@@ -125,6 +266,9 @@ def parse_article_sections(markdown_content: str) -> List[Dict[str, Any]]:
                     i += 1
             elif '<!-- stats-grid -->' in part:
                 sections.append({'type': 'stats-grid'})
+                i += 1
+            elif '<!-- cumulative-stats -->' in part:
+                sections.append({'type': 'cumulative-stats'})
                 i += 1
             else:
                 # Prose content - convert Markdown to HTML
@@ -457,7 +601,7 @@ def create_daily_flow_chart(df: pd.DataFrame) -> go.Figure:
         ))
 
     fig.update_layout(
-        title='Daily Search Volume by Client - Raw Data Collection (Last 7 Days)',
+        title='Daily Search Volume by Client - Raw Data Collection',
         xaxis_title='Date',
         yaxis_title='Number of Searches (Raw)',
         hovermode='x unified',
@@ -465,7 +609,11 @@ def create_daily_flow_chart(df: pd.DataFrame) -> go.Figure:
         template='plotly_white',
         plot_bgcolor='white',
         paper_bgcolor='white',
-        font=dict(color='black')
+        font=dict(color='black'),
+        xaxis=dict(
+            rangeslider=dict(visible=True),
+            type='date'
+        )
     )
 
     return fig
@@ -488,7 +636,7 @@ def create_daily_unique_users_chart(df: pd.DataFrame) -> go.Figure:
     ))
 
     fig.update_layout(
-        title='Daily Active Users - Deduplicated (Last 7 Days)',
+        title='Daily Active Users - Deduplicated',
         xaxis_title='Date',
         yaxis_title='Unique Users',
         hovermode='x unified',
@@ -496,7 +644,11 @@ def create_daily_unique_users_chart(df: pd.DataFrame) -> go.Figure:
         template='plotly_white',
         plot_bgcolor='white',
         paper_bgcolor='white',
-        font=dict(color='black')
+        font=dict(color='black'),
+        xaxis=dict(
+            rangeslider=dict(visible=True),
+            type='date'
+        )
     )
 
     return fig
@@ -540,7 +692,7 @@ def create_client_convergence_chart(df: pd.DataFrame) -> go.Figure:
     ))
 
     fig.update_layout(
-        title='Search Distribution Across Clients - Client Convergence (Last 7 Days)',
+        title='Search Distribution Across Clients - Client Convergence',
         xaxis_title='Date',
         yaxis_title='Number of Unique Searches',
         hovermode='x unified',
@@ -555,6 +707,10 @@ def create_client_convergence_chart(df: pd.DataFrame) -> go.Figure:
             y=1.02,
             xanchor='right',
             x=1
+        ),
+        xaxis=dict(
+            rangeslider=dict(visible=True),
+            type='date'
         )
     )
 
@@ -909,8 +1065,64 @@ def generate_stats_grid_html(stats: Dict) -> str:
     '''
 
 
+def generate_cumulative_stats_html(cumulative: Dict) -> str:
+    """Generate the all-time cumulative statistics section HTML."""
+    if not cumulative.get('has_archives') and cumulative.get('all_time_searches', 0) == 0:
+        # No data yet
+        return ''
+
+    # Calculate collection period
+    if cumulative.get('first_search') and cumulative.get('last_search'):
+        first_date = cumulative['first_search'][:10] if isinstance(cumulative['first_search'], str) else cumulative['first_search'].strftime('%Y-%m-%d')
+        last_date = cumulative['last_search'][:10] if isinstance(cumulative['last_search'], str) else cumulative['last_search'].strftime('%Y-%m-%d')
+        period_label = f"{first_date} to {last_date}"
+    else:
+        period_label = "Unknown period"
+
+    avg_queries_per_user = cumulative['all_time_pairs'] / cumulative['all_time_users'] if cumulative.get('all_time_users', 0) > 0 else 0
+
+    archive_note = f" ({cumulative['archive_count']} archive(s))" if cumulative.get('has_archives') else ""
+
+    return f'''
+        <h2>All-Time Statistics{archive_note}</h2>
+        <div class="stats-grid">
+            <div class="stat-card">
+                <h3>Total Searches</h3>
+                <div class="value">{cumulative['all_time_searches']:,}</div>
+                <div class="label">Since {first_date}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Unique Users</h3>
+                <div class="value">{cumulative['all_time_users']:,}</div>
+                <div class="label">Across all time</div>
+            </div>
+            <div class="stat-card">
+                <h3>Unique Queries</h3>
+                <div class="value">{cumulative['all_time_queries']:,}</div>
+                <div class="label">Different search terms</div>
+            </div>
+            <div class="stat-card">
+                <h3>Unique Search Pairs</h3>
+                <div class="value">{cumulative['all_time_pairs']:,}</div>
+                <div class="label">Unique (user, query) combinations</div>
+            </div>
+            <div class="stat-card">
+                <h3>Avg Queries per User</h3>
+                <div class="value">{avg_queries_per_user:.1f}</div>
+                <div class="label">Search diversity (all-time)</div>
+            </div>
+            <div class="stat-card">
+                <h3>Collection Period</h3>
+                <div class="value">{period_label}</div>
+                <div class="label">Full date range</div>
+            </div>
+        </div>
+    '''
+
+
 def generate_article_html(stats: Dict, figures: Dict[str, go.Figure],
-                          sections: List[Dict[str, Any]]) -> str:
+                          sections: List[Dict[str, Any]],
+                          cumulative: Optional[Dict] = None) -> str:
     """Generate HTML dashboard in article mode with narrative content."""
     # Convert figures to HTML
     chart_html = {}
@@ -934,6 +1146,9 @@ def generate_article_html(stats: Dict, figures: Dict[str, go.Figure],
                 body_parts.append(f'<p style="color: #999; font-style: italic;">Chart not found: {chart_id}</p>')
         elif section['type'] == 'stats-grid':
             body_parts.append(generate_stats_grid_html(stats))
+        elif section['type'] == 'cumulative-stats':
+            if cumulative:
+                body_parts.append(generate_cumulative_stats_html(cumulative))
 
     body_content = '\n'.join(body_parts)
 
@@ -1110,6 +1325,7 @@ def generate_article_html(stats: Dict, figures: Dict[str, go.Figure],
 
 
 def generate_html(stats: Dict, figures: Dict[str, go.Figure],
+                  cumulative: Optional[Dict] = None,
                   article_content: Optional[str] = None) -> str:
     """
     Generate HTML dashboard.
@@ -1120,7 +1336,7 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure],
     # Article mode: parse Markdown and generate article-style HTML
     if article_content:
         sections = parse_article_sections(article_content)
-        return generate_article_html(stats, figures, sections)
+        return generate_article_html(stats, figures, sections, cumulative)
 
     # Normal mode: generate standard dashboard
     # Convert figures to HTML divs
@@ -1301,6 +1517,9 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure],
             </p>
         </div>
 
+        {generate_cumulative_stats_html(cumulative) if cumulative else ''}
+
+        <h2>Current Period Statistics</h2>
         {generate_stats_grid_html(stats)}
 
         <h2>Data Collection Overview <span style="font-weight: normal; font-size: 14px; color: #999;">(Raw Counts)</span></h2>
@@ -1415,6 +1634,17 @@ def main():
             'cooccurrence': create_cooccurrence_chart(cooccurrences)
         }
 
+        # Compute cumulative statistics (archives + live DB)
+        print("Computing cumulative statistics...")
+        try:
+            cumulative = compute_cumulative_stats(conn)
+            print(f"  All-time: {cumulative['all_time_searches']:,} searches, "
+                  f"{cumulative['all_time_users']:,} users, "
+                  f"{cumulative['all_time_queries']:,} queries")
+        except Exception as e:
+            print(f"Warning: Could not compute cumulative stats: {e}")
+            cumulative = None
+
         # Check for article content
         article_content = load_article_content('docs/article.md')
 
@@ -1424,7 +1654,7 @@ def main():
             print("Standard mode: No article.md found")
 
         print("Generating HTML...")
-        html = generate_html(stats, figures, article_content=article_content)
+        html = generate_html(stats, figures, cumulative=cumulative, article_content=article_content)
 
         # Create docs directory
         os.makedirs('docs', exist_ok=True)

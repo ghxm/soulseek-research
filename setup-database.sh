@@ -82,11 +82,13 @@ DB_URL="postgresql://soulseek:${db_password}@localhost:5432/soulseek"
 
 # Run archive using Docker
 docker run --rm \
-  --network="$(docker-compose -f database.yml config --services | head -1)_default" \
+  --network=host \
   -v /opt/archives:/archives \
   -e DATABASE_URL="$DB_URL" \
+  -e ARCHIVE_PATH=/archives \
+  -e DELETE_AFTER_ARCHIVE=true \
   soulseek-research:latest \
-  soulseek-research archive --database-url "$DB_URL" --archive-path /archives
+  python /app/scripts/archive.py
 
 # Log the result
 echo "$(date): Weekly archive completed" >> /var/log/soulseek-archive.log
