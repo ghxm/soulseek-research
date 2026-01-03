@@ -373,6 +373,10 @@ def query_total_stats(conn) -> Dict[str, Any]:
     cursor.execute(f"{dedup_cte} SELECT COUNT(DISTINCT query) FROM deduplicated_searches")
     total_queries = cursor.fetchone()[0]
 
+    # Unique (user, query) pairs - ignores repeated searches by same user for same query
+    cursor.execute(f"{dedup_cte} SELECT COUNT(DISTINCT (username, query)) FROM deduplicated_searches")
+    unique_search_pairs = cursor.fetchone()[0]
+
     # Date range
     cursor.execute(f"{dedup_cte} SELECT MIN(timestamp), MAX(timestamp) FROM deduplicated_searches")
     date_range = cursor.fetchone()
@@ -388,10 +392,15 @@ def query_total_stats(conn) -> Dict[str, Any]:
 
     cursor.close()
 
+    # Calculate average queries per user
+    avg_queries_per_user = unique_search_pairs / total_users if total_users > 0 else 0
+
     return {
         'total_searches': total_searches,
         'total_users': total_users,
         'total_queries': total_queries,
+        'unique_search_pairs': unique_search_pairs,
+        'avg_queries_per_user': avg_queries_per_user,
         'first_search': date_range[0].isoformat() if date_range[0] else None,
         'last_search': date_range[1].isoformat() if date_range[1] else None,
         'client_totals': {client: count for client, count in client_totals}
@@ -791,6 +800,16 @@ def generate_stats_grid_html(stats: Dict) -> str:
                 <h3>Unique Queries</h3>
                 <div class="value">{stats['total_queries']:,}</div>
                 <div class="label">Different search terms</div>
+            </div>
+            <div class="stat-card">
+                <h3>Unique Search Pairs</h3>
+                <div class="value">{stats['unique_search_pairs']:,}</div>
+                <div class="label">Unique (user, query) combinations</div>
+            </div>
+            <div class="stat-card">
+                <h3>Avg Queries per User</h3>
+                <div class="value">{stats['avg_queries_per_user']:.1f}</div>
+                <div class="label">Search diversity</div>
             </div>
             <div class="stat-card">
                 <h3>Collection Period</h3>
