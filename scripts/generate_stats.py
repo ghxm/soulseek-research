@@ -2195,8 +2195,9 @@ def main():
         generate_jekyll_data_files(periods)
         print("✅ Generated Jekyll navigation data files")
 
-        # Generate all-time page
-        generate_period_page(conn, 'all', None)
+        # TEMPORARILY SKIPPED: all-time page (20M rows, takes 10+ min)
+        # TODO: Add materialized view or other optimization for all-time stats
+        # generate_period_page(conn, 'all', None)
 
         # Generate monthly pages
         for month in periods['months']:
@@ -2206,10 +2207,10 @@ def main():
         for week in periods['weeks']:
             generate_period_page(conn, 'week', week)
 
-        print(f"\n✅ Generated {1 + len(periods['months']) + len(periods['weeks'])} dashboard pages")
-        print(f"   - 1 all-time page (index.html)")
+        print(f"\n✅ Generated {len(periods['months']) + len(periods['weeks'])} dashboard pages")
         print(f"   - {len(periods['months'])} monthly pages")
         print(f"   - {len(periods['weeks'])} weekly pages")
+        print(f"   - All-time page skipped (TODO: optimize for 20M+ rows)")
 
     finally:
         conn.close()
