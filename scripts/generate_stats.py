@@ -2170,10 +2170,26 @@ def main():
         generate_jekyll_data_files(periods)
         print("✅ Generated Jekyll navigation data files")
 
-        # TEMPORARILY SKIP all-time and monthly pages to avoid loading all 20M rows
-        # TODO: Re-enable once we have more data or implement better pagination
+        # Generate all-time page (uses aggregate queries for cumulative stats)
+        print("="*80)
+        print("GENERATING ALL-TIME PAGE")
+        print("="*80)
+        print(f"  Loading all data...")
+        all_time_raw = load_search_data(conn)  # Load all data
+        all_time_dedup = deduplicate_dataframe(all_time_raw)
+        generate_period_page_from_df(conn, all_time_raw, all_time_dedup, 'all', None)
 
-        # Generate weekly pages (load data per week to avoid network timeout)
+        # Generate monthly pages (load data per month)
+        for month in periods['months']:
+            print("="*80)
+            print(f"GENERATING MONTHLY PAGE: {month['label']}")
+            print("="*80)
+            print(f"  Loading data for period: {month['start']} to {month['end']}")
+            month_raw = load_search_data(conn, start_date=month['start'], end_date=month['end'])
+            month_dedup = deduplicate_dataframe(month_raw)
+            generate_period_page_from_df(conn, month_raw, month_dedup, 'month', month)
+
+        # Generate weekly pages (load data per week)
         for week in periods['weeks']:
             print("="*80)
             print(f"GENERATING WEEKLY PAGE: CW {week['label']}")
@@ -2183,28 +2199,10 @@ def main():
             week_dedup = deduplicate_dataframe(week_raw)
             generate_period_page_from_df(conn, week_raw, week_dedup, 'week', week)
 
-        # Generate index page that redirects to most recent week
-        if periods['weeks']:
-            most_recent_week = periods['weeks'][-1]  # weeks are sorted oldest first, get last one
-            week_filename = f"week-{most_recent_week['id']}.html"
-            index_content = f"""---
-layout: default
-title: Soulseek Research Dashboard
----
-
-<script>
-window.location.href = "{week_filename}";
-</script>
-
-<p>Redirecting to most recent week...</p>
-<p>If not redirected, <a href="{week_filename}">click here</a>.</p>
-"""
-            with open('docs/index.html', 'w') as f:
-                f.write(index_content)
-            print("✅ Generated index.html redirect to most recent week")
-
         print("\n" + "="*80)
-        print(f"✅ Generated {len(periods['weeks'])} dashboard pages")
+        print(f"✅ Generated {1 + len(periods['months']) + len(periods['weeks'])} dashboard pages")
+        print(f"   - 1 all-time page")
+        print(f"   - {len(periods['months'])} monthly pages")
         print(f"   - {len(periods['weeks'])} weekly pages")
         print("="*80)
 
