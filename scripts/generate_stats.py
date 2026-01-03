@@ -197,15 +197,15 @@ def query_client_convergence(conn, days: int = 7) -> pd.DataFrame:
 
 
 def query_top_queries(conn, limit: int = 100) -> List[tuple]:
-    """Query most searched queries (deduplicated)"""
+    """Query most searched queries (deduplicated, normalized with LOWER and TRIM)"""
     query = f"""
         {get_deduplication_cte()}
         SELECT
-            query,
+            LOWER(TRIM(query)) as query,
             COUNT(DISTINCT username) as unique_users,
             COUNT(*) as total_searches
         FROM deduplicated_searches
-        GROUP BY query
+        GROUP BY LOWER(TRIM(query))
         ORDER BY unique_users DESC
         LIMIT %s
     """
@@ -237,14 +237,14 @@ def query_most_active_users(conn, limit: int = 50) -> List[tuple]:
 
 
 def query_query_length_distribution(conn) -> pd.DataFrame:
-    """Query distribution of search query lengths in words (unique queries)"""
+    """Query distribution of search query lengths in words (unique queries, normalized)"""
     query = f"""
         {get_deduplication_cte()}
         SELECT
-            array_length(string_to_array(TRIM(query), ' '), 1) as query_length,
-            COUNT(DISTINCT query) as count
+            array_length(string_to_array(LOWER(TRIM(query)), ' '), 1) as query_length,
+            COUNT(DISTINCT LOWER(TRIM(query))) as count
         FROM deduplicated_searches
-        GROUP BY array_length(string_to_array(TRIM(query), ' '), 1)
+        GROUP BY array_length(string_to_array(LOWER(TRIM(query)), ' '), 1)
         ORDER BY query_length
     """
     return pd.read_sql_query(query, conn)
@@ -420,15 +420,17 @@ def query_total_stats(conn) -> Dict[str, Any]:
 
     cursor.close()
 
-    # Calculate average queries per user
-    avg_queries_per_user = unique_search_pairs / total_users if total_users > 0 else 0
+    # Calculate averages
+    avg_searches_per_user = total_searches / total_users if total_users > 0 else 0
+    avg_unique_queries_per_user = unique_search_pairs / total_users if total_users > 0 else 0
 
     return {
         'total_searches': total_searches,
         'total_users': total_users,
         'total_queries': total_queries,
         'unique_search_pairs': unique_search_pairs,
-        'avg_queries_per_user': avg_queries_per_user,
+        'avg_searches_per_user': avg_searches_per_user,
+        'avg_unique_queries_per_user': avg_unique_queries_per_user,
         'first_search': date_range[0].isoformat() if date_range[0] else None,
         'last_search': date_range[1].isoformat() if date_range[1] else None,
         'client_totals': {client: count for client, count in client_totals}
@@ -643,7 +645,7 @@ def create_temporal_hourly_chart(df: pd.DataFrame) -> go.Figure:
 
 
 def create_query_length_chart(df: pd.DataFrame) -> go.Figure:
-    """Create histogram of query length distribution"""
+    """Create histogram of query length distribution (by word count)"""
     # Filter to reasonable lengths for visualization
     df_filtered = df[df['query_length'] <= 100]
 
@@ -656,9 +658,9 @@ def create_query_length_chart(df: pd.DataFrame) -> go.Figure:
     ])
 
     fig.update_layout(
-        title='Search Query Length Distribution (Characters)',
-        xaxis_title='Query Length',
-        yaxis_title='Number of Queries',
+        title='Search Query Length Distribution (Words)',
+        xaxis_title='Query Length (Number of Words)',
+        yaxis_title='Number of Unique Queries',
         height=400,
         template='plotly_white',
         plot_bgcolor='white',
@@ -889,13 +891,13 @@ def generate_stats_grid_html(stats: Dict) -> str:
                 <div class="label">Different search terms</div>
             </div>
             <div class="stat-card">
-                <h3>Unique Search Pairs</h3>
-                <div class="value">{stats['unique_search_pairs']:,}</div>
-                <div class="label">Unique (user, query) combinations</div>
+                <h3>Avg Searches per User</h3>
+                <div class="value">{stats['avg_searches_per_user']:.1f}</div>
+                <div class="label">Including repeated searches</div>
             </div>
             <div class="stat-card">
-                <h3>Avg Queries per User</h3>
-                <div class="value">{stats['avg_queries_per_user']:.1f}</div>
+                <h3>Avg Unique Queries per User</h3>
+                <div class="value">{stats['avg_unique_queries_per_user']:.1f}</div>
                 <div class="label">Search diversity</div>
             </div>
             <div class="stat-card">
