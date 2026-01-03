@@ -2199,7 +2199,7 @@ window.location.href = "{week_filename}";
 <p>Redirecting to most recent week...</p>
 <p>If not redirected, <a href="{week_filename}">click here</a>.</p>
 """
-            with open(os.path.join(DOCS_DIR, 'index.html'), 'w') as f:
+            with open('docs/index.html', 'w') as f:
                 f.write(index_content)
             print("✅ Generated index.html redirect to most recent week")
 
