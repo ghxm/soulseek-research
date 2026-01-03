@@ -89,20 +89,17 @@ def deduplicate_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     # Create 5-minute time bucket column (floor to nearest 5 minutes)
-    df = df.copy()
-    df['time_bucket'] = df['timestamp'].dt.floor('5min')
+    # Use assign to avoid modifying the original DataFrame
+    df_with_bucket = df.assign(time_bucket=df['timestamp'].dt.floor('5min'))
 
     # Sort by timestamp to ensure we keep the first occurrence
-    df = df.sort_values('timestamp')
+    df_sorted = df_with_bucket.sort_values('timestamp')
 
     # Keep first occurrence of each (username, query, time_bucket) combination
-    df_dedup = df.drop_duplicates(
+    df_dedup = df_sorted.drop_duplicates(
         subset=['username', 'query', 'time_bucket'],
         keep='first'
-    )
-
-    # Remove time_bucket column
-    df_dedup = df_dedup.drop(columns=['time_bucket'])
+    ).drop(columns=['time_bucket'])
 
     print(f"  Deduplicated: {len(df):,} → {len(df_dedup):,} records ({100*(1-len(df_dedup)/len(df)):.1f}% reduction)")
 
@@ -1751,22 +1748,22 @@ def query_period_data(conn, start_date=None, end_date=None):
     }
 
 
-def generate_period_page(conn, period_type: str, period_info: Optional[Dict] = None) -> str:
+def generate_period_page_from_df(conn, df_raw: pd.DataFrame, df_dedup: pd.DataFrame,
+                                  period_type: str, period_info: Optional[Dict] = None) -> str:
     """
-    Generate a dashboard page for a specific period using pandas-based processing.
+    Generate a dashboard page for a specific period using pre-loaded dataframes.
 
+    conn: Database connection (for computing cumulative stats if needed)
+    df_raw: Raw search data (not deduplicated)
+    df_dedup: Deduplicated search data
     period_type: 'all', 'month', or 'week'
     period_info: Dict with 'id', 'label', 'start', 'end' (None for all-time)
     """
     if period_type == 'all':
-        print("Generating all-time statistics...")
-        start_date, end_date = None, None
         period_label = "All Time"
         page_title = "Soulseek Research Dashboard - All Time"
         output_file = "docs/index.html"
     else:
-        start_date = period_info['start']
-        end_date = period_info['end']
         period_label = period_info['label']
 
         if period_type == 'week':
@@ -1776,17 +1773,9 @@ def generate_period_page(conn, period_type: str, period_info: Optional[Dict] = N
             page_title = f"Soulseek Research Dashboard - {period_label}"
             output_file = f"docs/months/{period_info['id']}.html"
 
-        print(f"Generating statistics for {period_label}...")
-
-    # Load raw data for this period
-    df_raw = load_search_data(conn, start_date, end_date)
-
-    if df_raw.empty:
+    if df_dedup.empty:
         print(f"  No data for {period_label}, skipping")
         return None
-
-    # Deduplicate using pandas (much faster than SQL window functions)
-    df_dedup = deduplicate_dataframe(df_raw)
 
     print(f"  Computing statistics for {period_label}...")
 
@@ -2181,21 +2170,89 @@ def main():
         generate_jekyll_data_files(periods)
         print("✅ Generated Jekyll navigation data files")
 
+        # OPTIMIZATION: Load all data once (using SQL date filtering from earliest to latest)
+        # This is much faster than loading 20M rows multiple times
+        print("\n" + "="*80)
+        print("LOADING ALL DATA FROM DATABASE (this will take a few minutes)...")
+        print("="*80)
+
+        # Get the overall date range
+        all_weeks = periods['weeks']
+        all_months = periods['months']
+
+        if all_weeks or all_months:
+            # Find the earliest and latest dates across all periods
+            earliest = None
+            latest = None
+
+            for week in all_weeks:
+                if earliest is None or week['start'] < earliest:
+                    earliest = week['start']
+                if latest is None or week['end'] > latest:
+                    latest = week['end']
+
+            for month in all_months:
+                if earliest is None or month['start'] < earliest:
+                    earliest = month['start']
+                if latest is None or month['end'] > latest:
+                    latest = month['end']
+
+            # Load all data once with date filtering
+            all_data_raw = load_search_data(conn, start_date=earliest, end_date=latest)
+            print(f"\n✅ Loaded all data ({len(all_data_raw):,} rows)")
+
+            # Deduplicate once
+            print("Deduplicating all data...")
+            all_data_dedup = deduplicate_dataframe(all_data_raw)
+            print(f"✅ Deduplicated data ready ({len(all_data_dedup):,} rows)\n")
+        else:
+            all_data_raw = pd.DataFrame()
+            all_data_dedup = pd.DataFrame()
+
         # Generate all-time page (now fast with pandas!)
-        generate_period_page(conn, 'all', None)
+        print("="*80)
+        print("GENERATING ALL-TIME PAGE")
+        print("="*80)
+        generate_period_page_from_df(conn, all_data_raw, all_data_dedup, 'all', None)
 
         # Generate monthly pages
         for month in periods['months']:
-            generate_period_page(conn, 'month', month)
+            print("="*80)
+            print(f"GENERATING MONTHLY PAGE: {month['label']}")
+            print("="*80)
+            # Filter data for this month
+            month_raw = all_data_raw[
+                (all_data_raw['timestamp'] >= month['start']) &
+                (all_data_raw['timestamp'] <= month['end'])
+            ]
+            month_dedup = all_data_dedup[
+                (all_data_dedup['timestamp'] >= month['start']) &
+                (all_data_dedup['timestamp'] <= month['end'])
+            ]
+            generate_period_page_from_df(conn, month_raw, month_dedup, 'month', month)
 
         # Generate weekly pages
         for week in periods['weeks']:
-            generate_period_page(conn, 'week', week)
+            print("="*80)
+            print(f"GENERATING WEEKLY PAGE: CW {week['label']}")
+            print("="*80)
+            # Filter data for this week
+            week_raw = all_data_raw[
+                (all_data_raw['timestamp'] >= week['start']) &
+                (all_data_raw['timestamp'] <= week['end'])
+            ]
+            week_dedup = all_data_dedup[
+                (all_data_dedup['timestamp'] >= week['start']) &
+                (all_data_dedup['timestamp'] <= week['end'])
+            ]
+            generate_period_page_from_df(conn, week_raw, week_dedup, 'week', week)
 
-        print(f"\n✅ Generated {1 + len(periods['months']) + len(periods['weeks'])} dashboard pages")
+        print("\n" + "="*80)
+        print(f"✅ Generated {1 + len(periods['months']) + len(periods['weeks'])} dashboard pages")
         print(f"   - 1 all-time page")
         print(f"   - {len(periods['months'])} monthly pages")
         print(f"   - {len(periods['weeks'])} weekly pages")
+        print("="*80)
 
     finally:
         conn.close()
