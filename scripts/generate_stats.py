@@ -2170,22 +2170,8 @@ def main():
         generate_jekyll_data_files(periods)
         print("✅ Generated Jekyll navigation data files")
 
-        # Generate all-time page (uses aggregate queries, no raw data loading)
-        print("="*80)
-        print("GENERATING ALL-TIME PAGE")
-        print("="*80)
-        # Pass empty DataFrames - all-time page uses compute_cumulative_stats() which handles data internally
-        generate_period_page_from_df(conn, pd.DataFrame(), pd.DataFrame(), 'all', None)
-
-        # Generate monthly pages (load data per month to avoid network timeout)
-        for month in periods['months']:
-            print("="*80)
-            print(f"GENERATING MONTHLY PAGE: {month['label']}")
-            print("="*80)
-            print(f"  Loading data for period: {month['start']} to {month['end']}")
-            month_raw = load_search_data(conn, start_date=month['start'], end_date=month['end'])
-            month_dedup = deduplicate_dataframe(month_raw)
-            generate_period_page_from_df(conn, month_raw, month_dedup, 'month', month)
+        # TEMPORARILY SKIP all-time and monthly pages to avoid loading all 20M rows
+        # TODO: Re-enable once we have more data or implement better pagination
 
         # Generate weekly pages (load data per week to avoid network timeout)
         for week in periods['weeks']:
@@ -2197,10 +2183,27 @@ def main():
             week_dedup = deduplicate_dataframe(week_raw)
             generate_period_page_from_df(conn, week_raw, week_dedup, 'week', week)
 
+        # Generate index page that redirects to most recent week
+        if periods['weeks']:
+            most_recent_week = periods['weeks'][0]  # weeks are sorted newest first
+            index_content = f"""---
+layout: default
+title: Soulseek Research Dashboard
+---
+
+<script>
+window.location.href = "week-{most_recent_week['year']}-{most_recent_week['week']:02d}.html";
+</script>
+
+<p>Redirecting to most recent week...</p>
+<p>If not redirected, <a href="week-{most_recent_week['year']}-{most_recent_week['week']:02d}.html">click here</a>.</p>
+"""
+            with open(os.path.join(DOCS_DIR, 'index.html'), 'w') as f:
+                f.write(index_content)
+            print("✅ Generated index.html redirect to most recent week")
+
         print("\n" + "="*80)
-        print(f"✅ Generated {1 + len(periods['months']) + len(periods['weeks'])} dashboard pages")
-        print(f"   - 1 all-time page")
-        print(f"   - {len(periods['months'])} monthly pages")
+        print(f"✅ Generated {len(periods['weeks'])} dashboard pages")
         print(f"   - {len(periods['weeks'])} weekly pages")
         print("="*80)
 
