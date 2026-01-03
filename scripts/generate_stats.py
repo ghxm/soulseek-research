@@ -2170,81 +2170,31 @@ def main():
         generate_jekyll_data_files(periods)
         print("✅ Generated Jekyll navigation data files")
 
-        # OPTIMIZATION: Load all data once (using SQL date filtering from earliest to latest)
-        # This is much faster than loading 20M rows multiple times
-        print("\n" + "="*80)
-        print("LOADING ALL DATA FROM DATABASE (this will take a few minutes)...")
-        print("="*80)
-
-        # Get the overall date range
-        all_weeks = periods['weeks']
-        all_months = periods['months']
-
-        if all_weeks or all_months:
-            # Find the earliest and latest dates across all periods
-            earliest = None
-            latest = None
-
-            for week in all_weeks:
-                if earliest is None or week['start'] < earliest:
-                    earliest = week['start']
-                if latest is None or week['end'] > latest:
-                    latest = week['end']
-
-            for month in all_months:
-                if earliest is None or month['start'] < earliest:
-                    earliest = month['start']
-                if latest is None or month['end'] > latest:
-                    latest = month['end']
-
-            # Load all data once with date filtering
-            all_data_raw = load_search_data(conn, start_date=earliest, end_date=latest)
-            print(f"\n✅ Loaded all data ({len(all_data_raw):,} rows)")
-
-            # Deduplicate once
-            print("Deduplicating all data...")
-            all_data_dedup = deduplicate_dataframe(all_data_raw)
-            print(f"✅ Deduplicated data ready ({len(all_data_dedup):,} rows)\n")
-        else:
-            all_data_raw = pd.DataFrame()
-            all_data_dedup = pd.DataFrame()
-
-        # Generate all-time page (now fast with pandas!)
+        # Generate all-time page (uses aggregate queries, no raw data loading)
         print("="*80)
         print("GENERATING ALL-TIME PAGE")
         print("="*80)
-        generate_period_page_from_df(conn, all_data_raw, all_data_dedup, 'all', None)
+        # Pass empty DataFrames - all-time page uses compute_cumulative_stats() which handles data internally
+        generate_period_page_from_df(conn, pd.DataFrame(), pd.DataFrame(), 'all', None)
 
-        # Generate monthly pages
+        # Generate monthly pages (load data per month to avoid network timeout)
         for month in periods['months']:
             print("="*80)
             print(f"GENERATING MONTHLY PAGE: {month['label']}")
             print("="*80)
-            # Filter data for this month (use .copy() to avoid SettingWithCopyWarning)
-            month_raw = all_data_raw[
-                (all_data_raw['timestamp'] >= month['start']) &
-                (all_data_raw['timestamp'] <= month['end'])
-            ].copy()
-            month_dedup = all_data_dedup[
-                (all_data_dedup['timestamp'] >= month['start']) &
-                (all_data_dedup['timestamp'] <= month['end'])
-            ].copy()
+            print(f"  Loading data for period: {month['start']} to {month['end']}")
+            month_raw = load_search_data(conn, start_date=month['start'], end_date=month['end'])
+            month_dedup = deduplicate_dataframe(month_raw)
             generate_period_page_from_df(conn, month_raw, month_dedup, 'month', month)
 
-        # Generate weekly pages
+        # Generate weekly pages (load data per week to avoid network timeout)
         for week in periods['weeks']:
             print("="*80)
             print(f"GENERATING WEEKLY PAGE: CW {week['label']}")
             print("="*80)
-            # Filter data for this week (use .copy() to avoid SettingWithCopyWarning)
-            week_raw = all_data_raw[
-                (all_data_raw['timestamp'] >= week['start']) &
-                (all_data_raw['timestamp'] <= week['end'])
-            ].copy()
-            week_dedup = all_data_dedup[
-                (all_data_dedup['timestamp'] >= week['start']) &
-                (all_data_dedup['timestamp'] <= week['end'])
-            ].copy()
+            print(f"  Loading data for period: {week['start']} to {week['end']}")
+            week_raw = load_search_data(conn, start_date=week['start'], end_date=week['end'])
+            week_dedup = deduplicate_dataframe(week_raw)
             generate_period_page_from_df(conn, week_raw, week_dedup, 'week', week)
 
         print("\n" + "="*80)
