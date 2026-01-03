@@ -992,7 +992,7 @@ def generate_article_html(stats: Dict, figures: Dict[str, go.Figure],
         <div class="footer">
             <p>Soulseek Research Project | Data collected from distributed geographic locations</p>
             <p>All usernames are cryptographically hashed for privacy | Research use only</p>
-            <p><a href="https://github.com/maxhaag/soulseek-research">View on GitHub</a></p>
+            <p><a href="https://github.com/ghxm/soulseek-research">View on GitHub</a></p>
         </div>
     </div>
 </body>
@@ -1178,7 +1178,7 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure],
 </head>
 <body>
     <div class="container">
-        <h1>Soulseek Research Network Dashboard</h1>
+        <h1>Soulseek Research Data Collection</h1>
 
         <p class="timestamp">Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
 
@@ -1243,8 +1243,8 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure],
 
         <div class="footer">
             <p>Soulseek Research Project | Data collected from distributed geographic locations</p>
-            <p>All usernames are cryptographically hashed for privacy | Research use only</p>
-            <p><a href="https://github.com/maxhaag/soulseek-research">View on GitHub</a></p>
+            <p>All usernames are cryptographically hashed for privacy</p>
+            <p><a href="https://github.com/ghxm/soulseek-research">View on GitHub</a></p>
         </div>
     </div>
 </body>
