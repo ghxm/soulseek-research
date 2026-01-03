@@ -2185,18 +2185,19 @@ def main():
 
         # Generate index page that redirects to most recent week
         if periods['weeks']:
-            most_recent_week = periods['weeks'][0]  # weeks are sorted newest first
+            most_recent_week = periods['weeks'][-1]  # weeks are sorted oldest first, get last one
+            week_filename = f"week-{most_recent_week['id']}.html"
             index_content = f"""---
 layout: default
 title: Soulseek Research Dashboard
 ---
 
 <script>
-window.location.href = "week-{most_recent_week['year']}-{most_recent_week['week']:02d}.html";
+window.location.href = "{week_filename}";
 </script>
 
 <p>Redirecting to most recent week...</p>
-<p>If not redirected, <a href="week-{most_recent_week['year']}-{most_recent_week['week']:02d}.html">click here</a>.</p>
+<p>If not redirected, <a href="{week_filename}">click here</a>.</p>
 """
             with open(os.path.join(DOCS_DIR, 'index.html'), 'w') as f:
                 f.write(index_content)
