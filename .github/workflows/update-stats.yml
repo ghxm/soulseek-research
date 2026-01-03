@@ -17,35 +17,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: Install dependencies
-        run: pip install -r requirements-dashboard.txt
-
-      - name: Download archives from database server
+      - name: Setup SSH and generate statistics on database server
         env:
           SSH_KEY: ${{ secrets.DB_SERVER_SSH_KEY }}
           DB_HOST: ${{ secrets.DB_SERVER_IP }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
+          # Setup SSH
           mkdir -p ~/.ssh
           echo "$SSH_KEY" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H $DB_HOST >> ~/.ssh/known_hosts
 
-          # Download archives if they exist
-          mkdir -p archives
-          scp -r -o StrictHostKeyChecking=no root@$DB_HOST:/opt/archives/*.csv.gz archives/ 2>/dev/null || echo "No archives found (this is OK for new deployments)"
-          ls -la archives/ || true
+          # Sync code to database server
+          scp -r -o StrictHostKeyChecking=no scripts/ root@$DB_HOST:/opt/soulseek-research/scripts/
+          scp -r -o StrictHostKeyChecking=no requirements-dashboard.txt root@$DB_HOST:/opt/soulseek-research/
 
-      - name: Generate statistics
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          ARCHIVE_PATH: ./archives
-        run: |
-          python scripts/generate_stats.py
+          # Run stats generation on database server (local to the database)
+          ssh -o StrictHostKeyChecking=no root@$DB_HOST "cd /opt/soulseek-research && \
+            python3 -m pip install -q -r requirements-dashboard.txt && \
+            DATABASE_URL='$DATABASE_URL' ARCHIVE_PATH=/opt/archives python3 scripts/generate_stats.py"
+
+          # Download generated docs directory
+          scp -r -o StrictHostKeyChecking=no root@$DB_HOST:/opt/soulseek-research/docs ./
 
       - name: Build with Jekyll
         uses: actions/jekyll-build-pages@v1
