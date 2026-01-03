@@ -1773,6 +1773,20 @@ def generate_period_page(conn, period_type: str, period_info: Optional[Dict] = N
         else:
             days = 365  # fallback
 
+    # PERFORMANCE OPTIMIZATION: Create temp table with deduplicated data ONCE
+    # This avoids running the expensive deduplication CTE 10+ times per page
+    print(f"  Creating deduplicated temp table for {period_label}...")
+    cursor = conn.cursor()
+    dedup_cte = get_deduplication_cte(start_date, end_date)
+    cursor.execute(f"""
+        CREATE TEMP TABLE temp_deduplicated AS
+        {dedup_cte}
+        SELECT id, client_id, timestamp, username, query
+        FROM deduplicated_searches
+    """)
+    conn.commit()
+    print(f"  Temp table created, querying metrics...")
+
     # Query time-series data (with date filter for performance)
     daily_stats = pd.read_sql_query(f"""
         SELECT
@@ -1784,15 +1798,11 @@ def generate_period_page(conn, period_type: str, period_info: Optional[Dict] = N
         GROUP BY client_id, DATE(timestamp)
         ORDER BY date DESC, client_id
     """, conn)
-
-    # Get dedup CTE with date filtering for performance
-    dedup_cte = get_deduplication_cte(start_date, end_date)
     daily_unique_users = pd.read_sql_query(f"""
-        {dedup_cte}
         SELECT
             DATE(timestamp) as date,
             COUNT(DISTINCT username) as unique_users
-        FROM deduplicated_searches
+        FROM temp_deduplicated
         GROUP BY DATE(timestamp)
         ORDER BY date DESC
     """, conn)
@@ -1818,16 +1828,13 @@ def generate_period_page(conn, period_type: str, period_info: Optional[Dict] = N
         ORDER BY date
     """, conn)
 
-    # Query aggregate data (date filter in CTE)
-    cursor = conn.cursor()
-
+    # Query aggregate data (from temp table)
     cursor.execute(f"""
-        {dedup_cte}
         SELECT
             LOWER(TRIM(query)) as query,
             COUNT(DISTINCT username) as unique_users,
             COUNT(*) as total_searches
-        FROM deduplicated_searches
+        FROM temp_deduplicated
         GROUP BY LOWER(TRIM(query))
         ORDER BY unique_users DESC
         LIMIT 100
@@ -1835,12 +1842,11 @@ def generate_period_page(conn, period_type: str, period_info: Optional[Dict] = N
     top_queries = cursor.fetchall()
 
     cursor.execute(f"""
-        {dedup_cte}
         SELECT
             username,
             COUNT(*) as search_count,
             COUNT(DISTINCT query) as unique_queries
-        FROM deduplicated_searches
+        FROM temp_deduplicated
         GROUP BY username
         ORDER BY search_count DESC
         LIMIT 50
@@ -1848,9 +1854,8 @@ def generate_period_page(conn, period_type: str, period_info: Optional[Dict] = N
     top_users = cursor.fetchall()
 
     cursor.execute(f"""
-        {dedup_cte}
         SELECT query
-        FROM deduplicated_searches
+        FROM temp_deduplicated
         LIMIT 10000
     """)
     query_sample = [row[0] for row in cursor.fetchall()]
@@ -1861,21 +1866,19 @@ def generate_period_page(conn, period_type: str, period_info: Optional[Dict] = N
     query_patterns = analyze_query_patterns(query_sample)
 
     temporal_data = pd.read_sql_query(f"""
-        {dedup_cte}
         SELECT
             EXTRACT(HOUR FROM timestamp) as hour,
             COUNT(*) as search_count
-        FROM deduplicated_searches
+        FROM temp_deduplicated
         GROUP BY EXTRACT(HOUR FROM timestamp)
         ORDER BY hour
     """, conn)
 
     query_length_data = pd.read_sql_query(f"""
-        {dedup_cte}
         SELECT
             array_length(string_to_array(LOWER(TRIM(query)), ' '), 1) as query_length,
             COUNT(DISTINCT LOWER(TRIM(query))) as count
-        FROM deduplicated_searches
+        FROM temp_deduplicated
         GROUP BY array_length(string_to_array(LOWER(TRIM(query)), ' '), 1)
         ORDER BY query_length
     """, conn)
@@ -1922,6 +1925,12 @@ def generate_period_page(conn, period_type: str, period_info: Optional[Dict] = N
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, 'w', encoding='utf-8') as f:
         f.write(html)
+
+    # Cleanup temp table
+    cursor = conn.cursor()
+    cursor.execute("DROP TABLE IF EXISTS temp_deduplicated")
+    conn.commit()
+    cursor.close()
 
     print(f"  ✅ Generated {output_file}")
     return output_file
