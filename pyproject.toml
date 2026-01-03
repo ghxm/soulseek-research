@@ -10,19 +10,22 @@ requires-python = ">=3.10"
 dependencies = [
     # 🚀 MAJOR REFACTOR: aioslsk is now an external dependency
     "aioslsk>=1.6.1",
-    
+
     # Database dependencies
     "sqlalchemy[asyncio]>=2.0.0",
     "aiosqlite>=0.19.0",
     "asyncpg>=0.29.0",
-    
+
     # Settings and utilities
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
     "click>=8.0.0",
     "python-dotenv>=1.0.0",
     "cryptography>=41.0.0",
-    
+
+    # Statistics and visualization (for generate_stats.py)
+    "mistune>=3.0.0",
+
     # Development and testing
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",

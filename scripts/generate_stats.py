@@ -9,7 +9,7 @@ import json
 import re
 from datetime import datetime, timedelta, timezone
 from collections import Counter, defaultdict
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 import psycopg2
 import pandas as pd
@@ -17,6 +17,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 import numpy as np
+import mistune
 
 
 def get_db_connection():
@@ -70,6 +71,71 @@ def get_deduplication_cte() -> str:
             WHERE rn = 1
         )
     """
+
+
+def load_article_content(article_path: str = 'docs/article.md') -> Optional[str]:
+    """
+    Load article Markdown content if it exists.
+
+    Returns None if file doesn't exist, enabling graceful fallback to normal mode.
+    """
+    if os.path.exists(article_path):
+        with open(article_path, 'r', encoding='utf-8') as f:
+            return f.read()
+    return None
+
+
+def parse_article_sections(markdown_content: str) -> List[Dict[str, Any]]:
+    """
+    Parse Markdown into sections with chart markers identified.
+
+    Returns list of section dicts:
+    [
+        {
+            'type': 'prose',  # or 'chart' or 'stats-grid'
+            'content': '<p>Rendered HTML...</p>',  # for prose
+            'chart_id': 'daily_flow',  # for chart type
+        },
+        ...
+    ]
+    """
+    sections = []
+
+    # Pattern to match chart markers and stats-grid
+    pattern = r'(<!--\s*chart:\s*(\w+)\s*-->|<!--\s*stats-grid\s*-->)'
+
+    # Split content while keeping delimiters
+    parts = re.split(pattern, markdown_content)
+
+    # Create Markdown parser
+    md_parser = mistune.create_markdown()
+
+    i = 0
+    while i < len(parts):
+        part = parts[i] if i < len(parts) else ''
+
+        if part and part.strip():
+            if '<!-- chart:' in part:
+                # Next item should be the chart_id from the regex group
+                if i + 1 < len(parts):
+                    chart_id = parts[i + 1].strip()
+                    sections.append({'type': 'chart', 'chart_id': chart_id})
+                    i += 2  # Skip the captured group
+                else:
+                    i += 1
+            elif '<!-- stats-grid -->' in part:
+                sections.append({'type': 'stats-grid'})
+                i += 1
+            else:
+                # Prose content - convert Markdown to HTML
+                html = md_parser(part)
+                if html.strip():
+                    sections.append({'type': 'prose', 'content': html})
+                i += 1
+        else:
+            i += 1
+
+    return sections
 
 
 def query_daily_stats(conn, days: int = 7) -> pd.DataFrame:
@@ -695,9 +761,251 @@ def create_client_distribution_chart(client_totals: Dict[str, int]) -> go.Figure
     return fig
 
 
-def generate_html(stats: Dict, figures: Dict[str, go.Figure]) -> str:
-    """Generate HTML dashboard"""
+def generate_stats_grid_html(stats: Dict) -> str:
+    """Generate the stats summary cards HTML."""
+    days = (datetime.fromisoformat(stats['last_search']) -
+            datetime.fromisoformat(stats['first_search'])).days
 
+    return f'''
+        <div class="stats-grid">
+            <div class="stat-card">
+                <h3>Total Searches</h3>
+                <div class="value">{stats['total_searches']:,}</div>
+                <div class="label">Deduplicated searches</div>
+            </div>
+            <div class="stat-card">
+                <h3>Unique Users</h3>
+                <div class="value">{stats['total_users']:,}</div>
+                <div class="label">Anonymized users</div>
+            </div>
+            <div class="stat-card">
+                <h3>Unique Queries</h3>
+                <div class="value">{stats['total_queries']:,}</div>
+                <div class="label">Different search terms</div>
+            </div>
+            <div class="stat-card">
+                <h3>Collection Period</h3>
+                <div class="value">{days}</div>
+                <div class="label">Days of data</div>
+            </div>
+        </div>
+    '''
+
+
+def generate_article_html(stats: Dict, figures: Dict[str, go.Figure],
+                          sections: List[Dict[str, Any]]) -> str:
+    """Generate HTML dashboard in article mode with narrative content."""
+    # Convert figures to HTML
+    chart_html = {}
+    for name, fig in figures.items():
+        if fig is not None:
+            chart_html[name] = fig.to_html(full_html=False, include_plotlyjs='cdn')
+        else:
+            chart_html[name] = '<p>Not enough data for visualization</p>'
+
+    # Build body content from sections
+    body_parts = []
+    for section in sections:
+        if section['type'] == 'prose':
+            body_parts.append(f'<div class="prose">{section["content"]}</div>')
+        elif section['type'] == 'chart':
+            chart_id = section['chart_id']
+            if chart_id in chart_html:
+                body_parts.append(f'<div class="chart">{chart_html[chart_id]}</div>')
+            else:
+                print(f"Warning: Unknown chart ID '{chart_id}' in article.md")
+                body_parts.append(f'<p style="color: #999; font-style: italic;">Chart not found: {chart_id}</p>')
+        elif section['type'] == 'stats-grid':
+            body_parts.append(generate_stats_grid_html(stats))
+
+    body_content = '\n'.join(body_parts)
+
+    # Same HTML structure as normal mode, but with article-mode class and dynamic content
+    html = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Soulseek Research Report</title>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: white;
+        }}
+        .container {{
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            padding: 30px;
+        }}
+        h1 {{
+            color: black;
+            border-bottom: 2px solid black;
+            padding-bottom: 10px;
+            font-weight: 600;
+        }}
+        h2 {{
+            color: black;
+            margin-top: 40px;
+            border-bottom: 1px solid #ccc;
+            padding-bottom: 8px;
+            font-weight: 600;
+        }}
+        .stats-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin: 30px 0;
+        }}
+        .stat-card {{
+            background: white;
+            color: black;
+            padding: 20px;
+            border: 1px solid #333;
+        }}
+        .stat-card h3 {{
+            margin: 0;
+            font-size: 14px;
+            font-weight: 400;
+            color: #666;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }}
+        .stat-card .value {{
+            font-size: 32px;
+            font-weight: 600;
+            margin: 10px 0;
+            color: black;
+        }}
+        .stat-card .label {{
+            font-size: 12px;
+            color: #999;
+        }}
+        .chart {{
+            margin: 30px 0;
+            border: 1px solid #eee;
+            padding: 10px;
+        }}
+        .footer {{
+            margin-top: 50px;
+            text-align: center;
+            color: #999;
+            font-size: 14px;
+            border-top: 1px solid #eee;
+            padding-top: 20px;
+        }}
+        .footer a {{
+            color: #666;
+            text-decoration: none;
+            border-bottom: 1px solid #666;
+        }}
+        .timestamp {{
+            color: #666;
+            font-size: 14px;
+            margin-top: 20px;
+        }}
+        /* Article mode prose styling */
+        .prose {{
+            max-width: 800px;
+            margin: 0 auto 30px auto;
+            line-height: 1.7;
+            color: #333;
+        }}
+        .prose p {{
+            margin: 1em 0;
+            font-size: 16px;
+        }}
+        .prose h2 {{
+            margin-top: 50px;
+        }}
+        .prose h3 {{
+            color: #333;
+            margin-top: 30px;
+            font-size: 20px;
+            font-weight: 500;
+        }}
+        .prose ul, .prose ol {{
+            margin: 1em 0;
+            padding-left: 2em;
+        }}
+        .prose li {{
+            margin: 0.5em 0;
+        }}
+        .prose code {{
+            background: #f5f5f5;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 14px;
+        }}
+        .prose pre {{
+            background: #f5f5f5;
+            padding: 15px;
+            border-radius: 4px;
+            overflow-x: auto;
+        }}
+        .prose pre code {{
+            background: none;
+            padding: 0;
+        }}
+        .prose blockquote {{
+            border-left: 4px solid #333;
+            margin: 1.5em 0;
+            padding-left: 20px;
+            color: #666;
+            font-style: italic;
+        }}
+        .prose a {{
+            color: #333;
+            text-decoration: underline;
+        }}
+        .prose strong {{
+            font-weight: 600;
+        }}
+        .prose em {{
+            font-style: italic;
+        }}
+        /* Center charts in article mode */
+        .article-mode .chart {{
+            max-width: 1200px;
+            margin: 30px auto;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container article-mode">
+        <p class="timestamp">Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
+
+        {body_content}
+
+        <div class="footer">
+            <p>Soulseek Research Project | Data collected from distributed geographic locations</p>
+            <p>All usernames are cryptographically hashed for privacy | Research use only</p>
+            <p><a href="https://github.com/maxhaag/soulseek-research">View on GitHub</a></p>
+        </div>
+    </div>
+</body>
+</html>
+"""
+    return html
+
+
+def generate_html(stats: Dict, figures: Dict[str, go.Figure],
+                  article_content: Optional[str] = None) -> str:
+    """
+    Generate HTML dashboard.
+
+    If article_content is provided, generates article mode with prose.
+    Otherwise, generates standard chart-only dashboard (existing behavior).
+    """
+    # Article mode: parse Markdown and generate article-style HTML
+    if article_content:
+        sections = parse_article_sections(article_content)
+        return generate_article_html(stats, figures, sections)
+
+    # Normal mode: generate standard dashboard
     # Convert figures to HTML divs
     chart_html = {}
     for name, fig in figures.items():
@@ -792,6 +1100,71 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure]) -> str:
             font-size: 14px;
             margin-top: 20px;
         }}
+        /* Article mode prose styling */
+        .prose {{
+            max-width: 800px;
+            margin: 0 auto 30px auto;
+            line-height: 1.7;
+            color: #333;
+        }}
+        .prose p {{
+            margin: 1em 0;
+            font-size: 16px;
+        }}
+        .prose h2 {{
+            margin-top: 50px;
+        }}
+        .prose h3 {{
+            color: #333;
+            margin-top: 30px;
+            font-size: 20px;
+            font-weight: 500;
+        }}
+        .prose ul, .prose ol {{
+            margin: 1em 0;
+            padding-left: 2em;
+        }}
+        .prose li {{
+            margin: 0.5em 0;
+        }}
+        .prose code {{
+            background: #f5f5f5;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 14px;
+        }}
+        .prose pre {{
+            background: #f5f5f5;
+            padding: 15px;
+            border-radius: 4px;
+            overflow-x: auto;
+        }}
+        .prose pre code {{
+            background: none;
+            padding: 0;
+        }}
+        .prose blockquote {{
+            border-left: 4px solid #333;
+            margin: 1.5em 0;
+            padding-left: 20px;
+            color: #666;
+            font-style: italic;
+        }}
+        .prose a {{
+            color: #333;
+            text-decoration: underline;
+        }}
+        .prose strong {{
+            font-weight: 600;
+        }}
+        .prose em {{
+            font-style: italic;
+        }}
+        /* Center charts in article mode */
+        .article-mode .chart {{
+            max-width: 1200px;
+            margin: 30px auto;
+        }}
     </style>
 </head>
 <body>
@@ -811,28 +1184,7 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure]) -> str:
             </p>
         </div>
 
-        <div class="stats-grid">
-            <div class="stat-card">
-                <h3>Total Searches</h3>
-                <div class="value">{stats['total_searches']:,}</div>
-                <div class="label">Deduplicated searches</div>
-            </div>
-            <div class="stat-card">
-                <h3>Unique Users</h3>
-                <div class="value">{stats['total_users']:,}</div>
-                <div class="label">Anonymized users</div>
-            </div>
-            <div class="stat-card">
-                <h3>Unique Queries</h3>
-                <div class="value">{stats['total_queries']:,}</div>
-                <div class="label">Different search terms</div>
-            </div>
-            <div class="stat-card">
-                <h3>Collection Period</h3>
-                <div class="value">{(datetime.fromisoformat(stats['last_search']) - datetime.fromisoformat(stats['first_search'])).days}</div>
-                <div class="label">Days of data</div>
-            </div>
-        </div>
+        {generate_stats_grid_html(stats)}
 
         <h2>Data Collection Overview <span style="font-weight: normal; font-size: 14px; color: #999;">(Raw Counts)</span></h2>
         <div class="chart">
@@ -940,8 +1292,16 @@ def main():
             'cooccurrence': create_cooccurrence_chart(cooccurrences)
         }
 
+        # Check for article content
+        article_content = load_article_content('docs/article.md')
+
+        if article_content:
+            print("Article mode: Found docs/article.md")
+        else:
+            print("Standard mode: No article.md found")
+
         print("Generating HTML...")
-        html = generate_html(stats, figures)
+        html = generate_html(stats, figures, article_content=article_content)
 
         # Create docs directory
         os.makedirs('docs', exist_ok=True)
