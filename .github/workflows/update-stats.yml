@@ -30,10 +30,10 @@ jobs:
           ssh-keyscan -H $DB_HOST >> ~/.ssh/known_hosts
 
           # Create directory structure on database server
-          ssh -o StrictHostKeyChecking=no root@$DB_HOST "mkdir -p /opt/soulseek-research/scripts /opt/archives"
+          ssh -o StrictHostKeyChecking=no root@$DB_HOST "mkdir -p /opt/soulseek-research /opt/archives"
 
           # Sync code to database server
-          scp -r -o StrictHostKeyChecking=no scripts/ root@$DB_HOST:/opt/soulseek-research/scripts/
+          scp -r -o StrictHostKeyChecking=no scripts root@$DB_HOST:/opt/soulseek-research/
           scp -o StrictHostKeyChecking=no requirements-dashboard.txt root@$DB_HOST:/opt/soulseek-research/
 
           # Install pip and dependencies, then run stats generation on database server
