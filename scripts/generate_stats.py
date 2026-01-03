@@ -1901,8 +1901,21 @@ def generate_period_page(conn, period_type: str, period_info: Optional[Dict] = N
         'cooccurrence': create_cooccurrence_chart(cooccurrences) if cooccurrences else None
     }
 
+    # Check for article mode (only for all-time page)
+    article_content = None
+    if period_type == 'all':
+        article_content = load_article_content('docs/article.md')
+        if article_content:
+            print("  Using article mode for all-time page")
+
     # Generate HTML with Jekyll front matter
-    html = generate_period_html(stats, figures, period_type, period_info)
+    if article_content:
+        # Use article mode (with charts embedded in narrative)
+        sections = parse_article_sections(article_content)
+        html = generate_article_html_with_jekyll(stats, figures, sections, period_type, period_info)
+    else:
+        # Standard dashboard page
+        html = generate_period_html(stats, figures, period_type, period_info)
 
     # Write output
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
@@ -1911,6 +1924,116 @@ def generate_period_page(conn, period_type: str, period_info: Optional[Dict] = N
 
     print(f"  ✅ Generated {output_file}")
     return output_file
+
+
+def generate_article_html_with_jekyll(stats: Dict, figures: Dict[str, go.Figure],
+                                      sections: List[Dict[str, Any]],
+                                      period_type: str, period_info: Optional[Dict] = None) -> str:
+    """Generate article mode HTML with Jekyll front matter"""
+    # Jekyll front matter (article mode is only for all-time)
+    front_matter = "---\nlayout: dashboard\nperiod: all\ntitle: All Time Statistics\n---\n\n"
+
+    # Convert figures to HTML
+    chart_html = {}
+    for name, fig in figures.items():
+        if fig is not None:
+            chart_html[name] = fig.to_html(full_html=False, include_plotlyjs='cdn')
+        else:
+            chart_html[name] = '<p>Not enough data for visualization</p>'
+
+    # Build body content from sections
+    body_parts = []
+    for section in sections:
+        if section['type'] == 'prose':
+            body_parts.append(f'<div class="prose">{section["content"]}</div>')
+        elif section['type'] == 'chart':
+            chart_id = section['chart_id']
+            if chart_id in chart_html:
+                body_parts.append(f'<div class="chart">{chart_html[chart_id]}</div>')
+            else:
+                print(f"Warning: Unknown chart ID '{chart_id}' in article.md")
+                body_parts.append(f'<p style="color: #999; font-style: italic;">Chart not found: {chart_id}</p>')
+        elif section['type'] == 'stats-grid':
+            body_parts.append(generate_stats_grid_html(stats))
+
+    body_content = '\n'.join(body_parts)
+
+    # Add article mode specific CSS inline
+    article_css = '''
+    <style>
+        .prose {
+            max-width: 800px;
+            margin: 0 auto 30px auto;
+            line-height: 1.7;
+            color: #333;
+        }
+        .prose p {
+            margin: 1em 0;
+            font-size: 16px;
+        }
+        .prose h2 {
+            margin-top: 50px;
+        }
+        .prose h3 {
+            color: #333;
+            margin-top: 30px;
+            font-size: 20px;
+            font-weight: 500;
+        }
+        .prose ul, .prose ol {
+            margin: 1em 0;
+            padding-left: 2em;
+        }
+        .prose li {
+            margin: 0.5em 0;
+        }
+        .prose code {
+            background: #f5f5f5;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 14px;
+        }
+        .prose pre {
+            background: #f5f5f5;
+            padding: 15px;
+            border-radius: 4px;
+            overflow-x: auto;
+        }
+        .prose pre code {
+            background: none;
+            padding: 0;
+        }
+        .prose blockquote {
+            border-left: 4px solid #333;
+            margin: 1.5em 0;
+            padding-left: 20px;
+            color: #666;
+            font-style: italic;
+        }
+        .prose a {
+            color: #333;
+            text-decoration: underline;
+        }
+        .prose strong {
+            font-weight: 600;
+        }
+        .prose em {
+            font-style: italic;
+        }
+        .chart {
+            max-width: 1200px;
+            margin: 30px auto;
+        }
+    </style>
+    '''
+
+    content = f'''{article_css}
+<p class="timestamp">Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
+
+{body_content}
+'''
+
+    return front_matter + content
 
 
 def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
