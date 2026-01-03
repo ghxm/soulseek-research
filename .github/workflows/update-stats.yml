@@ -25,25 +25,33 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements-dashboard.txt
 
-      - name: Download archives from server
+      - name: Generate statistics on database server
         env:
           SSH_KEY: ${{ secrets.DB_SERVER_SSH_KEY }}
           DB_HOST: ${{ secrets.DB_SERVER_IP }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
         run: |
           mkdir -p ~/.ssh
           echo "$SSH_KEY" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H $DB_HOST >> ~/.ssh/known_hosts
 
-          # Download all archive files
-          mkdir -p archives
-          scp -o StrictHostKeyChecking=no root@$DB_HOST:/opt/archives/*.csv.gz archives/ || echo "No archives found or error downloading"
+          # Generate stats on database server (faster - no network latency)
+          ssh -o StrictHostKeyChecking=no root@$DB_HOST "
+            cd /opt/soulseek-research/repo
+            git pull origin main
+            docker run --rm \
+              --network=host \
+              -v /opt/archives:/archives \
+              -v /tmp/docs:/docs \
+              -e DATABASE_URL='postgresql://soulseek:${DB_PASSWORD}@localhost:5432/soulseek' \
+              -e ARCHIVE_PATH=/archives \
+              soulseek-research:latest \
+              uv run python /app/scripts/generate_stats.py
+          "
 
-      - name: Generate statistics
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          ARCHIVE_PATH: archives
-        run: python scripts/generate_stats.py
+          # Download generated docs
+          scp -r -o StrictHostKeyChecking=no root@$DB_HOST:/tmp/docs ./
 
       - name: Build with Jekyll
         uses: actions/jekyll-build-pages@v1
