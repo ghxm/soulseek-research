@@ -2220,15 +2220,15 @@ def main():
             print("="*80)
             print(f"GENERATING MONTHLY PAGE: {month['label']}")
             print("="*80)
-            # Filter data for this month
+            # Filter data for this month (use .copy() to avoid SettingWithCopyWarning)
             month_raw = all_data_raw[
                 (all_data_raw['timestamp'] >= month['start']) &
                 (all_data_raw['timestamp'] <= month['end'])
-            ]
+            ].copy()
             month_dedup = all_data_dedup[
                 (all_data_dedup['timestamp'] >= month['start']) &
                 (all_data_dedup['timestamp'] <= month['end'])
-            ]
+            ].copy()
             generate_period_page_from_df(conn, month_raw, month_dedup, 'month', month)
 
         # Generate weekly pages
@@ -2236,15 +2236,15 @@ def main():
             print("="*80)
             print(f"GENERATING WEEKLY PAGE: CW {week['label']}")
             print("="*80)
-            # Filter data for this week
+            # Filter data for this week (use .copy() to avoid SettingWithCopyWarning)
             week_raw = all_data_raw[
                 (all_data_raw['timestamp'] >= week['start']) &
                 (all_data_raw['timestamp'] <= week['end'])
-            ]
+            ].copy()
             week_dedup = all_data_dedup[
                 (all_data_dedup['timestamp'] >= week['start']) &
                 (all_data_dedup['timestamp'] <= week['end'])
-            ]
+            ].copy()
             generate_period_page_from_df(conn, week_raw, week_dedup, 'week', week)
 
         print("\n" + "="*80)
