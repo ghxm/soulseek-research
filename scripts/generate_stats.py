@@ -178,7 +178,7 @@ def query_top_queries(conn, limit: int = 100) -> List[tuple]:
             COUNT(*) as total_searches
         FROM deduplicated_searches
         GROUP BY query
-        ORDER BY total_searches DESC
+        ORDER BY unique_users DESC
         LIMIT %s
     """
     cursor = conn.cursor()
@@ -209,14 +209,14 @@ def query_most_active_users(conn, limit: int = 50) -> List[tuple]:
 
 
 def query_query_length_distribution(conn) -> pd.DataFrame:
-    """Query distribution of search query lengths (deduplicated)"""
+    """Query distribution of search query lengths in words (unique queries)"""
     query = f"""
         {get_deduplication_cte()}
         SELECT
-            LENGTH(query) as query_length,
-            COUNT(*) as count
+            array_length(string_to_array(TRIM(query), ' '), 1) as query_length,
+            COUNT(DISTINCT query) as count
         FROM deduplicated_searches
-        GROUP BY LENGTH(query)
+        GROUP BY array_length(string_to_array(TRIM(query), ' '), 1)
         ORDER BY query_length
     """
     return pd.read_sql_query(query, conn)
@@ -271,48 +271,49 @@ def query_all_queries_sample(conn, limit: int = 10000) -> List[str]:
 
 
 def analyze_query_patterns(queries: List[str]) -> Dict[str, int]:
-    """Classify queries by structure pattern"""
+    """Analyze query characteristics - counts unique queries with each feature"""
     patterns = {
-        'Single Word': 0,
-        'Artist - Song': 0,
-        'Artist Album': 0,
-        'Multi-word (2-3)': 0,
-        'Long Query (4+)': 0,
         'Contains Numbers': 0,
-        'Special Characters': 0
+        'Contains Special Characters': 0,
+        'Contains Hyphens': 0,
+        'Contains Parentheses': 0
     }
 
     for query in queries:
-        query_lower = query.lower().strip()
-        word_count = len(query_lower.split())
+        # Normalize query for consistent checking
+        query_normalized = query.lower().strip()
 
-        # Check for specific patterns
-        if ' - ' in query_lower or ' – ' in query_lower:
-            patterns['Artist - Song'] += 1
-        elif word_count == 1:
-            patterns['Single Word'] += 1
-        elif word_count == 2:
-            # Could be artist + album/song
-            patterns['Artist Album'] += 1
-        elif word_count == 3:
-            patterns['Multi-word (2-3)'] += 1
-        elif word_count >= 4:
-            patterns['Long Query (4+)'] += 1
-
-        if re.search(r'\d', query):
+        # Contains numbers (0-9)
+        if re.search(r'\d', query_normalized):
             patterns['Contains Numbers'] += 1
-        if re.search(r'[^\w\s-]', query):
-            patterns['Special Characters'] += 1
+
+        # Contains special characters (excluding alphanumeric, spaces, hyphens, and parentheses)
+        if re.search(r'[^\w\s\-\–\—\‐\‑\(\)\[\]\{\}]', query_normalized):
+            patterns['Contains Special Characters'] += 1
+
+        # Contains hyphens (all kinds: - – — ‐ ‑)
+        if re.search(r'[\-\–\—\‐\‑]', query_normalized):
+            patterns['Contains Hyphens'] += 1
+
+        # Contains parentheses (all kinds: () [] {})
+        if re.search(r'[\(\)\[\]\{\}]', query_normalized):
+            patterns['Contains Parentheses'] += 1
 
     return patterns
 
 
 def analyze_ngrams(queries: List[str], n: int = 2, limit: int = 30) -> List[Tuple[str, int]]:
-    """Extract most common n-grams from queries"""
+    """
+    Extract most common n-grams from queries.
+
+    Note: Queries are normalized (lowercased and stripped) before analysis.
+    """
     ngrams = Counter()
 
     for query in queries:
-        words = query.lower().split()
+        # Normalize query for consistent analysis
+        query_normalized = query.lower().strip()
+        words = query_normalized.split()
         if len(words) >= n:
             for i in range(len(words) - n + 1):
                 ngram = ' '.join(words[i:i+n])
@@ -322,11 +323,17 @@ def analyze_ngrams(queries: List[str], n: int = 2, limit: int = 30) -> List[Tupl
 
 
 def analyze_term_cooccurrence(queries: List[str], min_freq: int = 5) -> List[Tuple[str, str, int]]:
-    """Analyze which terms frequently appear together in searches"""
+    """
+    Analyze which terms frequently appear together in searches.
+
+    Note: Queries are normalized (lowercased and stripped) before analysis.
+    """
     # Build word frequency
     word_freq = Counter()
     for query in queries:
-        words = set(query.lower().split())
+        # Normalize query for consistent analysis
+        query_normalized = query.lower().strip()
+        words = set(query_normalized.split())
         word_freq.update(words)
 
     # Filter to common words
@@ -335,7 +342,9 @@ def analyze_term_cooccurrence(queries: List[str], min_freq: int = 5) -> List[Tup
     # Count co-occurrences
     cooccurrence = Counter()
     for query in queries:
-        words = [w for w in set(query.lower().split()) if w in common_words]
+        # Normalize query for consistent analysis
+        query_normalized = query.lower().strip()
+        words = [w for w in set(query_normalized.split()) if w in common_words]
         if len(words) >= 2:
             # Create pairs
             for i, w1 in enumerate(words):
@@ -457,12 +466,12 @@ def create_daily_unique_users_chart(df: pd.DataFrame) -> go.Figure:
 def create_top_queries_chart(top_queries: List[tuple]) -> go.Figure:
     """Create bar chart of top queries"""
     queries = [q[0][:50] for q in top_queries[:20]]  # Truncate long queries
-    counts = [q[2] for q in top_queries[:20]]
+    unique_users = [q[1] for q in top_queries[:20]]  # q[1] is unique_users count
 
     fig = go.Figure(data=[
         go.Bar(
             y=queries[::-1],  # Reverse for better display
-            x=counts[::-1],
+            x=unique_users[::-1],
             orientation='h',
             marker=dict(color='#333333', line=dict(color='black', width=1))
         )
@@ -499,9 +508,9 @@ def create_query_pattern_chart(patterns: Dict[str, int]) -> go.Figure:
     ])
 
     fig.update_layout(
-        title='Search Query Patterns',
-        xaxis_title='Number of Queries',
-        yaxis_title='Pattern Type',
+        title='Search Query Characteristics',
+        xaxis_title='Number of Unique Queries',
+        yaxis_title='Characteristic',
         height=500,
         template='plotly_white',
         plot_bgcolor='white',
