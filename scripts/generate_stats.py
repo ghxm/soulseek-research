@@ -87,6 +87,21 @@ def query_daily_stats(conn, days: int = 7) -> pd.DataFrame:
     return pd.read_sql_query(query, conn, params=(days,))
 
 
+def query_daily_unique_users(conn, days: int = 7) -> pd.DataFrame:
+    """Query unique users per day for the last N days (deduplicated)"""
+    query = f"""
+        {get_deduplication_cte()}
+        SELECT
+            DATE(timestamp) as date,
+            COUNT(DISTINCT username) as unique_users
+        FROM deduplicated_searches
+        WHERE timestamp >= NOW() - INTERVAL '%s days'
+        GROUP BY DATE(timestamp)
+        ORDER BY date DESC
+    """
+    return pd.read_sql_query(query, conn, params=(days,))
+
+
 def query_top_queries(conn, limit: int = 100) -> List[tuple]:
     """Query most searched queries (deduplicated)"""
     query = f"""
@@ -333,6 +348,37 @@ def create_daily_flow_chart(df: pd.DataFrame) -> go.Figure:
         yaxis_title='Number of Searches (Raw)',
         hovermode='x unified',
         height=500,
+        template='plotly_white',
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        font=dict(color='black')
+    )
+
+    return fig
+
+
+def create_daily_unique_users_chart(df: pd.DataFrame) -> go.Figure:
+    """Create line chart showing daily unique users trend"""
+    df_sorted = df.sort_values('date')
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=df_sorted['date'],
+        y=df_sorted['unique_users'],
+        mode='lines+markers',
+        line=dict(width=3, color='#333333'),
+        marker=dict(size=10, color='#333333', line=dict(color='black', width=1)),
+        fill='tozeroy',
+        fillcolor='rgba(51, 51, 51, 0.1)'
+    ))
+
+    fig.update_layout(
+        title='Daily Active Users - Deduplicated (Last 7 Days)',
+        xaxis_title='Date',
+        yaxis_title='Unique Users',
+        hovermode='x unified',
+        height=400,
         template='plotly_white',
         plot_bgcolor='white',
         paper_bgcolor='white',
@@ -797,6 +843,11 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure]) -> str:
             {chart_html['client_distribution']}
         </div>
 
+        <h2>User Activity Trends <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
+        <div class="chart">
+            {chart_html.get('daily_unique_users', '<p>Not enough data</p>')}
+        </div>
+
         <h2>Search Patterns Analysis <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
         <div class="chart">
             {chart_html['top_queries']}
@@ -852,6 +903,7 @@ def main():
         # Get all statistics
         stats = query_total_stats(conn)
         daily_stats = query_daily_stats(conn, days=7)
+        daily_unique_users = query_daily_unique_users(conn, days=7)
         top_queries = query_top_queries(conn, limit=100)
         top_users = query_most_active_users(conn, limit=50)
 
@@ -877,6 +929,7 @@ def main():
         # Create all figures
         figures = {
             'daily_flow': create_daily_flow_chart(daily_stats),
+            'daily_unique_users': create_daily_unique_users_chart(daily_unique_users),
             'top_queries': create_top_queries_chart(top_queries),
             'user_activity': create_user_activity_chart(top_users),
             'client_distribution': create_client_distribution_chart(stats['client_totals']),
