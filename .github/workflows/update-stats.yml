@@ -36,11 +36,18 @@ jobs:
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H $DB_HOST >> ~/.ssh/known_hosts
 
-          # Generate stats on database server (faster - no network latency)
+          # Pull latest code and clean up old containers
           ssh -o StrictHostKeyChecking=no root@$DB_HOST "
             cd /opt/soulseek-research/repo
             git pull origin main
-            docker run --rm \
+            docker rm -f stats-gen 2>/dev/null || true
+            rm -rf /tmp/docs/*
+          "
+
+          # Start stats generation in detached mode
+          ssh -o StrictHostKeyChecking=no root@$DB_HOST "
+            docker run -d \
+              --name stats-gen \
               --network=host \
               -v /opt/archives:/archives \
               -v /tmp/docs:/docs \
@@ -50,8 +57,35 @@ jobs:
               uv run python /app/scripts/generate_stats.py
           "
 
+          # Poll until container finishes (10 min timeout)
+          echo "Waiting for stats generation to complete..."
+          SECONDS=0
+          while ssh -o StrictHostKeyChecking=no root@$DB_HOST "docker ps --filter name=stats-gen --format '{{.Names}}' | grep -q stats-gen"; do
+            if [ $SECONDS -ge 600 ]; then
+              echo "ERROR: Timeout after 10 minutes"
+              ssh -o StrictHostKeyChecking=no root@$DB_HOST "docker logs stats-gen" || true
+              exit 1
+            fi
+            echo "Still running... (${SECONDS}s elapsed)"
+            sleep 10
+          done
+          echo "Container finished after ${SECONDS}s"
+
+          # Check exit code
+          EXIT_CODE=$(ssh -o StrictHostKeyChecking=no root@$DB_HOST "docker inspect stats-gen --format='{{.State.ExitCode}}'")
+          echo "Container exit code: $EXIT_CODE"
+
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "ERROR: Stats generation failed!"
+            ssh -o StrictHostKeyChecking=no root@$DB_HOST "docker logs stats-gen"
+            exit 1
+          fi
+
           # Download generated docs
           scp -r -o StrictHostKeyChecking=no root@$DB_HOST:/tmp/docs ./
+
+          # Cleanup
+          ssh -o StrictHostKeyChecking=no root@$DB_HOST "docker rm stats-gen"
 
       - name: Build with Jekyll
         uses: actions/jekyll-build-pages@v1
