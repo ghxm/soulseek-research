@@ -50,15 +50,22 @@ def get_db_connection():
     )
 
 
-def get_deduplication_cte() -> str:
+def get_deduplication_cte(start_date=None, end_date=None) -> str:
     """
     Returns a CTE that deduplicates searches within 5-minute windows.
 
     This handles the case where the same search is distributed to multiple
     clients, resulting in duplicate entries. We only keep the first occurrence
     within each 5-minute window for the same username+query combination.
+
+    CRITICAL PERFORMANCE: Filters by date range BEFORE window function to avoid
+    scanning the entire table (20M+ rows). Without this, queries take 15+ minutes.
     """
-    return """
+    date_filter = ""
+    if start_date and end_date:
+        date_filter = f"WHERE timestamp >= '{start_date.isoformat()}' AND timestamp <= '{end_date.isoformat()}'"
+
+    return f"""
         WITH ranked_searches AS (
             SELECT *,
                    ROW_NUMBER() OVER (
@@ -67,6 +74,7 @@ def get_deduplication_cte() -> str:
                        ORDER BY timestamp
                    ) as rn
             FROM searches
+            {date_filter}
         ),
         deduplicated_searches AS (
             SELECT id, client_id, timestamp, username, query
@@ -1664,37 +1672,35 @@ def generate_jekyll_data_files(periods: Dict[str, List[Dict]]):
 
 def query_period_data(conn, start_date=None, end_date=None):
     """Query all data for a specific period (or all-time if dates are None)"""
-    # Date filter SQL
-    if start_date and end_date:
-        date_filter = f"AND timestamp >= '{start_date.isoformat()}' AND timestamp <= '{end_date.isoformat()}'"
-    else:
-        date_filter = ""
-
-    # Modify queries to include date filter
+    # Get deduplication CTE with date filtering for performance
     cursor = conn.cursor()
-    dedup_cte = get_deduplication_cte()
+    dedup_cte = get_deduplication_cte(start_date, end_date)
 
-    # Total stats with date filter
-    cursor.execute(f"{dedup_cte} SELECT COUNT(*) FROM deduplicated_searches WHERE 1=1 {date_filter}")
+    # Total stats (date filter already in CTE)
+    cursor.execute(f"{dedup_cte} SELECT COUNT(*) FROM deduplicated_searches")
     total_searches = cursor.fetchone()[0]
 
-    cursor.execute(f"{dedup_cte} SELECT COUNT(DISTINCT username) FROM deduplicated_searches WHERE 1=1 {date_filter}")
+    cursor.execute(f"{dedup_cte} SELECT COUNT(DISTINCT username) FROM deduplicated_searches")
     total_users = cursor.fetchone()[0]
 
-    cursor.execute(f"{dedup_cte} SELECT COUNT(DISTINCT query) FROM deduplicated_searches WHERE 1=1 {date_filter}")
+    cursor.execute(f"{dedup_cte} SELECT COUNT(DISTINCT query) FROM deduplicated_searches")
     total_queries = cursor.fetchone()[0]
 
-    cursor.execute(f"{dedup_cte} SELECT COUNT(DISTINCT (username, query)) FROM deduplicated_searches WHERE 1=1 {date_filter}")
+    cursor.execute(f"{dedup_cte} SELECT COUNT(DISTINCT (username, query)) FROM deduplicated_searches")
     unique_search_pairs = cursor.fetchone()[0]
 
-    cursor.execute(f"{dedup_cte} SELECT MIN(timestamp), MAX(timestamp) FROM deduplicated_searches WHERE 1=1 {date_filter}")
+    cursor.execute(f"{dedup_cte} SELECT MIN(timestamp), MAX(timestamp) FROM deduplicated_searches")
     date_range = cursor.fetchone()
 
-    # Per-client totals (raw)
+    # Per-client totals (raw - need explicit date filter)
+    date_filter = ""
+    if start_date and end_date:
+        date_filter = f"WHERE timestamp >= '{start_date.isoformat()}' AND timestamp <= '{end_date.isoformat()}'"
+
     cursor.execute(f"""
         SELECT client_id, COUNT(*) as count
         FROM searches
-        WHERE 1=1 {date_filter}
+        {date_filter}
         GROUP BY client_id
         ORDER BY count DESC
     """)
@@ -1767,7 +1773,7 @@ def generate_period_page(conn, period_type: str, period_info: Optional[Dict] = N
         else:
             days = 365  # fallback
 
-    # Query time-series data
+    # Query time-series data (with date filter for performance)
     daily_stats = pd.read_sql_query(f"""
         SELECT
             client_id,
@@ -1779,14 +1785,14 @@ def generate_period_page(conn, period_type: str, period_info: Optional[Dict] = N
         ORDER BY date DESC, client_id
     """, conn)
 
-    dedup_cte = get_deduplication_cte()
+    # Get dedup CTE with date filtering for performance
+    dedup_cte = get_deduplication_cte(start_date, end_date)
     daily_unique_users = pd.read_sql_query(f"""
         {dedup_cte}
         SELECT
             DATE(timestamp) as date,
             COUNT(DISTINCT username) as unique_users
         FROM deduplicated_searches
-        WHERE 1=1 {date_filter}
         GROUP BY DATE(timestamp)
         ORDER BY date DESC
     """, conn)
@@ -1812,7 +1818,7 @@ def generate_period_page(conn, period_type: str, period_info: Optional[Dict] = N
         ORDER BY date
     """, conn)
 
-    # Query aggregate data
+    # Query aggregate data (date filter in CTE)
     cursor = conn.cursor()
 
     cursor.execute(f"""
@@ -1822,7 +1828,6 @@ def generate_period_page(conn, period_type: str, period_info: Optional[Dict] = N
             COUNT(DISTINCT username) as unique_users,
             COUNT(*) as total_searches
         FROM deduplicated_searches
-        WHERE 1=1 {date_filter}
         GROUP BY LOWER(TRIM(query))
         ORDER BY unique_users DESC
         LIMIT 100
@@ -1836,7 +1841,6 @@ def generate_period_page(conn, period_type: str, period_info: Optional[Dict] = N
             COUNT(*) as search_count,
             COUNT(DISTINCT query) as unique_queries
         FROM deduplicated_searches
-        WHERE 1=1 {date_filter}
         GROUP BY username
         ORDER BY search_count DESC
         LIMIT 50
@@ -1847,7 +1851,6 @@ def generate_period_page(conn, period_type: str, period_info: Optional[Dict] = N
         {dedup_cte}
         SELECT query
         FROM deduplicated_searches
-        WHERE 1=1 {date_filter}
         LIMIT 10000
     """)
     query_sample = [row[0] for row in cursor.fetchall()]
@@ -1863,7 +1866,6 @@ def generate_period_page(conn, period_type: str, period_info: Optional[Dict] = N
             EXTRACT(HOUR FROM timestamp) as hour,
             COUNT(*) as search_count
         FROM deduplicated_searches
-        WHERE 1=1 {date_filter}
         GROUP BY EXTRACT(HOUR FROM timestamp)
         ORDER BY hour
     """, conn)
@@ -1874,7 +1876,6 @@ def generate_period_page(conn, period_type: str, period_info: Optional[Dict] = N
             array_length(string_to_array(LOWER(TRIM(query)), ' '), 1) as query_length,
             COUNT(DISTINCT LOWER(TRIM(query))) as count
         FROM deduplicated_searches
-        WHERE 1=1 {date_filter}
         GROUP BY array_length(string_to_array(LOWER(TRIM(query)), ' '), 1)
         ORDER BY query_length
     """, conn)
