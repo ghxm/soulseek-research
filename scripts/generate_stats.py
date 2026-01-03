@@ -168,6 +168,34 @@ def query_daily_unique_users(conn, days: int = 7) -> pd.DataFrame:
     return pd.read_sql_query(query, conn, params=(days,))
 
 
+def query_client_convergence(conn, days: int = 7) -> pd.DataFrame:
+    """
+    Analyze how many searches reach different numbers of clients over time.
+    Shows whether searches are global (all clients) or regional (few clients).
+    """
+    query = """
+        WITH search_coverage AS (
+            SELECT
+                DATE(timestamp) as date,
+                username,
+                query,
+                COUNT(DISTINCT client_id) as client_count
+            FROM searches
+            WHERE timestamp >= NOW() - INTERVAL '%s days'
+            GROUP BY DATE(timestamp), username, query
+        )
+        SELECT
+            date,
+            SUM(CASE WHEN client_count = 1 THEN 1 ELSE 0 END) as single_client,
+            SUM(CASE WHEN client_count = 2 THEN 1 ELSE 0 END) as two_clients,
+            SUM(CASE WHEN client_count >= 3 THEN 1 ELSE 0 END) as all_clients
+        FROM search_coverage
+        GROUP BY date
+        ORDER BY date
+    """
+    return pd.read_sql_query(query, conn, params=(days,))
+
+
 def query_top_queries(conn, limit: int = 100) -> List[tuple]:
     """Query most searched queries (deduplicated)"""
     query = f"""
@@ -467,6 +495,65 @@ def create_daily_unique_users_chart(df: pd.DataFrame) -> go.Figure:
         plot_bgcolor='white',
         paper_bgcolor='white',
         font=dict(color='black')
+    )
+
+    return fig
+
+
+def create_client_convergence_chart(df: pd.DataFrame) -> go.Figure:
+    """Create stacked area chart showing search distribution across clients over time"""
+    df_sorted = df.sort_values('date')
+
+    fig = go.Figure()
+
+    # Stacked area chart with greyscale colors
+    fig.add_trace(go.Scatter(
+        x=df_sorted['date'],
+        y=df_sorted['all_clients'],
+        mode='lines',
+        name='All Clients (3+)',
+        line=dict(width=0.5, color='#000000'),
+        stackgroup='one',
+        fillcolor='#000000'
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=df_sorted['date'],
+        y=df_sorted['two_clients'],
+        mode='lines',
+        name='Two Clients',
+        line=dict(width=0.5, color='#666666'),
+        stackgroup='one',
+        fillcolor='#666666'
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=df_sorted['date'],
+        y=df_sorted['single_client'],
+        mode='lines',
+        name='Single Client Only',
+        line=dict(width=0.5, color='#CCCCCC'),
+        stackgroup='one',
+        fillcolor='#CCCCCC'
+    ))
+
+    fig.update_layout(
+        title='Search Distribution Across Clients - Client Convergence (Last 7 Days)',
+        xaxis_title='Date',
+        yaxis_title='Number of Unique Searches',
+        hovermode='x unified',
+        height=500,
+        template='plotly_white',
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        font=dict(color='black'),
+        legend=dict(
+            orientation='h',
+            yanchor='bottom',
+            y=1.02,
+            xanchor='right',
+            x=1
+        )
     )
 
     return fig
@@ -1223,6 +1310,10 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure],
             {chart_html['client_distribution']}
         </div>
 
+        <div class="chart">
+            {chart_html.get('client_convergence', '<p>Not enough data</p>')}
+        </div>
+
         <h2>User Activity Trends <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
         <div class="chart">
             {chart_html.get('daily_unique_users', '<p>Not enough data</p>')}
@@ -1284,6 +1375,7 @@ def main():
         stats = query_total_stats(conn)
         daily_stats = query_daily_stats(conn, days=7)
         daily_unique_users = query_daily_unique_users(conn, days=7)
+        client_convergence = query_client_convergence(conn, days=7)
         top_queries = query_top_queries(conn, limit=100)
         top_users = query_most_active_users(conn, limit=50)
 
@@ -1309,6 +1401,7 @@ def main():
         # Create all figures
         figures = {
             'daily_flow': create_daily_flow_chart(daily_stats),
+            'client_convergence': create_client_convergence_chart(client_convergence),
             'daily_unique_users': create_daily_unique_users_chart(daily_unique_users),
             'top_queries': create_top_queries_chart(top_queries),
             'user_activity': create_user_activity_chart(top_users),
