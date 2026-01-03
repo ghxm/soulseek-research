@@ -47,7 +47,7 @@ docker run --rm \\
   -e ARCHIVE_PATH=/archives \\
   -e DELETE_AFTER_ARCHIVE=true \\
   soulseek-research:latest \\
-  python /app/scripts/archive.py
+  uv run python /app/scripts/archive.py
 
 # Log the result
 echo "\$(date): Weekly archive completed" >> /var/log/soulseek-archive.log
@@ -71,7 +71,7 @@ echo "1. Test the archive script:"
 echo "   docker run --rm --network=host -v /opt/archives:/archives \\"
 echo "     -e DATABASE_URL='postgresql://soulseek:${DB_PASSWORD}@localhost:5432/soulseek' \\"
 echo "     -e ARCHIVE_PATH=/archives -e DELETE_AFTER_ARCHIVE=false \\"
-echo "     soulseek-research:latest python /app/scripts/archive.py"
+echo "     soulseek-research:latest uv run python /app/scripts/archive.py"
 echo ""
 echo "2. Verify cron job:"
 echo "   crontab -l"

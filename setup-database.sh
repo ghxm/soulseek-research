@@ -88,7 +88,7 @@ docker run --rm \
   -e ARCHIVE_PATH=/archives \
   -e DELETE_AFTER_ARCHIVE=true \
   soulseek-research:latest \
-  python /app/scripts/archive.py
+  uv run python /app/scripts/archive.py
 
 # Log the result
 echo "$(date): Weekly archive completed" >> /var/log/soulseek-archive.log
