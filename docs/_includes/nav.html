@@ -1,0 +1,30 @@
+<nav class="period-nav">
+    <a href="{{ site.baseurl }}/" class="{% if page.period == 'all' %}active{% endif %}">All Time</a>
+    <span class="separator">|</span>
+
+    <div class="dropdown">
+        <span>Monthly ▾</span>
+        <div class="dropdown-content">
+            {% for month in site.data.months %}
+            <a href="{{ site.baseurl }}/months/{{ month.id }}.html"
+               class="{% if page.period_id == month.id %}active{% endif %}">
+                {{ month.label }}
+            </a>
+            {% endfor %}
+        </div>
+    </div>
+
+    <span class="separator">|</span>
+
+    <div class="dropdown">
+        <span>Weekly ▾</span>
+        <div class="dropdown-content">
+            {% for week in site.data.weeks %}
+            <a href="{{ site.baseurl }}/weeks/{{ week.id }}.html"
+               class="{% if page.period_id == week.id %}active{% endif %}">
+                CW {{ week.label }}
+            </a>
+            {% endfor %}
+        </div>
+    </div>
+</nav>

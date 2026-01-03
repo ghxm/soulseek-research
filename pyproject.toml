@@ -26,6 +26,7 @@ dependencies = [
 
     # Statistics and visualization (for generate_stats.py)
     "mistune>=3.0.0",
+    "pyyaml>=6.0.0",
 
     # Development and testing
     "pytest>=7.0.0",

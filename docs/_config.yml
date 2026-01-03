@@ -1,0 +1,22 @@
+title: Soulseek Research Dashboard
+description: Analysis of Soulseek P2P network search patterns
+
+# Build settings
+markdown: kramdown
+theme: null
+
+# Exclude files from build
+exclude:
+  - stats.json
+  - article.md
+  - ARTICLE_MODE.md
+
+# Collections
+collections_dir: .
+
+# Defaults
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: dashboard

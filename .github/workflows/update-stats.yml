@@ -45,10 +45,16 @@ jobs:
           ARCHIVE_PATH: archives
         run: python scripts/generate_stats.py
 
+      - name: Build with Jekyll
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./docs
+          destination: ./_site
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: ./docs
+          path: ./_site
 
   deploy:
     needs: build

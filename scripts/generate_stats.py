@@ -20,6 +20,7 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 import numpy as np
 import mistune
+import yaml
 
 
 def get_db_connection():
@@ -1584,90 +1585,498 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure],
     return html
 
 
+def get_available_periods(conn) -> Dict[str, List[Dict]]:
+    """Get all available weeks and months from the database"""
+    cursor = conn.cursor()
+
+    # Get date range
+    dedup_cte = get_deduplication_cte()
+    cursor.execute(f"{dedup_cte} SELECT MIN(timestamp), MAX(timestamp) FROM deduplicated_searches")
+    min_date, max_date = cursor.fetchone()
+
+    if not min_date or not max_date:
+        return {'weeks': [], 'months': []}
+
+    # Generate all weeks
+    weeks = []
+    current = min_date
+    while current <= max_date:
+        iso_year, iso_week, _ = current.isocalendar()
+        week_id = f"{iso_year}-W{iso_week:02d}"
+        week_label = f"{iso_week:02d}/{iso_year}"
+
+        # Find week start and end
+        week_start = datetime.fromisocalendar(iso_year, iso_week, 1).replace(tzinfo=timezone.utc)
+        week_end = week_start + timedelta(days=6, hours=23, minutes=59, seconds=59)
+
+        weeks.append({
+            'id': week_id,
+            'label': week_label,
+            'start': week_start,
+            'end': week_end
+        })
+
+        current = week_end + timedelta(seconds=1)
+
+    # Generate all months
+    months = []
+    current = min_date.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    while current <= max_date:
+        month_id = current.strftime('%Y-%m')
+        month_label = current.strftime('%B %Y')
+
+        # Find month end
+        if current.month == 12:
+            next_month = current.replace(year=current.year + 1, month=1)
+        else:
+            next_month = current.replace(month=current.month + 1)
+        month_end = next_month - timedelta(seconds=1)
+
+        months.append({
+            'id': month_id,
+            'label': month_label,
+            'start': current,
+            'end': month_end
+        })
+
+        current = next_month
+
+    cursor.close()
+    return {'weeks': weeks, 'months': months}
+
+
+def generate_jekyll_data_files(periods: Dict[str, List[Dict]]):
+    """Generate Jekyll _data files for navigation"""
+    import yaml
+
+    os.makedirs('docs/_data', exist_ok=True)
+
+    # Generate months.yml (newest first)
+    months_data = [{'id': m['id'], 'label': m['label']} for m in reversed(periods['months'])]
+    with open('docs/_data/months.yml', 'w', encoding='utf-8') as f:
+        yaml.dump(months_data, f, default_flow_style=False, allow_unicode=True)
+
+    # Generate weeks.yml (newest first)
+    weeks_data = [{'id': w['id'], 'label': w['label']} for w in reversed(periods['weeks'])]
+    with open('docs/_data/weeks.yml', 'w', encoding='utf-8') as f:
+        yaml.dump(weeks_data, f, default_flow_style=False, allow_unicode=True)
+
+
+def query_period_data(conn, start_date=None, end_date=None):
+    """Query all data for a specific period (or all-time if dates are None)"""
+    # Date filter SQL
+    if start_date and end_date:
+        date_filter = f"AND timestamp >= '{start_date.isoformat()}' AND timestamp <= '{end_date.isoformat()}'"
+    else:
+        date_filter = ""
+
+    # Modify queries to include date filter
+    cursor = conn.cursor()
+    dedup_cte = get_deduplication_cte()
+
+    # Total stats with date filter
+    cursor.execute(f"{dedup_cte} SELECT COUNT(*) FROM deduplicated_searches WHERE 1=1 {date_filter}")
+    total_searches = cursor.fetchone()[0]
+
+    cursor.execute(f"{dedup_cte} SELECT COUNT(DISTINCT username) FROM deduplicated_searches WHERE 1=1 {date_filter}")
+    total_users = cursor.fetchone()[0]
+
+    cursor.execute(f"{dedup_cte} SELECT COUNT(DISTINCT query) FROM deduplicated_searches WHERE 1=1 {date_filter}")
+    total_queries = cursor.fetchone()[0]
+
+    cursor.execute(f"{dedup_cte} SELECT COUNT(DISTINCT (username, query)) FROM deduplicated_searches WHERE 1=1 {date_filter}")
+    unique_search_pairs = cursor.fetchone()[0]
+
+    cursor.execute(f"{dedup_cte} SELECT MIN(timestamp), MAX(timestamp) FROM deduplicated_searches WHERE 1=1 {date_filter}")
+    date_range = cursor.fetchone()
+
+    # Per-client totals (raw)
+    cursor.execute(f"""
+        SELECT client_id, COUNT(*) as count
+        FROM searches
+        WHERE 1=1 {date_filter}
+        GROUP BY client_id
+        ORDER BY count DESC
+    """)
+    client_totals = cursor.fetchall()
+
+    cursor.close()
+
+    avg_searches_per_user = total_searches / total_users if total_users > 0 else 0
+    avg_unique_queries_per_user = unique_search_pairs / total_users if total_users > 0 else 0
+
+    return {
+        'total_searches': total_searches,
+        'total_users': total_users,
+        'total_queries': total_queries,
+        'unique_search_pairs': unique_search_pairs,
+        'avg_searches_per_user': avg_searches_per_user,
+        'avg_unique_queries_per_user': avg_unique_queries_per_user,
+        'first_search': date_range[0].isoformat() if date_range[0] else None,
+        'last_search': date_range[1].isoformat() if date_range[1] else None,
+        'client_totals': {client: count for client, count in client_totals},
+        'date_filter': date_filter
+    }
+
+
+def generate_period_page(conn, period_type: str, period_info: Optional[Dict] = None) -> str:
+    """
+    Generate a dashboard page for a specific period.
+
+    period_type: 'all', 'month', or 'week'
+    period_info: Dict with 'id', 'label', 'start', 'end' (None for all-time)
+    """
+    if period_type == 'all':
+        print("Querying all-time statistics...")
+        start_date, end_date = None, None
+        period_label = "All Time"
+        page_title = "Soulseek Research Dashboard - All Time"
+        output_file = "docs/index.html"
+        date_filter = ""
+    else:
+        start_date = period_info['start']
+        end_date = period_info['end']
+        period_label = period_info['label']
+
+        if period_type == 'week':
+            page_title = f"Soulseek Research Dashboard - CW {period_label}"
+            output_file = f"docs/weeks/{period_info['id']}.html"
+        else:  # month
+            page_title = f"Soulseek Research Dashboard - {period_label}"
+            output_file = f"docs/months/{period_info['id']}.html"
+
+        date_filter = f"AND timestamp >= '{start_date.isoformat()}' AND timestamp <= '{end_date.isoformat()}'"
+        print(f"Querying statistics for {period_label}...")
+
+    # Query period stats
+    stats = query_period_data(conn, start_date, end_date)
+
+    if stats['total_searches'] == 0:
+        print(f"  No data for {period_label}, skipping")
+        return None
+
+    # Calculate days for time-series queries
+    if start_date and end_date:
+        days = (end_date - start_date).days + 1
+    else:
+        # For all-time, use full range
+        if stats['first_search'] and stats['last_search']:
+            first = datetime.fromisoformat(stats['first_search'])
+            last = datetime.fromisoformat(stats['last_search'])
+            days = (last - first).days + 1
+        else:
+            days = 365  # fallback
+
+    # Query time-series data
+    daily_stats = pd.read_sql_query(f"""
+        SELECT
+            client_id,
+            DATE(timestamp) as date,
+            COUNT(*) as search_count
+        FROM searches
+        WHERE 1=1 {date_filter}
+        GROUP BY client_id, DATE(timestamp)
+        ORDER BY date DESC, client_id
+    """, conn)
+
+    dedup_cte = get_deduplication_cte()
+    daily_unique_users = pd.read_sql_query(f"""
+        {dedup_cte}
+        SELECT
+            DATE(timestamp) as date,
+            COUNT(DISTINCT username) as unique_users
+        FROM deduplicated_searches
+        WHERE 1=1 {date_filter}
+        GROUP BY DATE(timestamp)
+        ORDER BY date DESC
+    """, conn)
+
+    client_convergence = pd.read_sql_query(f"""
+        WITH search_coverage AS (
+            SELECT
+                DATE(timestamp) as date,
+                username,
+                query,
+                COUNT(DISTINCT client_id) as client_count
+            FROM searches
+            WHERE 1=1 {date_filter}
+            GROUP BY DATE(timestamp), username, query
+        )
+        SELECT
+            date,
+            SUM(CASE WHEN client_count = 1 THEN 1 ELSE 0 END) as single_client,
+            SUM(CASE WHEN client_count = 2 THEN 1 ELSE 0 END) as two_clients,
+            SUM(CASE WHEN client_count >= 3 THEN 1 ELSE 0 END) as all_clients
+        FROM search_coverage
+        GROUP BY date
+        ORDER BY date
+    """, conn)
+
+    # Query aggregate data
+    cursor = conn.cursor()
+
+    cursor.execute(f"""
+        {dedup_cte}
+        SELECT
+            LOWER(TRIM(query)) as query,
+            COUNT(DISTINCT username) as unique_users,
+            COUNT(*) as total_searches
+        FROM deduplicated_searches
+        WHERE 1=1 {date_filter}
+        GROUP BY LOWER(TRIM(query))
+        ORDER BY unique_users DESC
+        LIMIT 100
+    """)
+    top_queries = cursor.fetchall()
+
+    cursor.execute(f"""
+        {dedup_cte}
+        SELECT
+            username,
+            COUNT(*) as search_count,
+            COUNT(DISTINCT query) as unique_queries
+        FROM deduplicated_searches
+        WHERE 1=1 {date_filter}
+        GROUP BY username
+        ORDER BY search_count DESC
+        LIMIT 50
+    """)
+    top_users = cursor.fetchall()
+
+    cursor.execute(f"""
+        {dedup_cte}
+        SELECT query
+        FROM deduplicated_searches
+        WHERE 1=1 {date_filter}
+        LIMIT 10000
+    """)
+    query_sample = [row[0] for row in cursor.fetchall()]
+
+    cursor.close()
+
+    # Analyze patterns
+    query_patterns = analyze_query_patterns(query_sample)
+
+    temporal_data = pd.read_sql_query(f"""
+        {dedup_cte}
+        SELECT
+            EXTRACT(HOUR FROM timestamp) as hour,
+            COUNT(*) as search_count
+        FROM deduplicated_searches
+        WHERE 1=1 {date_filter}
+        GROUP BY EXTRACT(HOUR FROM timestamp)
+        ORDER BY hour
+    """, conn)
+
+    query_length_data = pd.read_sql_query(f"""
+        {dedup_cte}
+        SELECT
+            array_length(string_to_array(LOWER(TRIM(query)), ' '), 1) as query_length,
+            COUNT(DISTINCT LOWER(TRIM(query))) as count
+        FROM deduplicated_searches
+        WHERE 1=1 {date_filter}
+        GROUP BY array_length(string_to_array(LOWER(TRIM(query)), ' '), 1)
+        ORDER BY query_length
+    """, conn)
+
+    bigrams = analyze_ngrams(query_sample, n=2, limit=30)
+    trigrams = analyze_ngrams(query_sample, n=3, limit=30)
+    cooccurrences = analyze_term_cooccurrence(query_sample, min_freq=10)
+
+    print(f"  Found {stats['total_searches']:,} searches for {period_label}")
+    print(f"  Creating visualizations...")
+
+    # Create figures
+    figures = {
+        'daily_flow': create_daily_flow_chart(daily_stats),
+        'client_convergence': create_client_convergence_chart(client_convergence) if not client_convergence.empty else None,
+        'daily_unique_users': create_daily_unique_users_chart(daily_unique_users) if not daily_unique_users.empty else None,
+        'top_queries': create_top_queries_chart(top_queries) if top_queries else None,
+        'user_activity': create_user_activity_chart(top_users) if top_users else None,
+        'client_distribution': create_client_distribution_chart(stats['client_totals']) if stats['client_totals'] else None,
+        'query_patterns': create_query_pattern_chart(query_patterns) if query_patterns else None,
+        'temporal_hourly': create_temporal_hourly_chart(temporal_data) if not temporal_data.empty else None,
+        'query_length': create_query_length_chart(query_length_data) if not query_length_data.empty else None,
+        'ngrams': create_ngram_chart(bigrams, trigrams) if bigrams and trigrams else None,
+        'cooccurrence': create_cooccurrence_chart(cooccurrences) if cooccurrences else None
+    }
+
+    # Generate HTML with Jekyll front matter
+    html = generate_period_html(stats, figures, period_type, period_info)
+
+    # Write output
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write(html)
+
+    print(f"  ✅ Generated {output_file}")
+    return output_file
+
+
+def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
+                         period_type: str, period_info: Optional[Dict] = None) -> str:
+    """Generate HTML for a period page with Jekyll front matter"""
+    # Jekyll front matter
+    if period_type == 'all':
+        front_matter = "---\nlayout: dashboard\nperiod: all\ntitle: All Time Statistics\n---\n\n"
+        period_title = "All Time Statistics"
+    elif period_type == 'week':
+        front_matter = f"---\nlayout: dashboard\nperiod: week\nperiod_id: {period_info['id']}\ntitle: CW {period_info['label']}\n---\n\n"
+        period_title = f"Calendar Week {period_info['label']}"
+    else:  # month
+        front_matter = f"---\nlayout: dashboard\nperiod: month\nperiod_id: {period_info['id']}\ntitle: {period_info['label']}\n---\n\n"
+        period_title = period_info['label']
+
+    # Convert figures to HTML
+    chart_html = {}
+    for name, fig in figures.items():
+        if fig is not None:
+            chart_html[name] = fig.to_html(full_html=False, include_plotlyjs='cdn')
+        else:
+            chart_html[name] = '<p style="color: #999">Not enough data for visualization</p>'
+
+    # Generate stats grid
+    days = (datetime.fromisoformat(stats['last_search']) -
+            datetime.fromisoformat(stats['first_search'])).days if stats['first_search'] and stats['last_search'] else 0
+
+    stats_grid = f'''
+        <div class="stats-grid">
+            <div class="stat-card">
+                <h3>Total Searches</h3>
+                <div class="value">{stats['total_searches']:,}</div>
+                <div class="label">Deduplicated searches</div>
+            </div>
+            <div class="stat-card">
+                <h3>Unique Users</h3>
+                <div class="value">{stats['total_users']:,}</div>
+                <div class="label">Anonymized users</div>
+            </div>
+            <div class="stat-card">
+                <h3>Unique Queries</h3>
+                <div class="value">{stats['total_queries']:,}</div>
+                <div class="label">Different search terms</div>
+            </div>
+            <div class="stat-card">
+                <h3>Avg Searches per User</h3>
+                <div class="value">{stats['avg_searches_per_user']:.1f}</div>
+                <div class="label">Including repeated searches</div>
+            </div>
+            <div class="stat-card">
+                <h3>Avg Unique Queries per User</h3>
+                <div class="value">{stats['avg_unique_queries_per_user']:.1f}</div>
+                <div class="label">Search diversity</div>
+            </div>
+            <div class="stat-card">
+                <h3>Period</h3>
+                <div class="value">{days}</div>
+                <div class="label">Days of data</div>
+            </div>
+        </div>
+    '''
+
+    # Page content (no Jekyll layout, just the content)
+    content = f'''<h1>{period_title}</h1>
+
+<p class="timestamp">Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
+
+<div style="background: #f5f5f5; padding: 20px; margin: 20px 0; border-left: 4px solid #333;">
+    <h3 style="margin-top: 0; color: #333;">Data Deduplication Note</h3>
+    <p style="margin-bottom: 0; color: #666;">
+        Because Soulseek distributes searches across multiple clients, the same search from one user
+        can appear on 2-3 of our geographic clients simultaneously. <strong>Analysis statistics are
+        deduplicated within 5-minute windows</strong> to prevent inflated counts, keeping only the first
+        occurrence of each username+query combination. However, <strong>data collection metrics show
+        raw counts</strong> to accurately represent what each client receives from the network.
+    </p>
+</div>
+
+<h2>Summary Statistics</h2>
+{stats_grid}
+
+<h2>Data Collection Overview <span style="font-weight: normal; font-size: 14px; color: #999;">(Raw Counts)</span></h2>
+<div class="chart">
+    {chart_html['daily_flow']}
+</div>
+
+<div class="chart">
+    {chart_html.get('client_distribution', '<p>Not enough data</p>')}
+</div>
+
+<div class="chart">
+    {chart_html.get('client_convergence', '<p>Not enough data</p>')}
+</div>
+
+<h2>User Activity Trends <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
+<div class="chart">
+    {chart_html.get('daily_unique_users', '<p>Not enough data</p>')}
+</div>
+
+<h2>Search Patterns Analysis <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
+<div class="chart">
+    {chart_html.get('top_queries', '<p>Not enough data</p>')}
+</div>
+
+<div class="chart">
+    {chart_html.get('query_patterns', '<p>Not enough data</p>')}
+</div>
+
+<div class="chart">
+    {chart_html.get('query_length', '<p>Not enough data</p>')}
+</div>
+
+<h2>Temporal Analysis <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
+<div class="chart">
+    {chart_html.get('temporal_hourly', '<p>Not enough data</p>')}
+</div>
+
+<h2>Search Term Analysis <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
+<div class="chart">
+    {chart_html.get('ngrams', '<p>Not enough data</p>')}
+</div>
+
+<div class="chart">
+    {chart_html.get('cooccurrence', '<p>Not enough data for network visualization</p>')}
+</div>
+
+<h2>User Activity <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
+<div class="chart">
+    {chart_html.get('user_activity', '<p>Not enough data</p>')}
+</div>
+'''
+
+    return front_matter + content
+
+
 def main():
     """Main execution"""
     print("Connecting to database...")
     conn = get_db_connection()
 
     try:
-        print("Querying statistics...")
+        # Get available periods from database
+        periods = get_available_periods(conn)
 
-        # Get all statistics
-        stats = query_total_stats(conn)
-        daily_stats = query_daily_stats(conn, days=7)
-        daily_unique_users = query_daily_unique_users(conn, days=7)
-        client_convergence = query_client_convergence(conn, days=7)
-        top_queries = query_top_queries(conn, limit=100)
-        top_users = query_most_active_users(conn, limit=50)
+        print(f"Found {len(periods['months'])} months and {len(periods['weeks'])} weeks")
 
-        # Music-specific analyses
-        print("Analyzing query patterns...")
-        query_sample = query_all_queries_sample(conn, limit=10000)
-        query_patterns = analyze_query_patterns(query_sample)
+        # Generate Jekyll data files for navigation
+        generate_jekyll_data_files(periods)
+        print("✅ Generated Jekyll navigation data files")
 
-        print("Analyzing temporal patterns...")
-        temporal_data = query_temporal_patterns(conn)
-        query_length_data = query_query_length_distribution(conn)
+        # Generate all-time page
+        generate_period_page(conn, 'all', None)
 
-        print("Extracting n-grams...")
-        bigrams = analyze_ngrams(query_sample, n=2, limit=30)
-        trigrams = analyze_ngrams(query_sample, n=3, limit=30)
+        # Generate monthly pages
+        for month in periods['months']:
+            generate_period_page(conn, 'month', month)
 
-        print("Analyzing term co-occurrence...")
-        cooccurrences = analyze_term_cooccurrence(query_sample, min_freq=10)
+        # Generate weekly pages
+        for week in periods['weeks']:
+            generate_period_page(conn, 'week', week)
 
-        print(f"Found {stats['total_searches']:,} total searches (deduplicated)")
-        print(f"Creating visualizations...")
-
-        # Create all figures
-        figures = {
-            'daily_flow': create_daily_flow_chart(daily_stats),
-            'client_convergence': create_client_convergence_chart(client_convergence),
-            'daily_unique_users': create_daily_unique_users_chart(daily_unique_users),
-            'top_queries': create_top_queries_chart(top_queries),
-            'user_activity': create_user_activity_chart(top_users),
-            'client_distribution': create_client_distribution_chart(stats['client_totals']),
-            'query_patterns': create_query_pattern_chart(query_patterns),
-            'temporal_hourly': create_temporal_hourly_chart(temporal_data),
-            'query_length': create_query_length_chart(query_length_data),
-            'ngrams': create_ngram_chart(bigrams, trigrams),
-            'cooccurrence': create_cooccurrence_chart(cooccurrences)
-        }
-
-        # Compute cumulative statistics (archives + live DB)
-        print("Computing cumulative statistics...")
-        try:
-            cumulative = compute_cumulative_stats(conn)
-            print(f"  All-time: {cumulative['all_time_searches']:,} searches, "
-                  f"{cumulative['all_time_users']:,} users, "
-                  f"{cumulative['all_time_queries']:,} queries")
-        except Exception as e:
-            print(f"Warning: Could not compute cumulative stats: {e}")
-            cumulative = None
-
-        # Check for article content
-        article_content = load_article_content('docs/article.md')
-
-        if article_content:
-            print("Article mode: Found docs/article.md")
-        else:
-            print("Standard mode: No article.md found")
-
-        print("Generating HTML...")
-        html = generate_html(stats, figures, cumulative=cumulative, article_content=article_content)
-
-        # Create docs directory
-        os.makedirs('docs', exist_ok=True)
-
-        # Write HTML file
-        with open('docs/index.html', 'w', encoding='utf-8') as f:
-            f.write(html)
-
-        # Also save stats as JSON for potential API use
-        with open('docs/stats.json', 'w') as f:
-            json.dump(stats, f, indent=2)
-
-        print("✅ Dashboard generated successfully at docs/index.html")
+        print(f"\n✅ Generated {1 + len(periods['months']) + len(periods['weeks'])} dashboard pages")
+        print(f"   - 1 all-time page (index.html)")
+        print(f"   - {len(periods['months'])} monthly pages")
+        print(f"   - {len(periods['weeks'])} weekly pages")
 
     finally:
         conn.close()
