@@ -37,7 +37,7 @@ jobs:
           scp -o StrictHostKeyChecking=no requirements-dashboard.txt root@$DB_HOST:/opt/soulseek-research/
 
           # Install pip and dependencies, then run stats generation on database server
-          ssh -o StrictHostKeyChecking=no root@$DB_HOST "cd /opt/soulseek-research && \
+          ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=60 -o ServerAliveCountMax=30 root@$DB_HOST "cd /opt/soulseek-research && \
             apt-get update -qq && apt-get install -y -qq python3-pip && \
             python3 -m pip install -q -r requirements-dashboard.txt && \
             DATABASE_URL='$DATABASE_URL' ARCHIVE_PATH=/opt/archives python3 scripts/generate_stats.py"
