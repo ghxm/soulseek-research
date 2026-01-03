@@ -17,39 +17,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup SSH and generate statistics on database server
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements-dashboard.txt
+
+      - name: Generate statistics
         env:
-          SSH_KEY: ${{ secrets.DB_SERVER_SSH_KEY }}
-          DB_HOST: ${{ secrets.DB_SERVER_IP }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ARCHIVE_PATH: ./archives
         run: |
-          # Setup SSH
-          mkdir -p ~/.ssh
-          echo "$SSH_KEY" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H $DB_HOST >> ~/.ssh/known_hosts
-
-          # Create directory structure on database server
-          ssh -o StrictHostKeyChecking=no root@$DB_HOST "mkdir -p /opt/soulseek-research /opt/archives"
-
-          # Sync code to database server
-          scp -r -o StrictHostKeyChecking=no scripts root@$DB_HOST:/opt/soulseek-research/
-          scp -o StrictHostKeyChecking=no requirements-dashboard.txt root@$DB_HOST:/opt/soulseek-research/
-
-          # Run stats generation using Docker image (which already has Python and dependencies)
-          ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=60 -o ServerAliveCountMax=30 root@$DB_HOST "\
-            docker run --rm \
-              -v /opt/soulseek-research:/workspace \
-              -v /opt/archives:/opt/archives \
-              -e DATABASE_URL='$DATABASE_URL' \
-              -e ARCHIVE_PATH=/opt/archives \
-              --network host \
-              --name stats-generator \
-              soulseek-research:latest \
-              bash -c 'pip install -q -r /workspace/requirements-dashboard.txt && python3 /workspace/scripts/generate_stats.py'"
-
-          # Download generated docs directory
-          scp -r -o StrictHostKeyChecking=no root@$DB_HOST:/opt/soulseek-research/docs ./
+          python scripts/generate_stats.py
 
       - name: Build with Jekyll
         uses: actions/jekyll-build-pages@v1
