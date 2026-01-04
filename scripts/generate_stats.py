@@ -1879,11 +1879,12 @@ def generate_period_page_from_df(conn, df_raw: pd.DataFrame, df_dedup: pd.DataFr
     try:
         top_queries_query = f"""
             WITH deduped AS (
-                SELECT DISTINCT ON (username, query, DATE_TRUNC('minute', timestamp) / 5)
+                SELECT DISTINCT ON (username, query, FLOOR(EXTRACT(EPOCH FROM timestamp) / 300))
                     username,
                     LOWER(TRIM(query)) as query_normalized
                 FROM searches
                 WHERE TRUE {date_filter_sql}
+                ORDER BY username, query, FLOOR(EXTRACT(EPOCH FROM timestamp) / 300), timestamp
             )
             SELECT
                 query_normalized,
@@ -1901,10 +1902,11 @@ def generate_period_page_from_df(conn, df_raw: pd.DataFrame, df_dedup: pd.DataFr
         print(f"  Computing query length distribution using SQL aggregation...")
         query_length_query = f"""
             WITH deduped AS (
-                SELECT DISTINCT ON (username, query, DATE_TRUNC('minute', timestamp) / 5)
+                SELECT DISTINCT ON (username, query, FLOOR(EXTRACT(EPOCH FROM timestamp) / 300))
                     array_length(string_to_array(query, ' '), 1) as query_length
                 FROM searches
                 WHERE TRUE {date_filter_sql}
+                ORDER BY username, query, FLOOR(EXTRACT(EPOCH FROM timestamp) / 300), timestamp
             )
             SELECT
                 query_length,
