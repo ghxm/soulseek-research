@@ -1570,10 +1570,6 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure],
             {chart_html['client_distribution']}
         </div>
 
-        <div class="chart">
-            {chart_html.get('client_convergence', '<p>Not enough data</p>')}
-        </div>
-
         <h2>User Activity Trends <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
         <div class="chart">
             {chart_html.get('daily_unique_users', '<p>Not enough data</p>')}
@@ -1813,23 +1809,6 @@ def generate_period_page_from_df(conn, df_raw: pd.DataFrame, df_dedup: pd.DataFr
     df_dedup['date'] = df_dedup['timestamp'].dt.date
     daily_unique_users = df_dedup.groupby('date')['username'].nunique().reset_index(name='unique_users')
 
-    # Client convergence analysis (how many clients see each search)
-    df_raw['query_normalized'] = df_raw['query'].str.lower().str.strip()
-    search_coverage = df_raw.groupby(['date', 'username', 'query_normalized'])['client_id'].nunique().reset_index(name='client_count')
-    client_convergence = pd.DataFrame({
-        'date': search_coverage['date'].unique()
-    })
-    client_convergence = client_convergence.merge(
-        search_coverage[search_coverage['client_count'] == 1].groupby('date').size().reset_index(name='single_client'),
-        on='date', how='left'
-    ).merge(
-        search_coverage[search_coverage['client_count'] == 2].groupby('date').size().reset_index(name='two_clients'),
-        on='date', how='left'
-    ).merge(
-        search_coverage[search_coverage['client_count'] >= 3].groupby('date').size().reset_index(name='all_clients'),
-        on='date', how='left'
-    ).fillna(0)
-
     print(f"  Analyzing search patterns...")
 
     # Top queries (normalized, deduplicated)
@@ -1863,10 +1842,9 @@ def generate_period_page_from_df(conn, df_raw: pd.DataFrame, df_dedup: pd.DataFr
     print(f"  Found {total_searches:,} searches for {period_label}")
     print(f"  Creating visualizations...")
 
-    # Create figures (removed memory-intensive ngrams and cooccurrence charts)
+    # Create figures (removed memory-intensive charts: ngrams, cooccurrence, client_convergence)
     figures = {
         'daily_flow': create_daily_flow_chart(daily_stats),
-        'client_convergence': create_client_convergence_chart(client_convergence) if not client_convergence.empty else None,
         'daily_unique_users': create_daily_unique_users_chart(daily_unique_users) if not daily_unique_users.empty else None,
         'top_queries': create_top_queries_chart(top_queries) if top_queries else None,
         'user_activity': create_user_activity_chart(top_users) if top_users else None,
@@ -2098,10 +2076,6 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
 
 <div class="chart">
     {chart_html.get('client_distribution', '<p>Not enough data</p>')}
-</div>
-
-<div class="chart">
-    {chart_html.get('client_convergence', '<p>Not enough data</p>')}
 </div>
 
 <h2>User Activity Trends <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
