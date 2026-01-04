@@ -9,6 +9,7 @@ import json
 import re
 import gzip
 import csv
+import gc
 from datetime import datetime, timedelta, timezone
 from collections import Counter, defaultdict
 from typing import List, Dict, Any, Tuple, Optional, Iterator
@@ -2193,6 +2194,8 @@ def main():
         print("="*80)
         print(f"  Using full dataset: {len(all_data_raw):,} raw, {len(all_data_dedup):,} deduplicated")
         generate_period_page_from_df(conn, all_data_raw, all_data_dedup, 'all', None)
+        print("  Freeing memory...")
+        gc.collect()
 
         # Generate monthly pages (filter from loaded data)
         for month in periods['months']:
@@ -2210,6 +2213,9 @@ def main():
             ].copy()
             print(f"  Filtered to {len(month_raw):,} raw, {len(month_dedup):,} deduplicated")
             generate_period_page_from_df(conn, month_raw, month_dedup, 'month', month)
+            print("  Freeing memory...")
+            del month_raw, month_dedup
+            gc.collect()
 
         # Generate weekly pages (filter from loaded data)
         for week in periods['weeks']:
@@ -2227,6 +2233,9 @@ def main():
             ].copy()
             print(f"  Filtered to {len(week_raw):,} raw, {len(week_dedup):,} deduplicated")
             generate_period_page_from_df(conn, week_raw, week_dedup, 'week', week)
+            print("  Freeing memory...")
+            del week_raw, week_dedup
+            gc.collect()
 
         print("\n" + "="*80)
         print(f"✅ Generated {1 + len(periods['months']) + len(periods['weeks'])} dashboard pages")
