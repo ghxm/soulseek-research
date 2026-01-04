@@ -1343,9 +1343,44 @@ def generate_article_html(stats: Dict, figures: Dict[str, go.Figure],
             max-width: 1200px;
             margin: 30px auto;
         }}
+        /* Header with logo */
+        .header {{
+            background: #f8f8f8;
+            border-bottom: 2px solid #333;
+            padding: 15px 0;
+            margin: -20px -20px 30px -20px;
+        }}
+        .header-content {{
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 0 30px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }}
+        .header-logo {{
+            width: 32px;
+            height: 32px;
+            filter: grayscale(100%);
+            opacity: 0.7;
+        }}
+        .header-title {{
+            font-size: 18px;
+            font-weight: 600;
+            color: #333;
+            margin: 0;
+        }}
     </style>
 </head>
 <body>
+    <div class="header">
+        <div class="header-content">
+            <svg class="header-logo" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z" fill="currentColor"/>
+            </svg>
+            <h1 class="header-title">Soulseek Search Monitor</h1>
+        </div>
+    </div>
     <div class="container article-mode">
         <p class="timestamp">Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
 
@@ -1537,12 +1572,45 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure],
             max-width: 1200px;
             margin: 30px auto;
         }}
+        /* Header with logo */
+        .header {{
+            background: #f8f8f8;
+            border-bottom: 2px solid #333;
+            padding: 15px 0;
+            margin: -20px -20px 30px -20px;
+        }}
+        .header-content {{
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 0 30px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }}
+        .header-logo {{
+            width: 32px;
+            height: 32px;
+            filter: grayscale(100%);
+            opacity: 0.7;
+        }}
+        .header-title {{
+            font-size: 18px;
+            font-weight: 600;
+            color: #333;
+            margin: 0;
+        }}
     </style>
 </head>
 <body>
+    <div class="header">
+        <div class="header-content">
+            <svg class="header-logo" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z" fill="currentColor"/>
+            </svg>
+            <h1 class="header-title">Soulseek Search Monitor</h1>
+        </div>
+    </div>
     <div class="container">
-        <h1>Soulseek Research Data Collection</h1>
-
         <p class="timestamp">Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
 
         <div style="background: #f5f5f5; padding: 20px; margin: 20px 0; border-left: 4px solid #333;">
@@ -1573,6 +1641,11 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure],
         <h2>User Activity Trends <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
         <div class="chart">
             {chart_html.get('daily_unique_users', '<p>Not enough data</p>')}
+        </div>
+
+        <h2>Top Search Terms <span style="font-weight: normal; font-size: 14px; color: #999;">(Count once per user)</span></h2>
+        <div class="chart">
+            {chart_html.get('top_queries', '<p>Not enough data</p>')}
         </div>
 
         <h2>Query Length Distribution <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
@@ -1793,6 +1866,22 @@ def generate_period_page_from_df(conn, df_raw: pd.DataFrame, df_dedup: pd.DataFr
 
     print(f"  Analyzing search patterns...")
 
+    # Top queries (count once per user - memory efficient with sampling for large datasets)
+    if len(df_dedup) > 1_000_000:
+        # Sample for very large datasets to avoid OOM
+        top_queries_sample = df_dedup.sample(n=1_000_000, random_state=42)
+        print(f"  Sampling 1,000,000 rows for top queries analysis (from {len(df_dedup):,} total)")
+    else:
+        top_queries_sample = df_dedup
+
+    top_queries_sample_copy = top_queries_sample.copy()
+    top_queries_sample_copy['query_normalized'] = top_queries_sample_copy['query'].str.lower().str.strip()
+    top_queries_df = top_queries_sample_copy.groupby('query_normalized').agg(
+        unique_users=('username', 'nunique'),
+        total_searches=('query', 'size')
+    ).sort_values('unique_users', ascending=False).head(100)
+    top_queries = [(q, row['unique_users'], row['total_searches']) for q, row in top_queries_df.iterrows()]
+
     # Query length distribution (sample for large datasets to avoid OOM)
     # For datasets > 1M rows, sample 10% for query length analysis
     sample_size = min(len(df_dedup), 1_000_000)  # Use at most 1M rows
@@ -1816,6 +1905,7 @@ def generate_period_page_from_df(conn, df_raw: pd.DataFrame, df_dedup: pd.DataFr
         'daily_flow': create_daily_flow_chart(daily_stats),
         'daily_unique_users': create_daily_unique_users_chart(daily_unique_users) if not daily_unique_users.empty else None,
         'client_distribution': create_client_distribution_chart(client_totals) if client_totals else None,
+        'top_queries': create_top_queries_chart(top_queries) if top_queries else None,
         'query_length': create_query_length_chart(query_length_data) if not query_length_data.empty else None
     }
 
@@ -2046,6 +2136,11 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
 <h2>User Activity Trends <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
 <div class="chart">
     {chart_html.get('daily_unique_users', '<p>Not enough data</p>')}
+</div>
+
+<h2>Top Search Terms <span style="font-weight: normal; font-size: 14px; color: #999;">(Count once per user)</span></h2>
+<div class="chart">
+    {chart_html.get('top_queries', '<p>Not enough data</p>')}
 </div>
 
 <h2>Query Length Distribution <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
