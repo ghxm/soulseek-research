@@ -1577,25 +1577,12 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure],
 
         <h2>Search Patterns Analysis <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
         <div class="chart">
-            {chart_html['top_queries']}
-        </div>
-
-        <div class="chart">
-            {chart_html.get('query_patterns', '<p>Not enough data</p>')}
-        </div>
-
-        <div class="chart">
             {chart_html.get('query_length', '<p>Not enough data</p>')}
         </div>
 
         <h2>Temporal Analysis <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
         <div class="chart">
             {chart_html.get('temporal_hourly', '<p>Not enough data</p>')}
-        </div>
-
-        <h2>User Activity <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
-        <div class="chart">
-            {chart_html['user_activity']}
         </div>
 
         <div class="footer">
@@ -1811,24 +1798,8 @@ def generate_period_page_from_df(conn, df_raw: pd.DataFrame, df_dedup: pd.DataFr
 
     print(f"  Analyzing search patterns...")
 
-    # Top queries (normalized, deduplicated)
+    # Normalize queries (needed for query length analysis)
     df_dedup['query_normalized'] = df_dedup['query'].str.lower().str.strip()
-    top_queries_df = df_dedup.groupby('query_normalized').agg(
-        unique_users=('username', 'nunique'),
-        total_searches=('query', 'size')
-    ).sort_values('unique_users', ascending=False).head(100)
-    top_queries = [(q, row['unique_users'], row['total_searches']) for q, row in top_queries_df.iterrows()]
-
-    # Top users
-    top_users_df = df_dedup.groupby('username').agg(
-        search_count=('query', 'size'),
-        unique_queries=('query', 'nunique')
-    ).sort_values('search_count', ascending=False).head(50)
-    top_users = [(u, row['search_count'], row['unique_queries']) for u, row in top_users_df.iterrows()]
-
-    # Sample queries for pattern analysis
-    query_sample = df_dedup['query'].head(10000).tolist()
-    query_patterns = analyze_query_patterns(query_sample)
 
     # Temporal patterns (by hour)
     df_dedup['hour'] = df_dedup['timestamp'].dt.hour
@@ -1842,14 +1813,11 @@ def generate_period_page_from_df(conn, df_raw: pd.DataFrame, df_dedup: pd.DataFr
     print(f"  Found {total_searches:,} searches for {period_label}")
     print(f"  Creating visualizations...")
 
-    # Create figures (removed memory-intensive charts: ngrams, cooccurrence, client_convergence)
+    # Create figures (keeping only lightweight charts)
     figures = {
         'daily_flow': create_daily_flow_chart(daily_stats),
         'daily_unique_users': create_daily_unique_users_chart(daily_unique_users) if not daily_unique_users.empty else None,
-        'top_queries': create_top_queries_chart(top_queries) if top_queries else None,
-        'user_activity': create_user_activity_chart(top_users) if top_users else None,
         'client_distribution': create_client_distribution_chart(client_totals) if client_totals else None,
-        'query_patterns': create_query_pattern_chart(query_patterns) if query_patterns else None,
         'temporal_hourly': create_temporal_hourly_chart(temporal_data) if not temporal_data.empty else None,
         'query_length': create_query_length_chart(query_length_data) if not query_length_data.empty else None
     }
@@ -2085,25 +2053,12 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
 
 <h2>Search Patterns Analysis <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
 <div class="chart">
-    {chart_html.get('top_queries', '<p>Not enough data</p>')}
-</div>
-
-<div class="chart">
-    {chart_html.get('query_patterns', '<p>Not enough data</p>')}
-</div>
-
-<div class="chart">
     {chart_html.get('query_length', '<p>Not enough data</p>')}
 </div>
 
 <h2>Temporal Analysis <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
 <div class="chart">
     {chart_html.get('temporal_hourly', '<p>Not enough data</p>')}
-</div>
-
-<h2>User Activity <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
-<div class="chart">
-    {chart_html.get('user_activity', '<p>Not enough data</p>')}
 </div>
 '''
 
