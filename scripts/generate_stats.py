@@ -2170,33 +2170,57 @@ def main():
         generate_jekyll_data_files(periods)
         print("✅ Generated Jekyll navigation data files")
 
-        # Generate all-time page (uses aggregate queries for cumulative stats)
+        # LOAD ALL DATA ONCE to avoid OOM from loading multiple times
+        print("="*80)
+        print("LOADING ALL DATA FROM DATABASE")
+        print("="*80)
+        print(f"  Loading all live data...")
+        all_data_raw = load_search_data(conn)  # Load all data without date filter
+        print(f"  Loaded {len(all_data_raw):,} raw records")
+
+        print(f"  Deduplicating all data...")
+        all_data_dedup = deduplicate_dataframe(all_data_raw)
+        print(f"  Deduplicated to {len(all_data_dedup):,} records")
+
+        # Generate all-time page (use full dataset)
         print("="*80)
         print("GENERATING ALL-TIME PAGE")
         print("="*80)
-        print(f"  Loading all data...")
-        all_time_raw = load_search_data(conn)  # Load all data
-        all_time_dedup = deduplicate_dataframe(all_time_raw)
-        generate_period_page_from_df(conn, all_time_raw, all_time_dedup, 'all', None)
+        print(f"  Using full dataset: {len(all_data_raw):,} raw, {len(all_data_dedup):,} deduplicated")
+        generate_period_page_from_df(conn, all_data_raw, all_data_dedup, 'all', None)
 
-        # Generate monthly pages (load data per month)
+        # Generate monthly pages (filter from loaded data)
         for month in periods['months']:
             print("="*80)
             print(f"GENERATING MONTHLY PAGE: {month['label']}")
             print("="*80)
-            print(f"  Loading data for period: {month['start']} to {month['end']}")
-            month_raw = load_search_data(conn, start_date=month['start'], end_date=month['end'])
-            month_dedup = deduplicate_dataframe(month_raw)
+            print(f"  Filtering data for period: {month['start']} to {month['end']}")
+            month_raw = all_data_raw[
+                (all_data_raw['timestamp'] >= month['start']) &
+                (all_data_raw['timestamp'] <= month['end'])
+            ].copy()
+            month_dedup = all_data_dedup[
+                (all_data_dedup['timestamp'] >= month['start']) &
+                (all_data_dedup['timestamp'] <= month['end'])
+            ].copy()
+            print(f"  Filtered to {len(month_raw):,} raw, {len(month_dedup):,} deduplicated")
             generate_period_page_from_df(conn, month_raw, month_dedup, 'month', month)
 
-        # Generate weekly pages (load data per week)
+        # Generate weekly pages (filter from loaded data)
         for week in periods['weeks']:
             print("="*80)
             print(f"GENERATING WEEKLY PAGE: CW {week['label']}")
             print("="*80)
-            print(f"  Loading data for period: {week['start']} to {week['end']}")
-            week_raw = load_search_data(conn, start_date=week['start'], end_date=week['end'])
-            week_dedup = deduplicate_dataframe(week_raw)
+            print(f"  Filtering data for period: {week['start']} to {week['end']}")
+            week_raw = all_data_raw[
+                (all_data_raw['timestamp'] >= week['start']) &
+                (all_data_raw['timestamp'] <= week['end'])
+            ].copy()
+            week_dedup = all_data_dedup[
+                (all_data_dedup['timestamp'] >= week['start']) &
+                (all_data_dedup['timestamp'] <= week['end'])
+            ].copy()
+            print(f"  Filtered to {len(week_raw):,} raw, {len(week_dedup):,} deduplicated")
             generate_period_page_from_df(conn, week_raw, week_dedup, 'week', week)
 
         print("\n" + "="*80)
