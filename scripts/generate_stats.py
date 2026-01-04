@@ -1866,36 +1866,59 @@ def generate_period_page_from_df(conn, df_raw: pd.DataFrame, df_dedup: pd.DataFr
 
     print(f"  Analyzing search patterns...")
 
-    # Top queries (count once per user - memory efficient with sampling for large datasets)
-    if len(df_dedup) > 1_000_000:
-        # Sample for very large datasets to avoid OOM
-        top_queries_sample = df_dedup.sample(n=1_000_000, random_state=42)
-        print(f"  Sampling 1,000,000 rows for top queries analysis (from {len(df_dedup):,} total)")
+    # Top queries (count once per user - use SQL aggregation, no sampling)
+    # Build date filter for SQL query
+    if period_type == 'all' or period_info is None:
+        # For all-time, use same 30-day filter as main data load
+        date_filter_sql = "AND timestamp >= NOW() - INTERVAL '30 days'"
     else:
-        top_queries_sample = df_dedup
+        date_filter_sql = f"AND timestamp >= '{period_info['start'].isoformat()}' AND timestamp <= '{period_info['end'].isoformat()}'"
 
-    top_queries_sample_copy = top_queries_sample.copy()
-    top_queries_sample_copy['query_normalized'] = top_queries_sample_copy['query'].str.lower().str.strip()
-    top_queries_df = top_queries_sample_copy.groupby('query_normalized').agg(
-        unique_users=('username', 'nunique'),
-        total_searches=('query', 'size')
-    ).sort_values('unique_users', ascending=False).head(100)
-    top_queries = [(q, row['unique_users'], row['total_searches']) for q, row in top_queries_df.iterrows()]
+    print(f"  Computing top queries using SQL aggregation...")
+    cursor = conn.cursor()
+    try:
+        top_queries_query = f"""
+            WITH deduped AS (
+                SELECT DISTINCT ON (username, query, DATE_TRUNC('minute', timestamp) / 5)
+                    username,
+                    LOWER(TRIM(query)) as query_normalized
+                FROM searches
+                WHERE TRUE {date_filter_sql}
+            )
+            SELECT
+                query_normalized,
+                COUNT(DISTINCT username) as unique_users,
+                COUNT(*) as total_searches
+            FROM deduped
+            GROUP BY query_normalized
+            ORDER BY unique_users DESC, total_searches DESC
+            LIMIT 100
+        """
+        cursor.execute(top_queries_query)
+        top_queries = cursor.fetchall()
 
-    # Query length distribution (sample for large datasets to avoid OOM)
-    # For datasets > 1M rows, sample 10% for query length analysis
-    sample_size = min(len(df_dedup), 1_000_000)  # Use at most 1M rows
-    if len(df_dedup) > 1_000_000:
-        df_sample = df_dedup.sample(n=sample_size, random_state=42)
-        print(f"  Sampling {sample_size:,} rows for query length analysis (from {len(df_dedup):,} total)")
-    else:
-        df_sample = df_dedup
-
-    df_sample_copy = df_sample.copy()
-    df_sample_copy['query_length'] = df_sample_copy['query'].str.split().str.len()
-    query_length_counts = df_sample_copy['query_length'].value_counts().reset_index()
-    query_length_counts.columns = ['query_length', 'count']
-    query_length_data = query_length_counts[query_length_counts['query_length'] <= 100]  # Filter outliers
+        # Query length distribution (use SQL aggregation, no sampling)
+        print(f"  Computing query length distribution using SQL aggregation...")
+        query_length_query = f"""
+            WITH deduped AS (
+                SELECT DISTINCT ON (username, query, DATE_TRUNC('minute', timestamp) / 5)
+                    array_length(string_to_array(query, ' '), 1) as query_length
+                FROM searches
+                WHERE TRUE {date_filter_sql}
+            )
+            SELECT
+                query_length,
+                COUNT(*) as count
+            FROM deduped
+            WHERE query_length <= 100
+            GROUP BY query_length
+            ORDER BY query_length
+        """
+        cursor.execute(query_length_query)
+        query_length_results = cursor.fetchall()
+        query_length_data = pd.DataFrame(query_length_results, columns=['query_length', 'count'])
+    finally:
+        cursor.close()
 
     print(f"  Found {total_searches:,} searches for {period_label}")
     print(f"  Creating visualizations...")
