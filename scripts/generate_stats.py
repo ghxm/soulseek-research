@@ -60,6 +60,10 @@ def load_search_data(conn, start_date=None, end_date=None) -> pd.DataFrame:
     date_filter = ""
     if start_date and end_date:
         date_filter = f"WHERE timestamp >= '{start_date.isoformat()}' AND timestamp <= '{end_date.isoformat()}'"
+    else:
+        # When loading all data, still filter to last 30 days for performance
+        # (helps PostgreSQL use timestamp index instead of full table scan)
+        date_filter = "WHERE timestamp >= NOW() - INTERVAL '30 days'"
 
     query = f"""
         SELECT id, client_id, timestamp, username, query
@@ -68,7 +72,8 @@ def load_search_data(conn, start_date=None, end_date=None) -> pd.DataFrame:
         ORDER BY timestamp
     """
 
-    print(f"  Loading data from database...")
+    print(f"  Executing SQL query...")
+    print(f"    Query: SELECT id, client_id, timestamp, username, query FROM searches {date_filter}")
     df = pd.read_sql_query(query, conn, parse_dates=['timestamp'])
     print(f"  Loaded {len(df):,} raw records")
     return df
