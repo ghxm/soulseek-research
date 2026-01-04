@@ -1855,31 +1855,38 @@ def generate_period_page_from_df(conn, df_raw: pd.DataFrame, df_dedup: pd.DataFr
     # Top queries (count once per user - use deduplicated DataFrame)
     print(f"  Computing top queries from deduplicated DataFrame...")
     if not df_dedup.empty:
-        # Normalize queries
-        df_queries = df_dedup.copy()
-        df_queries['query_normalized'] = df_queries['query'].str.lower().str.strip()
+        # Normalize queries in-place for groupby (no copy needed)
+        query_normalized = df_dedup['query'].str.lower().str.strip()
 
-        # Count unique users per query
-        top_queries_df = df_queries.groupby('query_normalized', as_index=False).agg({
-            'username': 'nunique',  # Unique users
-            'query': 'count'        # Total occurrences
-        }).rename(columns={'username': 'unique_users', 'query': 'total_searches'})
+        # Count unique users per query - single efficient groupby
+        top_queries_df = df_dedup.groupby(query_normalized, sort=False).agg(
+            unique_users=('username', 'nunique'),
+            total_searches=('query', 'size')
+        ).nlargest(100, ['unique_users', 'total_searches'])
 
-        # Sort and limit
-        top_queries_df = top_queries_df.sort_values(['unique_users', 'total_searches'], ascending=False).head(100)
-        top_queries = list(top_queries_df.itertuples(index=False, name=None))
+        # Convert to list of tuples
+        top_queries = [(idx, row['unique_users'], row['total_searches'])
+                       for idx, row in top_queries_df.iterrows()]
+
+        # Clean up intermediate objects
+        del query_normalized, top_queries_df
+        gc.collect()
     else:
         top_queries = []
 
     # Query length distribution (use deduplicated DataFrame)
     print(f"  Computing query length distribution from deduplicated DataFrame...")
     if not df_dedup.empty:
-        # Calculate query length (number of words)
-        df_length = df_dedup.copy()
-        df_length['query_length'] = df_length['query'].str.split().str.len()
+        # Calculate query length efficiently (no copy, no intermediate column)
+        query_lengths = df_dedup['query'].str.split().str.len()
 
-        # Filter to reasonable lengths and count
-        query_length_data = df_length[df_length['query_length'] <= 100].groupby('query_length').size().reset_index(name='count')
+        # Filter and count in one pass
+        query_length_data = query_lengths[query_lengths <= 100].value_counts().sort_index().reset_index()
+        query_length_data.columns = ['query_length', 'count']
+
+        # Clean up
+        del query_lengths
+        gc.collect()
     else:
         query_length_data = pd.DataFrame(columns=['query_length', 'count'])
 
