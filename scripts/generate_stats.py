@@ -1343,29 +1343,24 @@ def generate_article_html(stats: Dict, figures: Dict[str, go.Figure],
             max-width: 1200px;
             margin: 30px auto;
         }}
-        /* Header with logo */
+        /* Combined header bar */
         .header {{
             background: #f8f8f8;
             border-bottom: 2px solid #333;
-            padding: 15px 0;
+            padding: 12px 20px;
             margin: -20px -20px 30px -20px;
-        }}
-        .header-content {{
-            max-width: 1400px;
-            margin: 0 auto;
-            padding: 0 30px;
             display: flex;
             align-items: center;
             gap: 15px;
         }}
         .header-logo {{
-            width: 32px;
-            height: 32px;
-            filter: grayscale(100%);
-            opacity: 0.7;
+            width: 24px;
+            height: 24px;
+            fill: #555;
+            flex-shrink: 0;
         }}
         .header-title {{
-            font-size: 18px;
+            font-size: 16px;
             font-weight: 600;
             color: #333;
             margin: 0;
@@ -1374,12 +1369,10 @@ def generate_article_html(stats: Dict, figures: Dict[str, go.Figure],
 </head>
 <body>
     <div class="header">
-        <div class="header-content">
-            <svg class="header-logo" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z" fill="currentColor"/>
-            </svg>
-            <h1 class="header-title">Soulseek Search Monitor</h1>
-        </div>
+        <svg class="header-logo" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+            <path d="M12,2C11.5,2 11,2.19 10.59,2.59L2.59,10.59C1.8,11.37 1.8,12.63 2.59,13.41L10.59,21.41C11.37,22.2 12.63,22.2 13.41,21.41L21.41,13.41C22.2,12.63 22.2,11.37 21.41,10.59L13.41,2.59C13,2.19 12.5,2 12,2M12,4L20,12L12,20L4,12L12,4M11,7V13H13V7H11M11,15V17H13V15H11Z"/>
+        </svg>
+        <span class="header-title">Soulseek Search Monitor</span>
     </div>
     <div class="container article-mode">
         <p class="timestamp">Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
@@ -1572,29 +1565,24 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure],
             max-width: 1200px;
             margin: 30px auto;
         }}
-        /* Header with logo */
+        /* Combined header bar */
         .header {{
             background: #f8f8f8;
             border-bottom: 2px solid #333;
-            padding: 15px 0;
+            padding: 12px 20px;
             margin: -20px -20px 30px -20px;
-        }}
-        .header-content {{
-            max-width: 1400px;
-            margin: 0 auto;
-            padding: 0 30px;
             display: flex;
             align-items: center;
             gap: 15px;
         }}
         .header-logo {{
-            width: 32px;
-            height: 32px;
-            filter: grayscale(100%);
-            opacity: 0.7;
+            width: 24px;
+            height: 24px;
+            fill: #555;
+            flex-shrink: 0;
         }}
         .header-title {{
-            font-size: 18px;
+            font-size: 16px;
             font-weight: 600;
             color: #333;
             margin: 0;
@@ -1603,12 +1591,10 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure],
 </head>
 <body>
     <div class="header">
-        <div class="header-content">
-            <svg class="header-logo" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z" fill="currentColor"/>
-            </svg>
-            <h1 class="header-title">Soulseek Search Monitor</h1>
-        </div>
+        <svg class="header-logo" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+            <path d="M12,2C11.5,2 11,2.19 10.59,2.59L2.59,10.59C1.8,11.37 1.8,12.63 2.59,13.41L10.59,21.41C11.37,22.2 12.63,22.2 13.41,21.41L21.41,13.41C22.2,12.63 22.2,11.37 21.41,10.59L13.41,2.59C13,2.19 12.5,2 12,2M12,4L20,12L12,20L4,12L12,4M11,7V13H13V7H11M11,15V17H13V15H11Z"/>
+        </svg>
+        <span class="header-title">Soulseek Search Monitor</span>
     </div>
     <div class="container">
         <p class="timestamp">Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
