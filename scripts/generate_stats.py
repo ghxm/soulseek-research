@@ -1575,6 +1575,11 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure],
             {chart_html.get('daily_unique_users', '<p>Not enough data</p>')}
         </div>
 
+        <h2>Query Length Distribution <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
+        <div class="chart">
+            {chart_html.get('query_length', '<p>Not enough data</p>')}
+        </div>
+
         <div class="footer">
             <p>Soulseek Research Project | Data collected from distributed geographic locations</p>
             <p>All usernames are cryptographically hashed for privacy</p>
@@ -1788,14 +1793,21 @@ def generate_period_page_from_df(conn, df_raw: pd.DataFrame, df_dedup: pd.DataFr
 
     print(f"  Analyzing search patterns...")
 
+    # Query length distribution (memory-efficient: use value_counts instead of groupby)
+    df_dedup['query_length'] = df_dedup['query'].str.split().str.len()
+    query_length_counts = df_dedup['query_length'].value_counts().reset_index()
+    query_length_counts.columns = ['query_length', 'count']
+    query_length_data = query_length_counts[query_length_counts['query_length'] <= 100]  # Filter outliers
+
     print(f"  Found {total_searches:,} searches for {period_label}")
     print(f"  Creating visualizations...")
 
-    # Create figures (minimal set to avoid OOM)
+    # Create figures (lightweight charts only)
     figures = {
         'daily_flow': create_daily_flow_chart(daily_stats),
         'daily_unique_users': create_daily_unique_users_chart(daily_unique_users) if not daily_unique_users.empty else None,
-        'client_distribution': create_client_distribution_chart(client_totals) if client_totals else None
+        'client_distribution': create_client_distribution_chart(client_totals) if client_totals else None,
+        'query_length': create_query_length_chart(query_length_data) if not query_length_data.empty else None
     }
 
     # Check for article mode (only for all-time page)
@@ -2025,6 +2037,11 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
 <h2>User Activity Trends <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
 <div class="chart">
     {chart_html.get('daily_unique_users', '<p>Not enough data</p>')}
+</div>
+
+<h2>Query Length Distribution <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
+<div class="chart">
+    {chart_html.get('query_length', '<p>Not enough data</p>')}
 </div>
 
 '''
