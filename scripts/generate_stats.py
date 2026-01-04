@@ -1575,16 +1575,6 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure],
             {chart_html.get('daily_unique_users', '<p>Not enough data</p>')}
         </div>
 
-        <h2>Search Patterns Analysis <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
-        <div class="chart">
-            {chart_html.get('query_length', '<p>Not enough data</p>')}
-        </div>
-
-        <h2>Temporal Analysis <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
-        <div class="chart">
-            {chart_html.get('temporal_hourly', '<p>Not enough data</p>')}
-        </div>
-
         <div class="footer">
             <p>Soulseek Research Project | Data collected from distributed geographic locations</p>
             <p>All usernames are cryptographically hashed for privacy</p>
@@ -1798,28 +1788,14 @@ def generate_period_page_from_df(conn, df_raw: pd.DataFrame, df_dedup: pd.DataFr
 
     print(f"  Analyzing search patterns...")
 
-    # Normalize queries (needed for query length analysis)
-    df_dedup['query_normalized'] = df_dedup['query'].str.lower().str.strip()
-
-    # Temporal patterns (by hour)
-    df_dedup['hour'] = df_dedup['timestamp'].dt.hour
-    temporal_data = df_dedup.groupby('hour').size().reset_index(name='search_count')
-
-    # Query length distribution
-    df_dedup['query_length'] = df_dedup['query_normalized'].str.split().str.len()
-    query_length_data = df_dedup.groupby('query_length')['query_normalized'].nunique().reset_index(name='count')
-    query_length_data = query_length_data[query_length_data['query_length'] <= 100]  # Filter outliers
-
     print(f"  Found {total_searches:,} searches for {period_label}")
     print(f"  Creating visualizations...")
 
-    # Create figures (keeping only lightweight charts)
+    # Create figures (minimal set to avoid OOM)
     figures = {
         'daily_flow': create_daily_flow_chart(daily_stats),
         'daily_unique_users': create_daily_unique_users_chart(daily_unique_users) if not daily_unique_users.empty else None,
-        'client_distribution': create_client_distribution_chart(client_totals) if client_totals else None,
-        'temporal_hourly': create_temporal_hourly_chart(temporal_data) if not temporal_data.empty else None,
-        'query_length': create_query_length_chart(query_length_data) if not query_length_data.empty else None
+        'client_distribution': create_client_distribution_chart(client_totals) if client_totals else None
     }
 
     # Check for article mode (only for all-time page)
@@ -2051,15 +2027,6 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
     {chart_html.get('daily_unique_users', '<p>Not enough data</p>')}
 </div>
 
-<h2>Search Patterns Analysis <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
-<div class="chart">
-    {chart_html.get('query_length', '<p>Not enough data</p>')}
-</div>
-
-<h2>Temporal Analysis <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
-<div class="chart">
-    {chart_html.get('temporal_hourly', '<p>Not enough data</p>')}
-</div>
 '''
 
     return front_matter + content
