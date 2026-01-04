@@ -1793,9 +1793,18 @@ def generate_period_page_from_df(conn, df_raw: pd.DataFrame, df_dedup: pd.DataFr
 
     print(f"  Analyzing search patterns...")
 
-    # Query length distribution (memory-efficient: use value_counts instead of groupby)
-    df_dedup['query_length'] = df_dedup['query'].str.split().str.len()
-    query_length_counts = df_dedup['query_length'].value_counts().reset_index()
+    # Query length distribution (sample for large datasets to avoid OOM)
+    # For datasets > 1M rows, sample 10% for query length analysis
+    sample_size = min(len(df_dedup), 1_000_000)  # Use at most 1M rows
+    if len(df_dedup) > 1_000_000:
+        df_sample = df_dedup.sample(n=sample_size, random_state=42)
+        print(f"  Sampling {sample_size:,} rows for query length analysis (from {len(df_dedup):,} total)")
+    else:
+        df_sample = df_dedup
+
+    df_sample_copy = df_sample.copy()
+    df_sample_copy['query_length'] = df_sample_copy['query'].str.split().str.len()
+    query_length_counts = df_sample_copy['query_length'].value_counts().reset_index()
     query_length_counts.columns = ['query_length', 'count']
     query_length_data = query_length_counts[query_length_counts['query_length'] <= 100]  # Filter outliers
 
