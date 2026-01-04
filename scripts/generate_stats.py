@@ -1852,61 +1852,36 @@ def generate_period_page_from_df(conn, df_raw: pd.DataFrame, df_dedup: pd.DataFr
 
     print(f"  Analyzing search patterns...")
 
-    # Top queries (count once per user - use SQL aggregation, no sampling)
-    # Build date filter for SQL query
-    if period_type == 'all' or period_info is None:
-        # For all-time, use same 30-day filter as main data load
-        date_filter_sql = "AND timestamp >= NOW() - INTERVAL '30 days'"
+    # Top queries (count once per user - use deduplicated DataFrame)
+    print(f"  Computing top queries from deduplicated DataFrame...")
+    if not df_dedup.empty:
+        # Normalize queries
+        df_queries = df_dedup.copy()
+        df_queries['query_normalized'] = df_queries['query'].str.lower().str.strip()
+
+        # Count unique users per query
+        top_queries_df = df_queries.groupby('query_normalized', as_index=False).agg({
+            'username': 'nunique',  # Unique users
+            'query': 'count'        # Total occurrences
+        }).rename(columns={'username': 'unique_users', 'query': 'total_searches'})
+
+        # Sort and limit
+        top_queries_df = top_queries_df.sort_values(['unique_users', 'total_searches'], ascending=False).head(100)
+        top_queries = list(top_queries_df.itertuples(index=False, name=None))
     else:
-        date_filter_sql = f"AND timestamp >= '{period_info['start'].isoformat()}' AND timestamp <= '{period_info['end'].isoformat()}'"
+        top_queries = []
 
-    print(f"  Computing top queries using SQL aggregation...")
-    cursor = conn.cursor()
-    try:
-        top_queries_query = f"""
-            WITH deduped AS (
-                SELECT DISTINCT ON (username, query, FLOOR(EXTRACT(EPOCH FROM timestamp) / 300))
-                    username,
-                    LOWER(TRIM(query)) as query_normalized
-                FROM searches
-                WHERE TRUE {date_filter_sql}
-                ORDER BY username, query, FLOOR(EXTRACT(EPOCH FROM timestamp) / 300), timestamp
-            )
-            SELECT
-                query_normalized,
-                COUNT(DISTINCT username) as unique_users,
-                COUNT(*) as total_searches
-            FROM deduped
-            GROUP BY query_normalized
-            ORDER BY unique_users DESC, total_searches DESC
-            LIMIT 100
-        """
-        cursor.execute(top_queries_query)
-        top_queries = cursor.fetchall()
+    # Query length distribution (use deduplicated DataFrame)
+    print(f"  Computing query length distribution from deduplicated DataFrame...")
+    if not df_dedup.empty:
+        # Calculate query length (number of words)
+        df_length = df_dedup.copy()
+        df_length['query_length'] = df_length['query'].str.split().str.len()
 
-        # Query length distribution (use SQL aggregation, no sampling)
-        print(f"  Computing query length distribution using SQL aggregation...")
-        query_length_query = f"""
-            WITH deduped AS (
-                SELECT DISTINCT ON (username, query, FLOOR(EXTRACT(EPOCH FROM timestamp) / 300))
-                    array_length(string_to_array(query, ' '), 1) as query_length
-                FROM searches
-                WHERE TRUE {date_filter_sql}
-                ORDER BY username, query, FLOOR(EXTRACT(EPOCH FROM timestamp) / 300), timestamp
-            )
-            SELECT
-                query_length,
-                COUNT(*) as count
-            FROM deduped
-            WHERE query_length <= 100
-            GROUP BY query_length
-            ORDER BY query_length
-        """
-        cursor.execute(query_length_query)
-        query_length_results = cursor.fetchall()
-        query_length_data = pd.DataFrame(query_length_results, columns=['query_length', 'count'])
-    finally:
-        cursor.close()
+        # Filter to reasonable lengths and count
+        query_length_data = df_length[df_length['query_length'] <= 100].groupby('query_length').size().reset_index(name='count')
+    else:
+        query_length_data = pd.DataFrame(columns=['query_length', 'count'])
 
     print(f"  Found {total_searches:,} searches for {period_label}")
     print(f"  Creating visualizations...")
