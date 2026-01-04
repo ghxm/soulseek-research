@@ -1597,15 +1597,6 @@ def generate_html(stats: Dict, figures: Dict[str, go.Figure],
             {chart_html.get('temporal_hourly', '<p>Not enough data</p>')}
         </div>
 
-        <h2>Search Term Analysis <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
-        <div class="chart">
-            {chart_html.get('ngrams', '<p>Not enough data</p>')}
-        </div>
-
-        <div class="chart">
-            {chart_html.get('cooccurrence', '<p>Not enough data for network visualization</p>')}
-        </div>
-
         <h2>User Activity <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
         <div class="chart">
             {chart_html['user_activity']}
@@ -1869,15 +1860,10 @@ def generate_period_page_from_df(conn, df_raw: pd.DataFrame, df_dedup: pd.DataFr
     query_length_data = df_dedup.groupby('query_length')['query_normalized'].nunique().reset_index(name='count')
     query_length_data = query_length_data[query_length_data['query_length'] <= 100]  # Filter outliers
 
-    # N-grams analysis
-    bigrams = analyze_ngrams(query_sample, n=2, limit=30)
-    trigrams = analyze_ngrams(query_sample, n=3, limit=30)
-    cooccurrences = analyze_term_cooccurrence(query_sample, min_freq=10)
-
     print(f"  Found {total_searches:,} searches for {period_label}")
     print(f"  Creating visualizations...")
 
-    # Create figures
+    # Create figures (removed memory-intensive ngrams and cooccurrence charts)
     figures = {
         'daily_flow': create_daily_flow_chart(daily_stats),
         'client_convergence': create_client_convergence_chart(client_convergence) if not client_convergence.empty else None,
@@ -1887,9 +1873,7 @@ def generate_period_page_from_df(conn, df_raw: pd.DataFrame, df_dedup: pd.DataFr
         'client_distribution': create_client_distribution_chart(client_totals) if client_totals else None,
         'query_patterns': create_query_pattern_chart(query_patterns) if query_patterns else None,
         'temporal_hourly': create_temporal_hourly_chart(temporal_data) if not temporal_data.empty else None,
-        'query_length': create_query_length_chart(query_length_data) if not query_length_data.empty else None,
-        'ngrams': create_ngram_chart(bigrams, trigrams) if bigrams and trigrams else None,
-        'cooccurrence': create_cooccurrence_chart(cooccurrences) if cooccurrences else None
+        'query_length': create_query_length_chart(query_length_data) if not query_length_data.empty else None
     }
 
     # Check for article mode (only for all-time page)
@@ -2141,15 +2125,6 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
 <h2>Temporal Analysis <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
 <div class="chart">
     {chart_html.get('temporal_hourly', '<p>Not enough data</p>')}
-</div>
-
-<h2>Search Term Analysis <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
-<div class="chart">
-    {chart_html.get('ngrams', '<p>Not enough data</p>')}
-</div>
-
-<div class="chart">
-    {chart_html.get('cooccurrence', '<p>Not enough data for network visualization</p>')}
 </div>
 
 <h2>User Activity <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
