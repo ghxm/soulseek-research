@@ -286,6 +286,13 @@ cython_debug/
 # Test files
 test_*.py
 
+# Generated/temporary docs
+DATA_RETENTION.md
+DEPLOYMENT_STEPS.md
+SECURITY_NOTE.md
+docs/ARTICLE_MODE.md
+docs/article.md.example
+
 # Secrets & Credentials
 terraform.tfvars
 .env*

@@ -201,6 +201,15 @@ germany,2025-01-01T00:00:01Z,abc123hash,artist name album
 
 ## Maintenance & Updates
 
+### DO NOT COMMIT
+**NEVER commit these files to the repository:**
+- `.DS_Store` (macOS metadata)
+- `.idea/` (IDE settings)
+- `test_*.py` (local test scripts)
+- Temporary markdown docs (DATA_RETENTION.md, DEPLOYMENT_STEPS.md, SECURITY_NOTE.md, etc.)
+
+These are in `.gitignore` - if you create them locally, do NOT stage or commit them.
+
 ### Update Protocol
 **IMPORTANT**: Always check if anything changed in the codebase and update this CLAUDE.md accordingly.
 
