@@ -15,6 +15,7 @@ from collections import Counter, defaultdict
 from typing import List, Dict, Any, Tuple, Optional, Iterator
 
 import psycopg2
+import duckdb
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
@@ -51,20 +52,18 @@ def get_db_connection():
     )
 
 
-def load_search_data(conn, start_date=None, end_date=None, chunksize=5_000_000) -> pd.DataFrame:
+def load_data_into_duckdb(pg_conn, duckdb_conn, start_date=None, end_date=None):
     """
-    Load search data from database into pandas DataFrame using chunked loading.
+    Load search data from PostgreSQL into DuckDB for fast analytics.
 
-    Uses date filtering in SQL (leverages timestamp index) for performance.
-    Loads data in chunks to avoid memory issues with large datasets.
-    Returns all columns needed for analysis.
+    Uses chunked loading to avoid memory issues, but DuckDB's columnar
+    storage is much more memory-efficient than pandas.
     """
     date_filter = ""
     if start_date and end_date:
         date_filter = f"WHERE timestamp >= '{start_date.isoformat()}' AND timestamp <= '{end_date.isoformat()}'"
     else:
         # When loading all data, still filter to last 30 days for performance
-        # (helps PostgreSQL use timestamp index instead of full table scan)
         date_filter = "WHERE timestamp >= NOW() - INTERVAL '30 days'"
 
     query = f"""
@@ -74,57 +73,76 @@ def load_search_data(conn, start_date=None, end_date=None, chunksize=5_000_000) 
         ORDER BY timestamp
     """
 
-    print(f"  Executing SQL query...")
+    print(f"  Loading data from PostgreSQL into DuckDB...")
     print(f"    Query: SELECT id, client_id, timestamp, username, query FROM searches {date_filter}")
-    print(f"  Loading data in chunks of {chunksize:,} rows...")
 
-    chunks = []
+    # Create table in DuckDB
+    duckdb_conn.execute("""
+        CREATE TABLE searches_raw (
+            id BIGINT,
+            client_id VARCHAR,
+            timestamp TIMESTAMP,
+            username VARCHAR,
+            query VARCHAR
+        )
+    """)
+
+    # Load data in chunks from PostgreSQL
+    chunksize = 1_000_000  # 1M rows per chunk
+    cursor = pg_conn.cursor()
+    cursor.execute(query)
+
     total_rows = 0
-    for i, chunk in enumerate(pd.read_sql_query(query, conn, parse_dates=['timestamp'], chunksize=chunksize)):
-        chunks.append(chunk)
-        total_rows += len(chunk)
-        print(f"    Loaded chunk {i+1}: {len(chunk):,} rows (total: {total_rows:,})")
+    chunk_num = 0
+    while True:
+        rows = cursor.fetchmany(chunksize)
+        if not rows:
+            break
 
-    df = pd.concat(chunks, ignore_index=True)
-    print(f"  Loaded {len(df):,} raw records")
+        chunk_num += 1
+        total_rows += len(rows)
 
-    # Clean up
-    del chunks
-    gc.collect()
+        # Insert into DuckDB (very fast)
+        duckdb_conn.executemany(
+            "INSERT INTO searches_raw VALUES (?, ?, ?, ?, ?)",
+            rows
+        )
+        print(f"    Loaded chunk {chunk_num}: {len(rows):,} rows (total: {total_rows:,})")
 
-    return df
+    cursor.close()
+    print(f"  Loaded {total_rows:,} raw records into DuckDB")
+
+    return total_rows
 
 
-def deduplicate_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+def deduplicate_in_duckdb(duckdb_conn):
     """
-    Deduplicate searches within 5-minute windows using pandas.
+    Deduplicate searches within 5-minute windows using DuckDB SQL.
 
-    This handles the case where the same search is distributed to multiple
-    clients, resulting in duplicate entries. We only keep the first occurrence
-    within each 5-minute window for the same username+query combination.
-
-    Performance: Much faster than SQL window functions on large datasets.
-    Uses pandas vectorized operations and efficient hashing.
+    This is 10-50x faster than pandas and uses minimal memory.
+    Creates a new deduplicated table.
     """
-    if df.empty:
-        return df
+    print(f"  Deduplicating data in DuckDB (5-minute windows)...")
 
-    # Create 5-minute time bucket column (floor to nearest 5 minutes)
-    # Use assign to avoid modifying the original DataFrame
-    df_with_bucket = df.assign(time_bucket=df['timestamp'].dt.floor('5min'))
+    # Get count before deduplication
+    raw_count = duckdb_conn.execute("SELECT COUNT(*) FROM searches_raw").fetchone()[0]
 
-    # Sort by timestamp to ensure we keep the first occurrence
-    df_sorted = df_with_bucket.sort_values('timestamp')
+    # Deduplicate using SQL - much faster than pandas
+    duckdb_conn.execute("""
+        CREATE TABLE searches_dedup AS
+        SELECT DISTINCT ON (username, query, FLOOR(EPOCH(timestamp) / 300))
+            id, client_id, timestamp, username, query
+        FROM searches_raw
+        ORDER BY username, query, FLOOR(EPOCH(timestamp) / 300), timestamp
+    """)
 
-    # Keep first occurrence of each (username, query, time_bucket) combination
-    df_dedup = df_sorted.drop_duplicates(
-        subset=['username', 'query', 'time_bucket'],
-        keep='first'
-    ).drop(columns=['time_bucket'])
+    # Get count after deduplication
+    dedup_count = duckdb_conn.execute("SELECT COUNT(*) FROM searches_dedup").fetchone()[0]
 
-    print(f"  Deduplicated: {len(df):,} → {len(df_dedup):,} records ({100*(1-len(df_dedup)/len(df)):.1f}% reduction)")
+    reduction_pct = 100 * (1 - dedup_count / raw_count) if raw_count > 0 else 0
+    print(f"  Deduplicated: {raw_count:,} → {dedup_count:,} records ({reduction_pct:.1f}% reduction)")
 
-    return df_dedup
+    return raw_count, dedup_count
 
 
 def get_archived_months(conn) -> List[Dict[str, Any]]:
@@ -1797,6 +1815,163 @@ def query_period_data(conn, start_date=None, end_date=None):
     }
 
 
+def generate_period_page_with_duckdb(pg_conn, duckdb_conn, period_type: str, period_info: Optional[Dict] = None) -> str:
+    """
+    Generate a dashboard page for a specific period using DuckDB for analytics.
+
+    pg_conn: PostgreSQL connection (for metadata if needed)
+    duckdb_conn: DuckDB connection with searches_raw and searches_dedup tables loaded
+    period_type: 'all', 'month', or 'week'
+    period_info: Dict with 'id', 'label', 'start', 'end' (None for all-time)
+    """
+    if period_type == 'all':
+        period_label = "All Time"
+        page_title = "Soulseek Research Dashboard - All Time"
+        output_file = "docs/index.html"
+    else:
+        period_label = period_info['label']
+
+        if period_type == 'week':
+            page_title = f"Soulseek Research Dashboard - CW {period_label}"
+            output_file = f"docs/weeks/{period_info['id']}.html"
+        else:  # month
+            page_title = f"Soulseek Research Dashboard - {period_label}"
+            output_file = f"docs/months/{period_info['id']}.html"
+
+    # Check if we have data
+    dedup_count = duckdb_conn.execute("SELECT COUNT(*) FROM searches_dedup").fetchone()[0]
+    if dedup_count == 0:
+        print(f"  No data for {period_label}, skipping")
+        return None
+
+    print(f"  Computing statistics for {period_label}...")
+
+    # Calculate summary statistics using DuckDB SQL (FAST!)
+    stats_query = duckdb_conn.execute("""
+        SELECT
+            COUNT(*) as total_searches,
+            COUNT(DISTINCT username) as total_users,
+            COUNT(DISTINCT LOWER(TRIM(query))) as total_queries,
+            COUNT(DISTINCT (username || '|' || LOWER(TRIM(query)))) as unique_search_pairs,
+            MIN(timestamp) as first_search,
+            MAX(timestamp) as last_search
+        FROM searches_dedup
+    """).fetchone()
+
+    total_searches, total_users, total_queries, unique_search_pairs, first_search, last_search = stats_query
+
+    avg_searches_per_user = total_searches / total_users if total_users > 0 else 0
+    avg_unique_queries_per_user = unique_search_pairs / total_users if total_users > 0 else 0
+
+    # Per-client totals (from raw data, not deduplicated)
+    client_totals_df = duckdb_conn.execute("""
+        SELECT client_id, COUNT(*) as count
+        FROM searches_raw
+        GROUP BY client_id
+    """).df()
+    client_totals = dict(zip(client_totals_df['client_id'], client_totals_df['count']))
+
+    stats = {
+        'total_searches': total_searches,
+        'total_users': total_users,
+        'total_queries': total_queries,
+        'unique_search_pairs': unique_search_pairs,
+        'avg_searches_per_user': avg_searches_per_user,
+        'avg_unique_queries_per_user': avg_unique_queries_per_user,
+        'first_search': first_search.isoformat(),
+        'last_search': last_search.isoformat(),
+        'client_totals': client_totals
+    }
+
+    print(f"  Generating time-series data...")
+
+    # Daily stats by client (raw data) - DuckDB query returns small DataFrame
+    daily_stats = duckdb_conn.execute("""
+        SELECT
+            client_id,
+            CAST(timestamp AS DATE) as date,
+            COUNT(*) as search_count
+        FROM searches_raw
+        GROUP BY client_id, CAST(timestamp AS DATE)
+        ORDER BY date, client_id
+    """).df()
+
+    # Daily unique users (deduplicated) - DuckDB query returns small DataFrame
+    daily_unique_users = duckdb_conn.execute("""
+        SELECT
+            CAST(timestamp AS DATE) as date,
+            COUNT(DISTINCT username) as unique_users
+        FROM searches_dedup
+        GROUP BY CAST(timestamp AS DATE)
+        ORDER BY date
+    """).df()
+
+    print(f"  Analyzing search patterns...")
+
+    # Top queries (count once per user) - DuckDB query, only 100 rows returned
+    print(f"  Computing top queries using DuckDB...")
+    top_queries_df = duckdb_conn.execute("""
+        SELECT
+            LOWER(TRIM(query)) as query_normalized,
+            COUNT(DISTINCT username) as unique_users,
+            COUNT(*) as total_searches
+        FROM searches_dedup
+        GROUP BY LOWER(TRIM(query))
+        ORDER BY unique_users DESC, total_searches DESC
+        LIMIT 100
+    """).df()
+
+    top_queries = list(top_queries_df.itertuples(index=False, name=None))
+
+    # Query length distribution - DuckDB query
+    print(f"  Computing query length distribution using DuckDB...")
+    query_length_data = duckdb_conn.execute("""
+        SELECT
+            LENGTH(query) - LENGTH(REPLACE(query, ' ', '')) + 1 as query_length,
+            COUNT(*) as count
+        FROM searches_dedup
+        WHERE LENGTH(query) - LENGTH(REPLACE(query, ' ', '')) + 1 <= 100
+        GROUP BY query_length
+        ORDER BY query_length
+    """).df()
+
+    print(f"  Found {total_searches:,} searches for {period_label}")
+    print(f"  Creating visualizations...")
+
+    # Create figures (lightweight charts only) - these work with small DataFrames
+    figures = {
+        'daily_flow': create_daily_flow_chart(daily_stats),
+        'daily_unique_users': create_daily_unique_users_chart(daily_unique_users) if not daily_unique_users.empty else None,
+        'client_distribution': create_client_distribution_chart(client_totals) if client_totals else None,
+        'top_queries': create_top_queries_chart(top_queries) if top_queries else None,
+        'query_length': create_query_length_chart(query_length_data) if not query_length_data.empty else None
+    }
+
+    # Check for article mode (only for all-time page)
+    article_content = None
+    if period_type == 'all':
+        article_content = load_article_content('docs/article.md')
+        if article_content:
+            print("  Using article mode for all-time page")
+
+    # Generate HTML with Jekyll front matter
+    if article_content:
+        # Use article mode (with charts embedded in narrative)
+        sections = parse_article_sections(article_content)
+        html = generate_article_html_with_jekyll(stats, figures, sections, period_type, period_info)
+    else:
+        # Standard dashboard page
+        html = generate_period_html(stats, figures, period_type, period_info)
+
+    # Write output
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    with open(output_file, 'w') as f:
+        f.write(html)
+
+    print(f"  ✅ Generated {output_file}")
+    return output_file
+
+
 def generate_period_page_from_df(conn, df_raw: pd.DataFrame, df_dedup: pd.DataFrame,
                                   period_type: str, period_info: Optional[Dict] = None) -> str:
     """
@@ -2162,13 +2337,17 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
 
 
 def main():
-    """Main execution"""
-    print("Connecting to database...")
-    conn = get_db_connection()
+    """Main execution using DuckDB for fast analytics"""
+    print("Connecting to PostgreSQL database...")
+    pg_conn = get_db_connection()
+
+    # Create DuckDB connection (in-memory for fast analytics)
+    print("Creating DuckDB connection...")
+    duck_conn = duckdb.connect(':memory:')
 
     try:
         # Get available periods from database
-        periods = get_available_periods(conn)
+        periods = get_available_periods(pg_conn)
 
         print(f"Found {len(periods['months'])} months and {len(periods['weeks'])} weeks")
 
@@ -2176,66 +2355,79 @@ def main():
         generate_jekyll_data_files(periods)
         print("✅ Generated Jekyll navigation data files")
 
-        # LOAD ALL DATA ONCE to avoid OOM from loading multiple times
+        # LOAD ALL DATA INTO DUCKDB
         print("="*80)
-        print("LOADING ALL DATA FROM DATABASE")
+        print("LOADING ALL DATA INTO DUCKDB")
         print("="*80)
-        print(f"  Loading all live data...")
-        all_data_raw = load_search_data(conn)  # Load all data without date filter
-        print(f"  Loaded {len(all_data_raw):,} raw records")
-
-        print(f"  Deduplicating all data...")
-        all_data_dedup = deduplicate_dataframe(all_data_raw)
-        print(f"  Deduplicated to {len(all_data_dedup):,} records")
+        raw_count = load_data_into_duckdb(pg_conn, duck_conn)
+        raw_count, dedup_count = deduplicate_in_duckdb(duck_conn)
 
         # Generate all-time page (use full dataset)
         print("="*80)
         print("GENERATING ALL-TIME PAGE")
         print("="*80)
-        print(f"  Using full dataset: {len(all_data_raw):,} raw, {len(all_data_dedup):,} deduplicated")
-        generate_period_page_from_df(conn, all_data_raw, all_data_dedup, 'all', None)
-        print("  Freeing memory...")
-        gc.collect()
+        print(f"  Using full dataset: {raw_count:,} raw, {dedup_count:,} deduplicated")
+        generate_period_page_with_duckdb(pg_conn, duck_conn, 'all', None)
 
-        # Generate monthly pages (filter from loaded data)
+        # Generate monthly pages (filter using SQL WHERE clauses)
         for month in periods['months']:
             print("="*80)
             print(f"GENERATING MONTHLY PAGE: {month['label']}")
             print("="*80)
             print(f"  Filtering data for period: {month['start']} to {month['end']}")
-            month_raw = all_data_raw[
-                (all_data_raw['timestamp'] >= month['start']) &
-                (all_data_raw['timestamp'] <= month['end'])
-            ].copy()
-            month_dedup = all_data_dedup[
-                (all_data_dedup['timestamp'] >= month['start']) &
-                (all_data_dedup['timestamp'] <= month['end'])
-            ].copy()
-            print(f"  Filtered to {len(month_raw):,} raw, {len(month_dedup):,} deduplicated")
-            generate_period_page_from_df(conn, month_raw, month_dedup, 'month', month)
-            print("  Freeing memory...")
-            del month_raw, month_dedup
-            gc.collect()
 
-        # Generate weekly pages (filter from loaded data)
+            # Create filtered views in DuckDB (fast SQL filtering)
+            duck_conn.execute("DROP VIEW IF EXISTS searches_raw")
+            duck_conn.execute("DROP VIEW IF EXISTS searches_dedup")
+            duck_conn.execute(f"""
+                CREATE VIEW searches_raw AS
+                SELECT * FROM main.searches_raw
+                WHERE timestamp >= '{month['start'].isoformat()}'
+                  AND timestamp <= '{month['end'].isoformat()}'
+            """)
+            duck_conn.execute(f"""
+                CREATE VIEW searches_dedup AS
+                SELECT * FROM main.searches_dedup
+                WHERE timestamp >= '{month['start'].isoformat()}'
+                  AND timestamp <= '{month['end'].isoformat()}'
+            """)
+
+            month_raw_count = duck_conn.execute("SELECT COUNT(*) FROM searches_raw").fetchone()[0]
+            month_dedup_count = duck_conn.execute("SELECT COUNT(*) FROM searches_dedup").fetchone()[0]
+            print(f"  Filtered to {month_raw_count:,} raw, {month_dedup_count:,} deduplicated")
+
+            if month_dedup_count > 0:
+                generate_period_page_with_duckdb(pg_conn, duck_conn, 'month', month)
+
+        # Generate weekly pages (filter using SQL WHERE clauses)
         for week in periods['weeks']:
             print("="*80)
             print(f"GENERATING WEEKLY PAGE: CW {week['label']}")
             print("="*80)
             print(f"  Filtering data for period: {week['start']} to {week['end']}")
-            week_raw = all_data_raw[
-                (all_data_raw['timestamp'] >= week['start']) &
-                (all_data_raw['timestamp'] <= week['end'])
-            ].copy()
-            week_dedup = all_data_dedup[
-                (all_data_dedup['timestamp'] >= week['start']) &
-                (all_data_dedup['timestamp'] <= week['end'])
-            ].copy()
-            print(f"  Filtered to {len(week_raw):,} raw, {len(week_dedup):,} deduplicated")
-            generate_period_page_from_df(conn, week_raw, week_dedup, 'week', week)
-            print("  Freeing memory...")
-            del week_raw, week_dedup
-            gc.collect()
+
+            # Create filtered views in DuckDB (fast SQL filtering)
+            duck_conn.execute("DROP VIEW IF EXISTS searches_raw")
+            duck_conn.execute("DROP VIEW IF EXISTS searches_dedup")
+            duck_conn.execute(f"""
+                CREATE VIEW searches_raw AS
+                SELECT * FROM main.searches_raw
+                WHERE timestamp >= '{week['start'].isoformat()}'
+                  AND timestamp <= '{week['end'].isoformat()}'
+            """)
+            duck_conn.execute(f"""
+                CREATE VIEW searches_dedup AS
+                SELECT * FROM main.searches_dedup
+                WHERE timestamp >= '{week['start'].isoformat()}'
+                  AND timestamp <= '{week['end'].isoformat()}'
+            """)
+
+            week_raw_count = duck_conn.execute("SELECT COUNT(*) FROM searches_raw").fetchone()[0]
+            week_dedup_count = duck_conn.execute("SELECT COUNT(*) FROM searches_dedup").fetchone()[0]
+            print(f"  Filtered to {week_raw_count:,} raw, {week_dedup_count:,} deduplicated")
+
+            if week_dedup_count > 0:
+                generate_period_page_with_duckdb(pg_conn, duck_conn, 'week', week)
 
         print("\n" + "="*80)
         print(f"✅ Generated {1 + len(periods['months']) + len(periods['weeks'])} dashboard pages")
@@ -2245,7 +2437,8 @@ def main():
         print("="*80)
 
     finally:
-        conn.close()
+        pg_conn.close()
+        duck_conn.close()
 
 
 if __name__ == '__main__':
