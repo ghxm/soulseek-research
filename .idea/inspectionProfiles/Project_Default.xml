@@ -1,0 +1,69 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="about-time" />
+          <option value="alive-progress" />
+          <option value="annotated-types" />
+          <option value="attrs" />
+          <option value="backoff" />
+          <option value="beautifulsoup4" />
+          <option value="blis" />
+          <option value="bs4" />
+          <option value="catalogue" />
+          <option value="certifi" />
+          <option value="charset-normalizer" />
+          <option value="click" />
+          <option value="cloudpathlib" />
+          <option value="confection" />
+          <option value="cymem" />
+          <option value="fuzzysearch" />
+          <option value="grapheme" />
+          <option value="idna" />
+          <option value="ijson" />
+          <option value="jellyfish" />
+          <option value="Jinja2" />
+          <option value="joblib" />
+          <option value="langcodes" />
+          <option value="Levenshtein" />
+          <option value="lxml" />
+          <option value="lzip" />
+          <option value="MarkupSafe" />
+          <option value="murmurhash" />
+          <option value="numpy" />
+          <option value="packaging" />
+          <option value="pandas" />
+          <option value="pathy" />
+          <option value="preshed" />
+          <option value="pydantic" />
+          <option value="pydantic_core" />
+          <option value="python-dateutil" />
+          <option value="pytz" />
+          <option value="pyxDamerauLevenshtein" />
+          <option value="rapidfuzz" />
+          <option value="regex" />
+          <option value="requests" />
+          <option value="six" />
+          <option value="smart-open" />
+          <option value="soupsieve" />
+          <option value="spacy" />
+          <option value="spacy-legacy" />
+          <option value="spacy-loggers" />
+          <option value="srsly" />
+          <option value="textdistance" />
+          <option value="thinc" />
+          <option value="tqdm" />
+          <option value="typer" />
+          <option value="typing_extensions" />
+          <option value="tzdata" />
+          <option value="urllib3" />
+          <option value="wasabi" />
+          <option value="weasel" />
+          <option value="word2number" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
