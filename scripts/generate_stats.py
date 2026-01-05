@@ -2366,6 +2366,10 @@ def main():
         print(f"  Using full dataset: {raw_count:,} raw, {dedup_count:,} deduplicated")
         generate_period_page_with_duckdb(pg_conn, duck_conn, 'all', None)
 
+        # Rename base tables to avoid view name conflicts
+        duck_conn.execute("ALTER TABLE searches_raw RENAME TO searches_raw_base")
+        duck_conn.execute("ALTER TABLE searches_dedup RENAME TO searches_dedup_base")
+
         # Generate monthly pages (filter using SQL WHERE clauses)
         for month in periods['months']:
             print("="*80)
@@ -2378,13 +2382,13 @@ def main():
             duck_conn.execute("DROP VIEW IF EXISTS searches_dedup")
             duck_conn.execute(f"""
                 CREATE VIEW searches_raw AS
-                SELECT * FROM main.searches_raw
+                SELECT * FROM searches_raw_base
                 WHERE timestamp >= '{month['start'].isoformat()}'
                   AND timestamp <= '{month['end'].isoformat()}'
             """)
             duck_conn.execute(f"""
                 CREATE VIEW searches_dedup AS
-                SELECT * FROM main.searches_dedup
+                SELECT * FROM searches_dedup_base
                 WHERE timestamp >= '{month['start'].isoformat()}'
                   AND timestamp <= '{month['end'].isoformat()}'
             """)
@@ -2408,13 +2412,13 @@ def main():
             duck_conn.execute("DROP VIEW IF EXISTS searches_dedup")
             duck_conn.execute(f"""
                 CREATE VIEW searches_raw AS
-                SELECT * FROM main.searches_raw
+                SELECT * FROM searches_raw_base
                 WHERE timestamp >= '{week['start'].isoformat()}'
                   AND timestamp <= '{week['end'].isoformat()}'
             """)
             duck_conn.execute(f"""
                 CREATE VIEW searches_dedup AS
-                SELECT * FROM main.searches_dedup
+                SELECT * FROM searches_dedup_base
                 WHERE timestamp >= '{week['start'].isoformat()}'
                   AND timestamp <= '{week['end'].isoformat()}'
             """)
