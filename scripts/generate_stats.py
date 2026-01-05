@@ -51,11 +51,12 @@ def get_db_connection():
     )
 
 
-def load_search_data(conn, start_date=None, end_date=None) -> pd.DataFrame:
+def load_search_data(conn, start_date=None, end_date=None, chunksize=5_000_000) -> pd.DataFrame:
     """
-    Load search data from database into pandas DataFrame.
+    Load search data from database into pandas DataFrame using chunked loading.
 
     Uses date filtering in SQL (leverages timestamp index) for performance.
+    Loads data in chunks to avoid memory issues with large datasets.
     Returns all columns needed for analysis.
     """
     date_filter = ""
@@ -75,8 +76,22 @@ def load_search_data(conn, start_date=None, end_date=None) -> pd.DataFrame:
 
     print(f"  Executing SQL query...")
     print(f"    Query: SELECT id, client_id, timestamp, username, query FROM searches {date_filter}")
-    df = pd.read_sql_query(query, conn, parse_dates=['timestamp'])
+    print(f"  Loading data in chunks of {chunksize:,} rows...")
+
+    chunks = []
+    total_rows = 0
+    for i, chunk in enumerate(pd.read_sql_query(query, conn, parse_dates=['timestamp'], chunksize=chunksize)):
+        chunks.append(chunk)
+        total_rows += len(chunk)
+        print(f"    Loaded chunk {i+1}: {len(chunk):,} rows (total: {total_rows:,})")
+
+    df = pd.concat(chunks, ignore_index=True)
     print(f"  Loaded {len(df):,} raw records")
+
+    # Clean up
+    del chunks
+    gc.collect()
+
     return df
 
 
