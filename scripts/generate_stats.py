@@ -155,10 +155,109 @@ def get_archived_months(conn) -> List[Dict[str, Any]]:
             for r in cursor.fetchall()]
 
 
+def download_parquet_archives(pg_conn, local_archive_path: str) -> List[str]:
+    """
+    Download Parquet archive files from database server to local path.
+    Returns list of local file paths.
+
+    If DB_SERVER_SSH_KEY and DB_SERVER_IP are set, downloads via SCP.
+    Otherwise assumes archives are already locally available.
+    """
+    os.makedirs(local_archive_path, exist_ok=True)
+
+    archives = get_archived_months(pg_conn)
+    if not archives:
+        print("  No archives found in database")
+        return []
+
+    print(f"  Found {len(archives)} archived months")
+
+    # Check if we need to download via SSH
+    ssh_key_path = os.environ.get('DB_SERVER_SSH_KEY')
+    db_server_ip = os.environ.get('DB_SERVER_IP')
+
+    local_files = []
+
+    if ssh_key_path and db_server_ip:
+        print(f"  Downloading archives from {db_server_ip} via SCP...")
+
+        for archive in archives:
+            remote_path = archive['file_path']
+            filename = os.path.basename(remote_path)
+            local_path = os.path.join(local_archive_path, filename)
+
+            # Skip if already downloaded
+            if os.path.exists(local_path):
+                print(f"    {filename} (cached)")
+                local_files.append(local_path)
+                continue
+
+            # Download via SCP
+            import subprocess
+            scp_cmd = [
+                'scp',
+                '-i', ssh_key_path,
+                '-o', 'StrictHostKeyChecking=no',
+                f'root@{db_server_ip}:{remote_path}',
+                local_path
+            ]
+
+            try:
+                subprocess.run(scp_cmd, check=True, capture_output=True)
+                print(f"    Downloaded {filename} ({archive['count']:,} records)")
+                local_files.append(local_path)
+            except subprocess.CalledProcessError as e:
+                print(f"    Warning: Failed to download {filename}: {e}")
+
+    else:
+        print(f"  Using local archives from {local_archive_path}")
+        for archive in archives:
+            local_path = os.path.join(local_archive_path, os.path.basename(archive['file_path']))
+            if os.path.exists(local_path):
+                local_files.append(local_path)
+            else:
+                print(f"    Warning: Archive not found: {local_path}")
+
+    return local_files
+
+
+def load_parquet_archives_into_duckdb(duckdb_conn, parquet_files: List[str]):
+    """
+    Load Parquet archive files into DuckDB as a single unioned table.
+
+    DuckDB can read Parquet files extremely efficiently - no need to
+    load all data into memory. Just register the files and query them.
+    """
+    if not parquet_files:
+        print("  No Parquet archives to load")
+        return 0
+
+    print(f"  Loading {len(parquet_files)} Parquet archives into DuckDB...")
+
+    # DuckDB can read multiple Parquet files as a single table
+    # This is VERY fast - it just registers the files, doesn't load everything
+    parquet_pattern = "', '".join(parquet_files)
+
+    # Create a view that unions all Parquet files
+    duckdb_conn.execute(f"""
+        CREATE VIEW searches_archived AS
+        SELECT * FROM read_parquet(['{parquet_pattern}'])
+    """)
+
+    # Count total archived records
+    archive_count = duckdb_conn.execute("SELECT COUNT(*) FROM searches_archived").fetchone()[0]
+    print(f"  Loaded {archive_count:,} archived records (metadata only, not in memory)")
+
+    return archive_count
+
+
 def read_archived_searches(archive_path: str) -> Iterator[Dict[str, str]]:
     """
     Stream-read a gzipped CSV archive file.
     Yields dict for each row: {client_id, timestamp, username, query}
+
+    NOTE: This function is kept for backwards compatibility with CSV.gz archives.
+    New archives use Parquet format which is loaded directly by DuckDB.
     """
     if not os.path.exists(archive_path):
         print(f"Warning: Archive file not found: {archive_path}")
@@ -2352,11 +2451,47 @@ def main():
         generate_jekyll_data_files(periods)
         print("✅ Generated Jekyll navigation data files")
 
-        # LOAD ALL DATA INTO DUCKDB
+        # CHECK FOR AND LOAD PARQUET ARCHIVES
         print("="*80)
-        print("LOADING ALL DATA INTO DUCKDB")
+        print("CHECKING FOR ARCHIVED DATA")
+        print("="*80)
+        local_archive_path = os.environ.get('ARCHIVE_PATH', './archives')
+        parquet_files = download_parquet_archives(pg_conn, local_archive_path)
+
+        # Load archives into DuckDB (if any exist)
+        archive_count = 0
+        if parquet_files:
+            archive_count = load_parquet_archives_into_duckdb(duck_conn, parquet_files)
+
+        # LOAD LIVE DATA INTO DUCKDB
+        print("="*80)
+        print("LOADING LIVE DATA INTO DUCKDB")
         print("="*80)
         raw_count = load_data_into_duckdb(pg_conn, duck_conn)
+
+        # If we have archives, union them with live data
+        if archive_count > 0:
+            print("  Combining archived and live data...")
+            # Rename live tables temporarily
+            duck_conn.execute("ALTER TABLE searches_raw RENAME TO searches_live_raw")
+
+            # Create unified raw table (union of archived + live)
+            duck_conn.execute("""
+                CREATE TABLE searches_raw AS
+                SELECT * FROM searches_archived
+                UNION ALL
+                SELECT * FROM searches_live_raw
+            """)
+
+            # Clean up
+            duck_conn.execute("DROP TABLE searches_live_raw")
+            duck_conn.execute("DROP VIEW searches_archived")
+
+            total_raw = duck_conn.execute("SELECT COUNT(*) FROM searches_raw").fetchone()[0]
+            print(f"  Combined: {archive_count:,} archived + {raw_count:,} live = {total_raw:,} total raw records")
+            raw_count = total_raw
+
+        # Deduplicate combined data
         raw_count, dedup_count = deduplicate_in_duckdb(duck_conn)
 
         # Generate all-time page (use full dataset)
