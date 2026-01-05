@@ -76,7 +76,7 @@ def load_data_into_duckdb(pg_conn, duckdb_conn, start_date=None, end_date=None):
     print(f"  Loading data from PostgreSQL into DuckDB...")
     print(f"    Query: SELECT id, client_id, timestamp, username, query FROM searches {date_filter}")
 
-    # Create table in DuckDB
+    # Create empty table in DuckDB
     duckdb_conn.execute("""
         CREATE TABLE searches_raw (
             id BIGINT,
@@ -87,29 +87,26 @@ def load_data_into_duckdb(pg_conn, duckdb_conn, start_date=None, end_date=None):
         )
     """)
 
-    # Load data in chunks from PostgreSQL
-    chunksize = 1_000_000  # 1M rows per chunk
-    cursor = pg_conn.cursor()
-    cursor.execute(query)
-
+    # Load data in chunks using pandas as efficient transfer format
+    # DuckDB has optimized pandas integration for fast bulk loading
+    chunksize = 2_000_000  # 2M rows per chunk
     total_rows = 0
     chunk_num = 0
-    while True:
-        rows = cursor.fetchmany(chunksize)
-        if not rows:
-            break
 
+    for chunk_df in pd.read_sql_query(query, pg_conn, parse_dates=['timestamp'], chunksize=chunksize):
         chunk_num += 1
-        total_rows += len(rows)
+        total_rows += len(chunk_df)
 
-        # Insert into DuckDB (very fast)
-        duckdb_conn.executemany(
-            "INSERT INTO searches_raw VALUES (?, ?, ?, ?, ?)",
-            rows
-        )
-        print(f"    Loaded chunk {chunk_num}: {len(rows):,} rows (total: {total_rows:,})")
+        # Insert pandas DataFrame into DuckDB (VERY FAST - optimized C++ path)
+        # DuckDB can read directly from pandas without Python overhead
+        duckdb_conn.execute("INSERT INTO searches_raw SELECT * FROM chunk_df")
 
-    cursor.close()
+        print(f"    Loaded chunk {chunk_num}: {len(chunk_df):,} rows (total: {total_rows:,})")
+
+        # Free pandas memory immediately after transfer to DuckDB
+        del chunk_df
+        gc.collect()
+
     print(f"  Loaded {total_rows:,} raw records into DuckDB")
 
     return total_rows
