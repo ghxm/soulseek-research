@@ -148,7 +148,7 @@ def get_archived_months(conn) -> List[Dict[str, Any]]:
     cursor.execute("""
         SELECT month, file_path, record_count
         FROM archives
-        WHERE deleted = TRUE
+        WHERE deleted = FALSE
         ORDER BY month
     """)
     return [{'month': r[0], 'file_path': r[1], 'count': r[2]}
