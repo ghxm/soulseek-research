@@ -239,9 +239,11 @@ def load_parquet_archives_into_duckdb(duckdb_conn, parquet_files: List[str]):
     parquet_pattern = "', '".join(parquet_files)
 
     # Create a view that unions all Parquet files
+    # Note: Add NULL id column to match schema of live data table
     duckdb_conn.execute(f"""
         CREATE VIEW searches_archived AS
-        SELECT * FROM read_parquet(['{parquet_pattern}'])
+        SELECT NULL::BIGINT as id, client_id, timestamp, username, query
+        FROM read_parquet(['{parquet_pattern}'])
     """)
 
     # Count total archived records
