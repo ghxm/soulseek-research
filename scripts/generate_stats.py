@@ -2316,7 +2316,18 @@ def generate_article_html_with_jekyll(stats: Dict, figures: Dict[str, go.Figure]
     </style>
     '''
 
+    # Format date range for display
+    if stats['first_search'] and stats['last_search']:
+        first_dt = datetime.fromisoformat(stats['first_search'])
+        last_dt = datetime.fromisoformat(stats['last_search'])
+        date_range_str = f"{first_dt.strftime('%Y-%m-%d %H:%M')} to {last_dt.strftime('%Y-%m-%d %H:%M')} UTC"
+    else:
+        date_range_str = "No data"
+
     content = f'''{article_css}
+<h1>All Time Statistics</h1>
+<p class="period-range">{date_range_str}</p>
+
 <p class="timestamp">Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
 
 {body_content}
@@ -2386,8 +2397,17 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
         </div>
     '''
 
+    # Format date range for display
+    if stats['first_search'] and stats['last_search']:
+        first_dt = datetime.fromisoformat(stats['first_search'])
+        last_dt = datetime.fromisoformat(stats['last_search'])
+        date_range_str = f"{first_dt.strftime('%Y-%m-%d %H:%M')} to {last_dt.strftime('%Y-%m-%d %H:%M')} UTC"
+    else:
+        date_range_str = "No data"
+
     # Page content (no Jekyll layout, just the content)
     content = f'''<h1>{period_title}</h1>
+<p class="period-range">{date_range_str}</p>
 
 <p class="timestamp">Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
 
