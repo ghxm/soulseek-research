@@ -243,6 +243,21 @@ SELECT COUNT(*) FROM searches WHERE timestamp > NOW() - INTERVAL '1 hour';
 SELECT client_id, timestamp, query FROM searches ORDER BY timestamp DESC LIMIT 10;
 ```
 
+### CRITICAL: Terraform Safety
+**NEVER run `terraform apply` without first running `terraform plan`.**
+
+Changing variables (especially in terraform.tfvars) can trigger server replacement, which **destroys all data** on those servers. The `user_data` field forces replacement when changed.
+
+```bash
+# ALWAYS do this first:
+terraform plan
+
+# Only if plan looks safe (no "must be replaced"):
+terraform apply
+```
+
+If you see "must be replaced" for the database server, **STOP** - this will destroy all data.
+
 ### Common Issues & Solutions
 - **No search data**: Check if Soulseek ports 60000-60001 are properly exposed and clients are connected
 - **Database connection errors**: Verify database password and external IP connectivity

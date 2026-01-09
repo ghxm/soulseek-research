@@ -11,14 +11,17 @@ encryption_key = "your_encryption_key_here"
 
 # Soulseek credentials for remote client regions
 # (Germany client runs on database server)
+# Set disabled = true to deactivate a client without removing config
 soulseek_credentials = {
   "us-west" = {
-    username = "soulseek_us_user" 
+    username = "soulseek_us_user"
     password = "soulseek_us_pass"
+    disabled = true  # Deactivated 2026-01 - redundant coverage
   }
   "singapore" = {
     username = "soulseek_asia_user"
     password = "soulseek_asia_pass"
+    # disabled = false (default)
   }
 }
 

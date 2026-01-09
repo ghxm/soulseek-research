@@ -32,6 +32,7 @@ variable "soulseek_credentials" {
   type = map(object({
     username = string
     password = string
+    disabled = optional(bool, false)
   }))
 }
 
@@ -103,7 +104,7 @@ resource "hcloud_server" "database" {
 
 # Client Servers with specific locations
 resource "hcloud_server" "client" {
-  for_each = var.soulseek_credentials
+  for_each = { for k, v in var.soulseek_credentials : k => v if !v.disabled }
 
   name        = "soulseek-client-${each.key}"
   image       = "ubuntu-22.04" 
