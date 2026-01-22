@@ -90,6 +90,11 @@ def load_data_into_duckdb(pg_conn, duckdb_conn, start_date=None, end_date=None):
         chunk_num += 1
         total_rows += len(chunk_df)
 
+        # Convert Pandas 3.0 string dtype to object for DuckDB compatibility
+        # Pandas 3.0 uses pd.StringDtype() by default which DuckDB doesn't recognize
+        for col in chunk_df.select_dtypes(include=['string']).columns:
+            chunk_df[col] = chunk_df[col].astype(object)
+
         # Insert pandas DataFrame into DuckDB (VERY FAST - optimized C++ path)
         # DuckDB can read directly from pandas without Python overhead
         duckdb_conn.execute("INSERT INTO searches_raw SELECT * FROM chunk_df")
