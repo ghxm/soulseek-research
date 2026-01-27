@@ -45,16 +45,28 @@ def get_db_connection():
     )
 
 
-def load_data_into_duckdb(pg_conn, duckdb_conn, start_date=None, end_date=None):
+def load_data_into_duckdb(pg_conn, duckdb_conn, start_date=None, end_date=None, cutoff_date=None):
     """
     Load search data from PostgreSQL into DuckDB for fast analytics.
 
     Uses chunked loading to avoid memory issues, but DuckDB's columnar
     storage is much more memory-efficient than pandas.
+
+    Args:
+        cutoff_date: Hard upper bound to exclude incomplete days (e.g., current day).
     """
+    # Apply cutoff as effective end date
+    effective_end = cutoff_date or end_date
+    if cutoff_date and end_date:
+        effective_end = min(cutoff_date, end_date)
+
     date_filter = ""
-    if start_date and end_date:
-        date_filter = f"WHERE timestamp >= '{start_date.isoformat()}' AND timestamp <= '{end_date.isoformat()}'"
+    if start_date and effective_end:
+        date_filter = f"WHERE timestamp >= '{start_date.isoformat()}' AND timestamp <= '{effective_end.isoformat()}'"
+    elif effective_end:
+        date_filter = f"WHERE timestamp <= '{effective_end.isoformat()}'"
+    elif start_date:
+        date_filter = f"WHERE timestamp >= '{start_date.isoformat()}'"
     else:
         # When loading all data, still filter to last 30 days for performance
         date_filter = "WHERE timestamp >= NOW() - INTERVAL '30 days'"
@@ -513,21 +525,28 @@ def generate_stats_grid_html(stats: Dict) -> str:
     '''
 
 
-def get_available_periods(conn) -> Dict[str, List[Dict]]:
-    """Get all available weeks and months from the database"""
+def get_available_periods(conn, max_date=None) -> Dict[str, List[Dict]]:
+    """Get all available weeks and months from the database.
+
+    Args:
+        max_date: Cap for period generation (excludes incomplete day).
+    """
     cursor = conn.cursor()
 
     # Get date range - simple query, no deduplication needed for date range
     cursor.execute("SELECT MIN(timestamp), MAX(timestamp) FROM searches")
-    min_date, max_date = cursor.fetchone()
+    min_date, db_max_date = cursor.fetchone()
 
-    if not min_date or not max_date:
+    if not min_date or not db_max_date:
         return {'weeks': [], 'months': []}
+
+    # Apply cap if provided (to exclude incomplete current day)
+    effective_max = min(db_max_date, max_date) if max_date else db_max_date
 
     # Generate all weeks
     weeks = []
     current = min_date
-    while current <= max_date:
+    while current <= effective_max:
         iso_year, iso_week, _ = current.isocalendar()
         week_id = f"{iso_year}-W{iso_week:02d}"
         week_label = f"{iso_week:02d}/{iso_year}"
@@ -548,7 +567,7 @@ def get_available_periods(conn) -> Dict[str, List[Dict]]:
     # Generate all months
     months = []
     current = min_date.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    while current <= max_date:
+    while current <= effective_max:
         month_id = current.strftime('%Y-%m')
         month_label = current.strftime('%B %Y')
 
@@ -994,9 +1013,15 @@ def main():
     print("Creating DuckDB connection...")
     duck_conn = duckdb.connect(':memory:')
 
+    # Calculate cutoff: end of yesterday UTC (exclude incomplete current day)
+    # Pipeline runs at 3am, so current day only has partial data
+    cutoff_date = (datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+                   - timedelta(seconds=1))
+    print(f"Data cutoff: {cutoff_date.strftime('%Y-%m-%d %H:%M:%S')} UTC (excluding incomplete current day)")
+
     try:
         # Get available periods from database
-        periods = get_available_periods(pg_conn)
+        periods = get_available_periods(pg_conn, max_date=cutoff_date)
 
         print(f"Found {len(periods['months'])} months and {len(periods['weeks'])} weeks")
 
@@ -1020,7 +1045,7 @@ def main():
         print("="*80)
         print("LOADING LIVE DATA INTO DUCKDB")
         print("="*80)
-        raw_count = load_data_into_duckdb(pg_conn, duck_conn)
+        raw_count = load_data_into_duckdb(pg_conn, duck_conn, cutoff_date=cutoff_date)
 
         # If we have archives, union them with live data
         if archive_count > 0:
