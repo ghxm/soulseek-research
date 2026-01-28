@@ -492,9 +492,9 @@ def generate_stats_grid_html(stats: Dict) -> str:
     return f'''
         <div class="stats-grid">
             <div class="stat-card">
-                <h3>Total Searches</h3>
+                <h3>Total Search Events</h3>
                 <div class="value">{stats['total_searches']:,}</div>
-                <div class="label">Deduplicated searches</div>
+                <div class="label">Raw search requests received</div>
             </div>
             <div class="stat-card">
                 <h3>Unique Users</h3>
@@ -613,9 +613,12 @@ def generate_period_page_with_duckdb(pg_conn, duckdb_conn, period_type: str, per
     Generate a dashboard page for a specific period using DuckDB for analytics.
 
     pg_conn: PostgreSQL connection (for metadata if needed)
-    duckdb_conn: DuckDB connection with searches_raw and searches_dedup tables loaded
+    duckdb_conn: DuckDB connection with 'searches' table loaded
     period_type: 'all', 'month', or 'week'
     period_info: Dict with 'id', 'label', 'start', 'end' (None for all-time)
+
+    Note: Deduplication is done inline per-query using COUNT(DISTINCT ...) rather
+    than creating a separate deduplicated table upfront.
     """
     if period_type == 'all':
         period_label = "All Time"
@@ -632,14 +635,15 @@ def generate_period_page_with_duckdb(pg_conn, duckdb_conn, period_type: str, per
             output_file = f"docs/months/{period_info['id']}.html"
 
     # Check if we have data
-    dedup_count = duckdb_conn.execute("SELECT COUNT(*) FROM searches_dedup").fetchone()[0]
-    if dedup_count == 0:
+    record_count = duckdb_conn.execute("SELECT COUNT(*) FROM searches").fetchone()[0]
+    if record_count == 0:
         print(f"  No data for {period_label}, skipping")
         return None
 
     print(f"  Computing statistics for {period_label}...")
 
     # Calculate summary statistics using DuckDB SQL (FAST!)
+    # Uses inline deduplication via COUNT(DISTINCT ...) - no separate dedup table needed
     stats_query = duckdb_conn.execute("""
         SELECT
             COUNT(*) as total_searches,
@@ -648,7 +652,7 @@ def generate_period_page_with_duckdb(pg_conn, duckdb_conn, period_type: str, per
             COUNT(DISTINCT (username || '|' || LOWER(TRIM(query)))) as unique_search_pairs,
             MIN(timestamp) as first_search,
             MAX(timestamp) as last_search
-        FROM searches_dedup
+        FROM searches
     """).fetchone()
 
     total_searches, total_users, total_queries, unique_search_pairs, first_search, last_search = stats_query
@@ -656,10 +660,10 @@ def generate_period_page_with_duckdb(pg_conn, duckdb_conn, period_type: str, per
     avg_searches_per_user = total_searches / total_users if total_users > 0 else 0
     avg_unique_queries_per_user = unique_search_pairs / total_users if total_users > 0 else 0
 
-    # Per-client totals (from raw data, not deduplicated)
+    # Per-client totals
     client_totals_df = duckdb_conn.execute("""
         SELECT client_id, COUNT(*) as count
-        FROM searches_raw
+        FROM searches
         GROUP BY client_id
     """).df()
     client_totals = dict(zip(client_totals_df['client_id'], client_totals_df['count']))
@@ -678,23 +682,23 @@ def generate_period_page_with_duckdb(pg_conn, duckdb_conn, period_type: str, per
 
     print(f"  Generating time-series data...")
 
-    # Daily stats by client (raw data) - DuckDB query returns small DataFrame
+    # Daily stats by client - DuckDB query returns small DataFrame
     daily_stats = duckdb_conn.execute("""
         SELECT
             client_id,
             CAST(timestamp AS DATE) as date,
             COUNT(*) as search_count
-        FROM searches_raw
+        FROM searches
         GROUP BY client_id, CAST(timestamp AS DATE)
         ORDER BY date, client_id
     """).df()
 
-    # Daily unique users (deduplicated) - DuckDB query returns small DataFrame
+    # Daily unique users - DuckDB query returns small DataFrame
     daily_unique_users = duckdb_conn.execute("""
         SELECT
             CAST(timestamp AS DATE) as date,
             COUNT(DISTINCT username) as unique_users
-        FROM searches_dedup
+        FROM searches
         GROUP BY CAST(timestamp AS DATE)
         ORDER BY date
     """).df()
@@ -708,7 +712,7 @@ def generate_period_page_with_duckdb(pg_conn, duckdb_conn, period_type: str, per
             LOWER(TRIM(query)) as query_normalized,
             COUNT(DISTINCT username) as unique_users,
             COUNT(*) as total_searches
-        FROM searches_dedup
+        FROM searches
         GROUP BY LOWER(TRIM(query))
         ORDER BY unique_users DESC, total_searches DESC
         LIMIT 100
@@ -716,13 +720,13 @@ def generate_period_page_with_duckdb(pg_conn, duckdb_conn, period_type: str, per
 
     top_queries = list(top_queries_df.itertuples(index=False, name=None))
 
-    # Query length distribution - DuckDB query
+    # Query length distribution - count unique queries per length bucket
     print(f"  Computing query length distribution using DuckDB...")
     query_length_data = duckdb_conn.execute("""
         SELECT
             LENGTH(query) - LENGTH(REPLACE(query, ' ', '')) + 1 as query_length,
-            COUNT(*) as count
-        FROM searches_dedup
+            COUNT(DISTINCT LOWER(TRIM(query))) as count
+        FROM searches
         WHERE LENGTH(query) - LENGTH(REPLACE(query, ' ', '')) + 1 <= 100
         GROUP BY query_length
         ORDER BY query_length
@@ -915,9 +919,9 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
     stats_grid = f'''
         <div class="stats-grid">
             <div class="stat-card">
-                <h3>Total Searches</h3>
+                <h3>Total Search Events</h3>
                 <div class="value">{stats['total_searches']:,}</div>
-                <div class="label">Deduplicated searches</div>
+                <div class="label">Raw search requests received</div>
             </div>
             <div class="stat-card">
                 <h3>Unique Users</h3>
@@ -962,13 +966,12 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
 <p class="timestamp">Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
 
 <div style="background: #f5f5f5; padding: 20px; margin: 20px 0; border-left: 4px solid #333;">
-    <h3 style="margin-top: 0; color: #333;">Data Deduplication Note</h3>
+    <h3 style="margin-top: 0; color: #333;">Data Collection Note</h3>
     <p style="margin-bottom: 0; color: #666;">
-        Because Soulseek distributes searches across multiple clients, the same search from one user
-        can appear on 2-3 of our geographic clients simultaneously. <strong>Analysis statistics are
-        deduplicated within 5-minute windows</strong> to prevent inflated counts, keeping only the first
-        occurrence of each username+query combination. However, <strong>data collection metrics show
-        raw counts</strong> to accurately represent what each client receives from the network.
+        <strong>Total Search Events</strong> shows the raw count of search requests received by
+        the research client. <strong>Unique Users</strong> and <strong>Unique Queries</strong>
+        are counted distinctly to show actual network diversity. Top queries are ranked by
+        <strong>unique users searching for that term</strong>, not raw event count.
     </p>
 </div>
 
@@ -984,7 +987,7 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
     {chart_html.get('client_distribution', '<p>Not enough data</p>')}
 </div>
 
-<h2>User Activity Trends <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
+<h2>User Activity Trends <span style="font-weight: normal; font-size: 14px; color: #999;">(Unique Users per Day)</span></h2>
 <div class="chart">
     {chart_html.get('daily_unique_users', '<p>Not enough data</p>')}
 </div>
@@ -994,7 +997,7 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
     {chart_html.get('top_queries', '<p>Not enough data</p>')}
 </div>
 
-<h2>Query Length Distribution <span style="font-weight: normal; font-size: 14px; color: #999;">(Deduplicated)</span></h2>
+<h2>Query Length Distribution <span style="font-weight: normal; font-size: 14px; color: #999;">(Unique Queries)</span></h2>
 <div class="chart">
     {chart_html.get('query_length', '<p>Not enough data</p>')}
 </div>
@@ -1069,19 +1072,19 @@ def main():
             print(f"  Combined: {archive_count:,} archived + {raw_count:,} live = {total_raw:,} total raw records")
             raw_count = total_raw
 
-        # Deduplicate combined data
-        raw_count, dedup_count = deduplicate_in_duckdb(duck_conn)
+        # Rename table for simpler usage (no separate dedup table needed)
+        # Deduplication is done inline per-query using COUNT(DISTINCT ...)
+        duck_conn.execute("ALTER TABLE searches_raw RENAME TO searches")
 
         # Generate all-time page (use full dataset)
         print("="*80)
         print("GENERATING ALL-TIME PAGE")
         print("="*80)
-        print(f"  Using full dataset: {raw_count:,} raw, {dedup_count:,} deduplicated")
+        print(f"  Using full dataset: {raw_count:,} records")
         generate_period_page_with_duckdb(pg_conn, duck_conn, 'all', None)
 
-        # Rename base tables to avoid view name conflicts
-        duck_conn.execute("ALTER TABLE searches_raw RENAME TO searches_raw_base")
-        duck_conn.execute("ALTER TABLE searches_dedup RENAME TO searches_dedup_base")
+        # Rename base table to avoid view name conflicts
+        duck_conn.execute("ALTER TABLE searches RENAME TO searches_base")
 
         # Generate monthly pages (filter using SQL WHERE clauses)
         for month in periods['months']:
@@ -1090,27 +1093,19 @@ def main():
             print("="*80)
             print(f"  Filtering data for period: {month['start']} to {month['end']}")
 
-            # Create filtered views in DuckDB (fast SQL filtering)
-            duck_conn.execute("DROP VIEW IF EXISTS searches_raw")
-            duck_conn.execute("DROP VIEW IF EXISTS searches_dedup")
+            # Create filtered view in DuckDB (fast SQL filtering)
+            duck_conn.execute("DROP VIEW IF EXISTS searches")
             duck_conn.execute(f"""
-                CREATE VIEW searches_raw AS
-                SELECT * FROM searches_raw_base
-                WHERE timestamp >= '{month['start'].isoformat()}'
-                  AND timestamp <= '{month['end'].isoformat()}'
-            """)
-            duck_conn.execute(f"""
-                CREATE VIEW searches_dedup AS
-                SELECT * FROM searches_dedup_base
+                CREATE VIEW searches AS
+                SELECT * FROM searches_base
                 WHERE timestamp >= '{month['start'].isoformat()}'
                   AND timestamp <= '{month['end'].isoformat()}'
             """)
 
-            month_raw_count = duck_conn.execute("SELECT COUNT(*) FROM searches_raw").fetchone()[0]
-            month_dedup_count = duck_conn.execute("SELECT COUNT(*) FROM searches_dedup").fetchone()[0]
-            print(f"  Filtered to {month_raw_count:,} raw, {month_dedup_count:,} deduplicated")
+            month_count = duck_conn.execute("SELECT COUNT(*) FROM searches").fetchone()[0]
+            print(f"  Filtered to {month_count:,} records")
 
-            if month_dedup_count > 0:
+            if month_count > 0:
                 generate_period_page_with_duckdb(pg_conn, duck_conn, 'month', month)
 
         # Generate weekly pages (filter using SQL WHERE clauses)
@@ -1120,27 +1115,19 @@ def main():
             print("="*80)
             print(f"  Filtering data for period: {week['start']} to {week['end']}")
 
-            # Create filtered views in DuckDB (fast SQL filtering)
-            duck_conn.execute("DROP VIEW IF EXISTS searches_raw")
-            duck_conn.execute("DROP VIEW IF EXISTS searches_dedup")
+            # Create filtered view in DuckDB (fast SQL filtering)
+            duck_conn.execute("DROP VIEW IF EXISTS searches")
             duck_conn.execute(f"""
-                CREATE VIEW searches_raw AS
-                SELECT * FROM searches_raw_base
-                WHERE timestamp >= '{week['start'].isoformat()}'
-                  AND timestamp <= '{week['end'].isoformat()}'
-            """)
-            duck_conn.execute(f"""
-                CREATE VIEW searches_dedup AS
-                SELECT * FROM searches_dedup_base
+                CREATE VIEW searches AS
+                SELECT * FROM searches_base
                 WHERE timestamp >= '{week['start'].isoformat()}'
                   AND timestamp <= '{week['end'].isoformat()}'
             """)
 
-            week_raw_count = duck_conn.execute("SELECT COUNT(*) FROM searches_raw").fetchone()[0]
-            week_dedup_count = duck_conn.execute("SELECT COUNT(*) FROM searches_dedup").fetchone()[0]
-            print(f"  Filtered to {week_raw_count:,} raw, {week_dedup_count:,} deduplicated")
+            week_count = duck_conn.execute("SELECT COUNT(*) FROM searches").fetchone()[0]
+            print(f"  Filtered to {week_count:,} records")
 
-            if week_dedup_count > 0:
+            if week_count > 0:
                 generate_period_page_with_duckdb(pg_conn, duck_conn, 'week', week)
 
         print("\n" + "="*80)
