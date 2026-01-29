@@ -18,6 +18,22 @@ import mistune
 import yaml
 
 
+def format_days(first_search_str, last_search_str):
+    """Calculate days of data from first/last search timestamps.
+
+    Uses hours/24 for precision. Displays as integer when the
+    1-decimal rounding is a whole number, otherwise as float.
+    """
+    if not first_search_str or not last_search_str:
+        return "0"
+    delta = datetime.fromisoformat(last_search_str) - datetime.fromisoformat(first_search_str)
+    days_float = delta.total_seconds() / 86400
+    days_rounded = round(days_float, 1)
+    if days_rounded == int(days_rounded):
+        return str(int(days_rounded))
+    return f"{days_rounded:.1f}"
+
+
 def get_db_connection():
     """Get database connection from environment"""
     database_url = os.environ.get('DATABASE_URL')
@@ -488,8 +504,7 @@ def create_client_distribution_chart(client_totals: Dict[str, int]) -> go.Figure
 
 def generate_stats_grid_html(stats: Dict) -> str:
     """Generate the stats summary cards HTML."""
-    days = (datetime.fromisoformat(stats['last_search']) -
-            datetime.fromisoformat(stats['first_search'])).days
+    days = format_days(stats['first_search'], stats['last_search'])
 
     return f'''
         <div class="stats-grid">
@@ -915,8 +930,7 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
             chart_html[name] = '<p style="color: #999">Not enough data for visualization</p>'
 
     # Generate stats grid
-    days = (datetime.fromisoformat(stats['last_search']) -
-            datetime.fromisoformat(stats['first_search'])).days if stats['first_search'] and stats['last_search'] else 0
+    days = format_days(stats['first_search'], stats['last_search'])
 
     stats_grid = f'''
         <div class="stats-grid">
