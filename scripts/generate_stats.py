@@ -41,7 +41,9 @@ def get_db_connection():
         port=int(host_port[1]) if len(host_port) > 1 else 5432,
         user=user_pass[0],
         password=user_pass[1] if len(user_pass) > 1 else '',
-        dbname=host_db[1]
+        dbname=host_db[1],
+        connect_timeout=30,
+        options='-c statement_timeout=600000'
     )
 
 
@@ -1010,7 +1012,11 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
 def main():
     """Main execution using DuckDB for fast analytics"""
     print("Connecting to PostgreSQL database...")
-    pg_conn = get_db_connection()
+    try:
+        pg_conn = get_db_connection()
+    except Exception as e:
+        print(f"ERROR: Failed to connect to database: {e}")
+        raise
 
     # Create DuckDB connection (in-memory for fast analytics)
     print("Creating DuckDB connection...")
