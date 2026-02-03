@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
 Generate statistics dashboard for Soulseek research data.
-Queries the database and creates visualizations for GitHub Pages.
+Queries pre-computed materialized views and cumulative stats table.
 """
 
+import json
 import os
 import re
-import gc
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 
 import psycopg2
-import duckdb
 import pandas as pd
 import plotly.graph_objects as go
 import mistune
@@ -26,7 +25,9 @@ def format_days(first_search_str, last_search_str):
     """
     if not first_search_str or not last_search_str:
         return "0"
-    delta = datetime.fromisoformat(last_search_str) - datetime.fromisoformat(first_search_str)
+    first = datetime.fromisoformat(str(first_search_str).replace('Z', '+00:00'))
+    last = datetime.fromisoformat(str(last_search_str).replace('Z', '+00:00'))
+    delta = last - first
     days_float = delta.total_seconds() / 86400
     days_rounded = round(days_float, 1)
     if days_rounded == int(days_rounded):
@@ -41,7 +42,6 @@ def get_db_connection():
         raise ValueError("DATABASE_URL environment variable not set")
 
     # Parse postgresql:// URL to connection params
-    # Format: postgresql://user:pass@host:port/dbname
     if database_url.startswith('postgresql://'):
         database_url = database_url.replace('postgresql://', '')
     elif database_url.startswith('postgresql+asyncpg://'):
@@ -63,230 +63,324 @@ def get_db_connection():
     )
 
 
-def load_data_into_duckdb(pg_conn, duckdb_conn, start_date=None, end_date=None, cutoff_date=None):
-    """
-    Load search data from PostgreSQL into DuckDB for fast analytics.
+def get_cumulative_stats(conn) -> Dict[str, Any]:
+    """Get cumulative stats (archived + live data combined)"""
+    cursor = conn.cursor()
 
-    Uses chunked loading to avoid memory issues, but DuckDB's columnar
-    storage is much more memory-efficient than pandas.
+    # Get cumulative stats from archived data
+    cursor.execute("""
+        SELECT total_searches, total_users, total_queries, total_search_pairs,
+               first_search, last_search, client_totals
+        FROM stats_cumulative
+        WHERE id = 1
+    """)
+    cumulative = cursor.fetchone()
 
-    Args:
-        cutoff_date: Hard upper bound to exclude incomplete days (e.g., current day).
-    """
-    # Apply cutoff as effective end date
-    effective_end = cutoff_date or end_date
-    if cutoff_date and end_date:
-        effective_end = min(cutoff_date, end_date)
+    if cumulative is None:
+        # No cumulative stats yet, return zeros
+        cumulative = (0, 0, 0, 0, None, None, {})
 
-    date_filter = ""
-    if start_date and effective_end:
-        date_filter = f"WHERE timestamp >= '{start_date.isoformat()}' AND timestamp <= '{effective_end.isoformat()}'"
-    elif effective_end:
-        date_filter = f"WHERE timestamp <= '{effective_end.isoformat()}'"
-    elif start_date:
-        date_filter = f"WHERE timestamp >= '{start_date.isoformat()}'"
+    (cum_searches, cum_users, cum_queries, cum_pairs,
+     cum_first, cum_last, cum_clients) = cumulative
+
+    # Parse client_totals if it's a string
+    if isinstance(cum_clients, str):
+        cum_clients = json.loads(cum_clients) if cum_clients else {}
+
+    # Get live data stats from materialized view
+    cursor.execute("""
+        SELECT total_searches, total_users, total_queries, total_search_pairs,
+               first_search, last_search, client_totals
+        FROM mv_summary_stats
+    """)
+    live = cursor.fetchone()
+
+    if live is None or live[0] is None:
+        # No live data
+        live = (0, 0, 0, 0, None, None, {})
+
+    (live_searches, live_users, live_queries, live_pairs,
+     live_first, live_last, live_clients) = live
+
+    # Parse client_totals if it's a string
+    if isinstance(live_clients, str):
+        live_clients = json.loads(live_clients) if live_clients else {}
+
+    # Combine cumulative + live
+    total_searches = cum_searches + live_searches
+    total_users = cum_users + live_users  # Approximate
+    total_queries = cum_queries + live_queries  # Approximate
+    total_pairs = cum_pairs + live_pairs  # Approximate
+
+    # Earliest/latest timestamps
+    first_search = None
+    if cum_first and live_first:
+        first_search = min(cum_first, live_first)
     else:
-        # When loading all data, still filter to last 30 days for performance
-        date_filter = "WHERE timestamp >= NOW() - INTERVAL '30 days'"
+        first_search = cum_first or live_first
 
-    query = f"""
-        SELECT id, client_id, timestamp, username, query
-        FROM searches
-        {date_filter}
-        ORDER BY timestamp
-    """
+    last_search = None
+    if cum_last and live_last:
+        last_search = max(cum_last, live_last)
+    else:
+        last_search = cum_last or live_last
 
-    print(f"  Loading data from PostgreSQL into DuckDB...")
-    print(f"    Query: SELECT id, client_id, timestamp, username, query FROM searches {date_filter}")
+    # Merge client totals
+    client_totals = {}
+    for client, count in (cum_clients or {}).items():
+        client_totals[client] = client_totals.get(client, 0) + count
+    for client, count in (live_clients or {}).items():
+        client_totals[client] = client_totals.get(client, 0) + count
 
-    # Create empty table in DuckDB
-    duckdb_conn.execute("""
-        CREATE TABLE searches_raw (
-            id BIGINT,
-            client_id VARCHAR,
-            timestamp TIMESTAMP,
-            username VARCHAR,
-            query VARCHAR
-        )
+    cursor.close()
+
+    avg_searches_per_user = total_searches / total_users if total_users > 0 else 0
+    avg_unique_queries_per_user = total_pairs / total_users if total_users > 0 else 0
+
+    return {
+        'total_searches': total_searches,
+        'total_users': total_users,
+        'total_queries': total_queries,
+        'total_search_pairs': total_pairs,
+        'avg_searches_per_user': avg_searches_per_user,
+        'avg_unique_queries_per_user': avg_unique_queries_per_user,
+        'first_search': first_search.isoformat() if first_search else None,
+        'last_search': last_search.isoformat() if last_search else None,
+        'client_totals': client_totals
+    }
+
+
+def get_live_summary_stats(conn) -> Dict[str, Any]:
+    """Get summary stats from live data only (from materialized view)"""
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT total_searches, total_users, total_queries, total_search_pairs,
+               first_search, last_search, client_totals
+        FROM mv_summary_stats
     """)
+    result = cursor.fetchone()
+    cursor.close()
 
-    # Load data in chunks using pandas as efficient transfer format
-    # DuckDB has optimized pandas integration for fast bulk loading
-    chunksize = 2_000_000  # 2M rows per chunk
-    total_rows = 0
-    chunk_num = 0
+    if result is None or result[0] is None:
+        return {
+            'total_searches': 0,
+            'total_users': 0,
+            'total_queries': 0,
+            'total_search_pairs': 0,
+            'avg_searches_per_user': 0,
+            'avg_unique_queries_per_user': 0,
+            'first_search': None,
+            'last_search': None,
+            'client_totals': {}
+        }
 
-    for chunk_df in pd.read_sql_query(query, pg_conn, parse_dates=['timestamp'], chunksize=chunksize):
-        chunk_num += 1
-        total_rows += len(chunk_df)
+    (total_searches, total_users, total_queries, total_pairs,
+     first_search, last_search, client_totals) = result
 
-        # Convert Pandas 3.0 string dtype to object for DuckDB compatibility
-        # Pandas 3.0 uses pd.StringDtype() by default which DuckDB doesn't recognize
-        for col in chunk_df.select_dtypes(include=['string']).columns:
-            chunk_df[col] = chunk_df[col].astype(object)
+    if isinstance(client_totals, str):
+        client_totals = json.loads(client_totals) if client_totals else {}
 
-        # Insert pandas DataFrame into DuckDB (VERY FAST - optimized C++ path)
-        # DuckDB can read directly from pandas without Python overhead
-        duckdb_conn.execute("INSERT INTO searches_raw SELECT * FROM chunk_df")
+    avg_searches_per_user = total_searches / total_users if total_users > 0 else 0
+    avg_unique_queries_per_user = total_pairs / total_users if total_users > 0 else 0
 
-        print(f"    Loaded chunk {chunk_num}: {len(chunk_df):,} rows (total: {total_rows:,})")
-
-        # Free pandas memory immediately after transfer to DuckDB
-        del chunk_df
-        gc.collect()
-
-    print(f"  Loaded {total_rows:,} raw records into DuckDB")
-
-    return total_rows
-
-
-def deduplicate_in_duckdb(duckdb_conn):
-    """
-    Deduplicate searches within 5-minute windows using DuckDB SQL.
-
-    This is 10-50x faster than pandas and uses minimal memory.
-    Creates a new deduplicated table.
-    """
-    print(f"  Deduplicating data in DuckDB (5-minute windows)...")
-
-    # Get count before deduplication
-    raw_count = duckdb_conn.execute("SELECT COUNT(*) FROM searches_raw").fetchone()[0]
-
-    # Deduplicate using SQL - much faster than pandas
-    duckdb_conn.execute("""
-        CREATE TABLE searches_dedup AS
-        SELECT DISTINCT ON (username, query, FLOOR(EPOCH(timestamp) / 300))
-            id, client_id, timestamp, username, query
-        FROM searches_raw
-        ORDER BY username, query, FLOOR(EPOCH(timestamp) / 300), timestamp
-    """)
-
-    # Get count after deduplication
-    dedup_count = duckdb_conn.execute("SELECT COUNT(*) FROM searches_dedup").fetchone()[0]
-
-    reduction_pct = 100 * (1 - dedup_count / raw_count) if raw_count > 0 else 0
-    print(f"  Deduplicated: {raw_count:,} → {dedup_count:,} records ({reduction_pct:.1f}% reduction)")
-
-    return raw_count, dedup_count
+    return {
+        'total_searches': total_searches,
+        'total_users': total_users,
+        'total_queries': total_queries,
+        'total_search_pairs': total_pairs,
+        'avg_searches_per_user': avg_searches_per_user,
+        'avg_unique_queries_per_user': avg_unique_queries_per_user,
+        'first_search': first_search.isoformat() if first_search else None,
+        'last_search': last_search.isoformat() if last_search else None,
+        'client_totals': client_totals or {}
+    }
 
 
-def get_archived_months(conn) -> List[Dict[str, Any]]:
-    """Get list of archived months from database"""
+def get_daily_stats(conn, start_date=None, end_date=None) -> pd.DataFrame:
+    """Get daily stats from materialized view, optionally filtered by date range"""
+    cursor = conn.cursor()
+
+    if start_date and end_date:
+        cursor.execute("""
+            SELECT client_id, date, search_count, unique_users
+            FROM mv_daily_stats
+            WHERE date >= %s AND date <= %s
+            ORDER BY date, client_id
+        """, (start_date.date(), end_date.date()))
+    else:
+        cursor.execute("""
+            SELECT client_id, date, search_count, unique_users
+            FROM mv_daily_stats
+            ORDER BY date, client_id
+        """)
+
+    rows = cursor.fetchall()
+    cursor.close()
+
+    if not rows:
+        return pd.DataFrame(columns=['client_id', 'date', 'search_count', 'unique_users'])
+
+    return pd.DataFrame(rows, columns=['client_id', 'date', 'search_count', 'unique_users'])
+
+
+def get_daily_unique_users(conn, start_date=None, end_date=None) -> pd.DataFrame:
+    """Get daily unique users by aggregating from mv_daily_stats"""
+    cursor = conn.cursor()
+
+    if start_date and end_date:
+        # For period-specific: query searches table directly for accurate dedup
+        cursor.execute("""
+            SELECT DATE(timestamp) as date, COUNT(DISTINCT username) as unique_users
+            FROM searches
+            WHERE timestamp >= %s AND timestamp <= %s
+            GROUP BY DATE(timestamp)
+            ORDER BY date
+        """, (start_date, end_date))
+    else:
+        # For all-time: use mv_daily_stats (approximation - max across clients per day)
+        cursor.execute("""
+            SELECT date, MAX(unique_users) as unique_users
+            FROM mv_daily_stats
+            GROUP BY date
+            ORDER BY date
+        """)
+
+    rows = cursor.fetchall()
+    cursor.close()
+
+    if not rows:
+        return pd.DataFrame(columns=['date', 'unique_users'])
+
+    return pd.DataFrame(rows, columns=['date', 'unique_users'])
+
+
+def get_top_queries(conn) -> List[tuple]:
+    """Get top 100 queries from materialized view"""
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT month, file_path, record_count
-        FROM archives
-        WHERE deleted = FALSE
-        ORDER BY month
+        SELECT query_normalized, unique_users, total_searches
+        FROM mv_top_queries
+        ORDER BY unique_users DESC, total_searches DESC
+        LIMIT 100
     """)
-    return [{'month': r[0], 'file_path': r[1], 'count': r[2]}
-            for r in cursor.fetchall()]
+    rows = cursor.fetchall()
+    cursor.close()
+    return rows
 
 
-def download_parquet_archives(pg_conn, local_archive_path: str) -> List[str]:
-    """
-    Download Parquet archive files from database server to local path.
-    Returns list of local file paths.
-
-    If DB_SERVER_SSH_KEY and DB_SERVER_IP are set, downloads via SCP.
-    Otherwise assumes archives are already locally available.
-    """
-    os.makedirs(local_archive_path, exist_ok=True)
-
-    archives = get_archived_months(pg_conn)
-    if not archives:
-        print("  No archives found in database")
-        return []
-
-    print(f"  Found {len(archives)} archived months")
-
-    # Check if we need to download via SSH
-    ssh_key_path = os.environ.get('DB_SERVER_SSH_KEY')
-    db_server_ip = os.environ.get('DB_SERVER_IP')
-
-    local_files = []
-
-    if ssh_key_path and db_server_ip:
-        print(f"  Downloading archives from {db_server_ip} via SCP...")
-
-        for archive in archives:
-            remote_path = archive['file_path']
-            filename = os.path.basename(remote_path)
-            local_path = os.path.join(local_archive_path, filename)
-
-            # Skip if already downloaded
-            if os.path.exists(local_path):
-                print(f"    {filename} (cached)")
-                local_files.append(local_path)
-                continue
-
-            # Download via SCP
-            import subprocess
-            scp_cmd = [
-                'scp',
-                '-i', ssh_key_path,
-                '-o', 'StrictHostKeyChecking=no',
-                f'root@{db_server_ip}:{remote_path}',
-                local_path
-            ]
-
-            try:
-                subprocess.run(scp_cmd, check=True, capture_output=True)
-                print(f"    Downloaded {filename} ({archive['count']:,} records)")
-                local_files.append(local_path)
-            except subprocess.CalledProcessError as e:
-                print(f"    Warning: Failed to download {filename}: {e}")
-
-    else:
-        print(f"  Using local archives from {local_archive_path}")
-        for archive in archives:
-            local_path = os.path.join(local_archive_path, os.path.basename(archive['file_path']))
-            if os.path.exists(local_path):
-                local_files.append(local_path)
-            else:
-                print(f"    Warning: Archive not found: {local_path}")
-
-    return local_files
-
-
-def load_parquet_archives_into_duckdb(duckdb_conn, parquet_files: List[str]):
-    """
-    Load Parquet archive files into DuckDB as a single unioned table.
-
-    DuckDB can read Parquet files extremely efficiently - no need to
-    load all data into memory. Just register the files and query them.
-    """
-    if not parquet_files:
-        print("  No Parquet archives to load")
-        return 0
-
-    print(f"  Loading {len(parquet_files)} Parquet archives into DuckDB...")
-
-    # DuckDB can read multiple Parquet files as a single table
-    # This is VERY fast - it just registers the files, doesn't load everything
-    parquet_pattern = "', '".join(parquet_files)
-
-    # Create a view that unions all Parquet files
-    # Note: Add NULL id column to match schema of live data table
-    duckdb_conn.execute(f"""
-        CREATE VIEW searches_archived AS
-        SELECT NULL::BIGINT as id, client_id, timestamp, username, query
-        FROM read_parquet(['{parquet_pattern}'])
+def get_query_length_distribution(conn) -> pd.DataFrame:
+    """Get query length distribution from materialized view"""
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT word_count as query_length, unique_query_count as count
+        FROM mv_query_length_dist
+        ORDER BY word_count
     """)
+    rows = cursor.fetchall()
+    cursor.close()
 
-    # Count total archived records
-    archive_count = duckdb_conn.execute("SELECT COUNT(*) FROM searches_archived").fetchone()[0]
-    print(f"  Loaded {archive_count:,} archived records (metadata only, not in memory)")
+    if not rows:
+        return pd.DataFrame(columns=['query_length', 'count'])
 
-    return archive_count
+    return pd.DataFrame(rows, columns=['query_length', 'count'])
+
+
+def get_period_stats(conn, start_date, end_date) -> Dict[str, Any]:
+    """Get stats for a specific period by querying searches table directly"""
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            COUNT(*) as total_searches,
+            COUNT(DISTINCT username) as total_users,
+            COUNT(DISTINCT LOWER(TRIM(query))) as total_queries,
+            COUNT(DISTINCT (username || '|' || LOWER(TRIM(query)))) as total_search_pairs,
+            MIN(timestamp) as first_search,
+            MAX(timestamp) as last_search
+        FROM searches
+        WHERE timestamp >= %s AND timestamp <= %s
+    """, (start_date, end_date))
+
+    result = cursor.fetchone()
+
+    if result is None or result[0] == 0:
+        cursor.close()
+        return None
+
+    (total_searches, total_users, total_queries, total_pairs,
+     first_search, last_search) = result
+
+    # Get per-client totals
+    cursor.execute("""
+        SELECT client_id, COUNT(*) as count
+        FROM searches
+        WHERE timestamp >= %s AND timestamp <= %s
+        GROUP BY client_id
+    """, (start_date, end_date))
+    client_totals = {row[0]: row[1] for row in cursor.fetchall()}
+
+    cursor.close()
+
+    avg_searches_per_user = total_searches / total_users if total_users > 0 else 0
+    avg_unique_queries_per_user = total_pairs / total_users if total_users > 0 else 0
+
+    return {
+        'total_searches': total_searches,
+        'total_users': total_users,
+        'total_queries': total_queries,
+        'total_search_pairs': total_pairs,
+        'avg_searches_per_user': avg_searches_per_user,
+        'avg_unique_queries_per_user': avg_unique_queries_per_user,
+        'first_search': first_search.isoformat() if first_search else None,
+        'last_search': last_search.isoformat() if last_search else None,
+        'client_totals': client_totals
+    }
+
+
+def get_period_top_queries(conn, start_date, end_date) -> List[tuple]:
+    """Get top queries for a specific period"""
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT
+            LOWER(TRIM(query)) as query_normalized,
+            COUNT(DISTINCT username) as unique_users,
+            COUNT(*) as total_searches
+        FROM searches
+        WHERE timestamp >= %s AND timestamp <= %s
+        GROUP BY LOWER(TRIM(query))
+        ORDER BY unique_users DESC, total_searches DESC
+        LIMIT 100
+    """, (start_date, end_date))
+    rows = cursor.fetchall()
+    cursor.close()
+    return rows
+
+
+def get_period_query_length_dist(conn, start_date, end_date) -> pd.DataFrame:
+    """Get query length distribution for a specific period"""
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT
+            LENGTH(query) - LENGTH(REPLACE(query, ' ', '')) + 1 as query_length,
+            COUNT(DISTINCT LOWER(TRIM(query))) as count
+        FROM searches
+        WHERE timestamp >= %s AND timestamp <= %s
+          AND LENGTH(query) - LENGTH(REPLACE(query, ' ', '')) + 1 <= 100
+        GROUP BY query_length
+        ORDER BY query_length
+    """, (start_date, end_date))
+    rows = cursor.fetchall()
+    cursor.close()
+
+    if not rows:
+        return pd.DataFrame(columns=['query_length', 'count'])
+
+    return pd.DataFrame(rows, columns=['query_length', 'count'])
 
 
 def load_article_content(article_path: str = 'docs/article.md') -> Optional[str]:
-    """
-    Load article Markdown content if it exists.
-
-    Returns None if file doesn't exist, enabling graceful fallback to normal mode.
-    """
+    """Load article Markdown content if it exists."""
     if os.path.exists(article_path):
         with open(article_path, 'r', encoding='utf-8') as f:
             return f.read()
@@ -294,41 +388,21 @@ def load_article_content(article_path: str = 'docs/article.md') -> Optional[str]
 
 
 def parse_article_sections(markdown_content: str) -> List[Dict[str, Any]]:
-    """
-    Parse Markdown into sections with chart markers identified.
-
-    Returns list of section dicts:
-    [
-        {
-            'type': 'prose',  # or 'chart' or 'stats-grid'
-            'content': '<p>Rendered HTML...</p>',  # for prose
-            'chart_id': 'daily_flow',  # for chart type
-        },
-        ...
-    ]
-    """
+    """Parse Markdown into sections with chart markers identified."""
     sections = []
-
-    # Pattern to match chart markers, stats-grid, and cumulative-stats
     pattern = r'(<!--\s*chart:\s*(\w+)\s*-->|<!--\s*stats-grid\s*-->|<!--\s*cumulative-stats\s*-->)'
-
-    # Split content while keeping delimiters
     parts = re.split(pattern, markdown_content)
-
-    # Create Markdown parser
     md_parser = mistune.create_markdown()
 
     i = 0
     while i < len(parts):
         part = parts[i] if i < len(parts) else ''
-
         if part and part.strip():
             if '<!-- chart:' in part:
-                # Next item should be the chart_id from the regex group
                 if i + 1 < len(parts):
                     chart_id = parts[i + 1].strip()
                     sections.append({'type': 'chart', 'chart_id': chart_id})
-                    i += 2  # Skip the captured group
+                    i += 2
                 else:
                     i += 1
             elif '<!-- stats-grid -->' in part:
@@ -338,22 +412,18 @@ def parse_article_sections(markdown_content: str) -> List[Dict[str, Any]]:
                 sections.append({'type': 'cumulative-stats'})
                 i += 1
             else:
-                # Prose content - convert Markdown to HTML
                 html = md_parser(part)
                 if html.strip():
                     sections.append({'type': 'prose', 'content': html})
                 i += 1
         else:
             i += 1
-
     return sections
 
 
 def create_daily_flow_chart(df: pd.DataFrame) -> go.Figure:
     """Create line chart showing daily search flow per client"""
     fig = go.Figure()
-
-    # Get unique clients with greyscale colors
     clients = df['client_id'].unique()
     greys = ['#000000', '#555555', '#999999', '#333333', '#777777']
 
@@ -378,19 +448,14 @@ def create_daily_flow_chart(df: pd.DataFrame) -> go.Figure:
         plot_bgcolor='white',
         paper_bgcolor='white',
         font=dict(color='black'),
-        xaxis=dict(
-            rangeslider=dict(visible=True),
-            type='date'
-        )
+        xaxis=dict(rangeslider=dict(visible=True), type='date')
     )
-
     return fig
 
 
 def create_daily_unique_users_chart(df: pd.DataFrame) -> go.Figure:
     """Create line chart showing daily unique users trend"""
     df_sorted = df.sort_values('date')
-
     fig = go.Figure()
 
     fig.add_trace(go.Scatter(
@@ -413,23 +478,19 @@ def create_daily_unique_users_chart(df: pd.DataFrame) -> go.Figure:
         plot_bgcolor='white',
         paper_bgcolor='white',
         font=dict(color='black'),
-        xaxis=dict(
-            rangeslider=dict(visible=True),
-            type='date'
-        )
+        xaxis=dict(rangeslider=dict(visible=True), type='date')
     )
-
     return fig
 
 
 def create_top_queries_chart(top_queries: List[tuple]) -> go.Figure:
     """Create bar chart of top queries"""
-    queries = [q[0][:50] for q in top_queries[:100]]  # Truncate long queries
-    unique_users = [q[1] for q in top_queries[:100]]  # q[1] is unique_users count
+    queries = [q[0][:50] for q in top_queries[:100]]
+    unique_users = [q[1] for q in top_queries[:100]]
 
     fig = go.Figure(data=[
         go.Bar(
-            y=queries[::-1],  # Reverse for better display
+            y=queries[::-1],
             x=unique_users[::-1],
             orientation='h',
             marker=dict(color='#333333', line=dict(color='black', width=1))
@@ -446,13 +507,11 @@ def create_top_queries_chart(top_queries: List[tuple]) -> go.Figure:
         paper_bgcolor='white',
         font=dict(color='black')
     )
-
     return fig
 
 
 def create_query_length_chart(df: pd.DataFrame) -> go.Figure:
     """Create histogram of query length distribution (by word count)"""
-    # Filter to reasonable lengths for visualization
     df_filtered = df[df['query_length'] <= 100]
 
     fig = go.Figure(data=[
@@ -473,13 +532,11 @@ def create_query_length_chart(df: pd.DataFrame) -> go.Figure:
         paper_bgcolor='white',
         font=dict(color='black')
     )
-
     return fig
 
 
 def create_client_distribution_chart(client_totals: Dict[str, int]) -> go.Figure:
     """Create pie chart of search distribution by client"""
-    # Greyscale palette for pie chart
     grey_palette = ['#000000', '#555555', '#999999', '#333333', '#777777']
 
     fig = go.Figure(data=[
@@ -498,7 +555,6 @@ def create_client_distribution_chart(client_totals: Dict[str, int]) -> go.Figure
         paper_bgcolor='white',
         font=dict(color='black')
     )
-
     return fig
 
 
@@ -543,65 +599,41 @@ def generate_stats_grid_html(stats: Dict) -> str:
 
 
 def get_available_periods(conn, max_date=None) -> Dict[str, List[Dict]]:
-    """Get all available weeks and months from the database.
-
-    Args:
-        max_date: Cap for period generation (excludes incomplete day).
-    """
+    """Get all available weeks and months from the database."""
     cursor = conn.cursor()
 
-    # Get date range - simple query, no deduplication needed for date range
     cursor.execute("SELECT MIN(timestamp), MAX(timestamp) FROM searches")
     min_date, db_max_date = cursor.fetchone()
 
     if not min_date or not db_max_date:
         return {'weeks': [], 'months': []}
 
-    # Apply cap if provided (to exclude incomplete current day)
     effective_max = min(db_max_date, max_date) if max_date else db_max_date
 
-    # Generate all weeks
+    # Generate weeks
     weeks = []
     current = min_date
     while current <= effective_max:
         iso_year, iso_week, _ = current.isocalendar()
         week_id = f"{iso_year}-W{iso_week:02d}"
         week_label = f"{iso_week:02d}/{iso_year}"
-
-        # Find week start and end
         week_start = datetime.fromisocalendar(iso_year, iso_week, 1).replace(tzinfo=timezone.utc)
         week_end = week_start + timedelta(days=6, hours=23, minutes=59, seconds=59)
-
-        weeks.append({
-            'id': week_id,
-            'label': week_label,
-            'start': week_start,
-            'end': week_end
-        })
-
+        weeks.append({'id': week_id, 'label': week_label, 'start': week_start, 'end': week_end})
         current = week_end + timedelta(seconds=1)
 
-    # Generate all months
+    # Generate months
     months = []
     current = min_date.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     while current <= effective_max:
         month_id = current.strftime('%Y-%m')
         month_label = current.strftime('%B %Y')
-
-        # Find month end
         if current.month == 12:
             next_month = current.replace(year=current.year + 1, month=1)
         else:
             next_month = current.replace(month=current.month + 1)
         month_end = next_month - timedelta(seconds=1)
-
-        months.append({
-            'id': month_id,
-            'label': month_label,
-            'start': current,
-            'end': month_end
-        })
-
+        months.append({'id': month_id, 'label': month_label, 'start': current, 'end': month_end})
         current = next_month
 
     cursor.close()
@@ -610,190 +642,115 @@ def get_available_periods(conn, max_date=None) -> Dict[str, List[Dict]]:
 
 def generate_jekyll_data_files(periods: Dict[str, List[Dict]]):
     """Generate Jekyll _data files for navigation"""
-    import yaml
-
     os.makedirs('docs/_data', exist_ok=True)
 
-    # Generate months.yml (newest first)
     months_data = [{'id': m['id'], 'label': m['label']} for m in reversed(periods['months'])]
     with open('docs/_data/months.yml', 'w', encoding='utf-8') as f:
         yaml.dump(months_data, f, default_flow_style=False, allow_unicode=True)
 
-    # Generate weeks.yml (newest first)
     weeks_data = [{'id': w['id'], 'label': w['label']} for w in reversed(periods['weeks'])]
     with open('docs/_data/weeks.yml', 'w', encoding='utf-8') as f:
         yaml.dump(weeks_data, f, default_flow_style=False, allow_unicode=True)
 
 
-def generate_period_page_with_duckdb(pg_conn, duckdb_conn, period_type: str, period_info: Optional[Dict] = None) -> str:
-    """
-    Generate a dashboard page for a specific period using DuckDB for analytics.
+def generate_all_time_page(conn) -> str:
+    """Generate the all-time dashboard page using cumulative stats + materialized views"""
+    print("  Computing all-time statistics from cumulative + live data...")
 
-    pg_conn: PostgreSQL connection (for metadata if needed)
-    duckdb_conn: DuckDB connection with 'searches' table loaded
-    period_type: 'all', 'month', or 'week'
-    period_info: Dict with 'id', 'label', 'start', 'end' (None for all-time)
+    # Get cumulative stats (archived + live combined)
+    stats = get_cumulative_stats(conn)
 
-    Note: Deduplication is done inline per-query using COUNT(DISTINCT ...) rather
-    than creating a separate deduplicated table upfront.
-    """
-    if period_type == 'all':
-        period_label = "All Time"
-        page_title = "Soulseek Research Dashboard - All Time"
-        output_file = "docs/index.html"
-    else:
-        period_label = period_info['label']
-
-        if period_type == 'week':
-            page_title = f"Soulseek Research Dashboard - CW {period_label}"
-            output_file = f"docs/weeks/{period_info['id']}.html"
-        else:  # month
-            page_title = f"Soulseek Research Dashboard - {period_label}"
-            output_file = f"docs/months/{period_info['id']}.html"
-
-    # Check if we have data
-    record_count = duckdb_conn.execute("SELECT COUNT(*) FROM searches").fetchone()[0]
-    if record_count == 0:
-        print(f"  No data for {period_label}, skipping")
+    if stats['total_searches'] == 0:
+        print("  No data available, skipping all-time page")
         return None
 
-    print(f"  Computing statistics for {period_label}...")
+    print(f"  Total all-time: {stats['total_searches']:,} searches, {stats['total_users']:,} users")
 
-    # Calculate summary statistics using DuckDB SQL (FAST!)
-    # Uses inline deduplication via COUNT(DISTINCT ...) - no separate dedup table needed
-    stats_query = duckdb_conn.execute("""
-        SELECT
-            COUNT(*) as total_searches,
-            COUNT(DISTINCT username) as total_users,
-            COUNT(DISTINCT LOWER(TRIM(query))) as total_queries,
-            COUNT(DISTINCT (username || '|' || LOWER(TRIM(query)))) as unique_search_pairs,
-            MIN(timestamp) as first_search,
-            MAX(timestamp) as last_search
-        FROM searches
-    """).fetchone()
+    # Get chart data from materialized views
+    print("  Loading chart data from materialized views...")
+    daily_stats = get_daily_stats(conn)
+    daily_unique_users = get_daily_unique_users(conn)
+    top_queries = get_top_queries(conn)
+    query_length_dist = get_query_length_distribution(conn)
 
-    total_searches, total_users, total_queries, unique_search_pairs, first_search, last_search = stats_query
-
-    avg_searches_per_user = total_searches / total_users if total_users > 0 else 0
-    avg_unique_queries_per_user = unique_search_pairs / total_users if total_users > 0 else 0
-
-    # Per-client totals
-    client_totals_df = duckdb_conn.execute("""
-        SELECT client_id, COUNT(*) as count
-        FROM searches
-        GROUP BY client_id
-    """).df()
-    client_totals = dict(zip(client_totals_df['client_id'], client_totals_df['count']))
-
-    stats = {
-        'total_searches': total_searches,
-        'total_users': total_users,
-        'total_queries': total_queries,
-        'unique_search_pairs': unique_search_pairs,
-        'avg_searches_per_user': avg_searches_per_user,
-        'avg_unique_queries_per_user': avg_unique_queries_per_user,
-        'first_search': first_search.isoformat(),
-        'last_search': last_search.isoformat(),
-        'client_totals': client_totals
-    }
-
-    print(f"  Generating time-series data...")
-
-    # Daily stats by client - DuckDB query returns small DataFrame
-    daily_stats = duckdb_conn.execute("""
-        SELECT
-            client_id,
-            CAST(timestamp AS DATE) as date,
-            COUNT(*) as search_count
-        FROM searches
-        GROUP BY client_id, CAST(timestamp AS DATE)
-        ORDER BY date, client_id
-    """).df()
-
-    # Daily unique users - DuckDB query returns small DataFrame
-    daily_unique_users = duckdb_conn.execute("""
-        SELECT
-            CAST(timestamp AS DATE) as date,
-            COUNT(DISTINCT username) as unique_users
-        FROM searches
-        GROUP BY CAST(timestamp AS DATE)
-        ORDER BY date
-    """).df()
-
-    print(f"  Analyzing search patterns...")
-
-    # Top queries (count once per user) - DuckDB query, only 100 rows returned
-    print(f"  Computing top queries using DuckDB...")
-    top_queries_df = duckdb_conn.execute("""
-        SELECT
-            LOWER(TRIM(query)) as query_normalized,
-            COUNT(DISTINCT username) as unique_users,
-            COUNT(*) as total_searches
-        FROM searches
-        GROUP BY LOWER(TRIM(query))
-        ORDER BY unique_users DESC, total_searches DESC
-        LIMIT 100
-    """).df()
-
-    top_queries = list(top_queries_df.itertuples(index=False, name=None))
-
-    # Query length distribution - count unique queries per length bucket
-    print(f"  Computing query length distribution using DuckDB...")
-    query_length_data = duckdb_conn.execute("""
-        SELECT
-            LENGTH(query) - LENGTH(REPLACE(query, ' ', '')) + 1 as query_length,
-            COUNT(DISTINCT LOWER(TRIM(query))) as count
-        FROM searches
-        WHERE LENGTH(query) - LENGTH(REPLACE(query, ' ', '')) + 1 <= 100
-        GROUP BY query_length
-        ORDER BY query_length
-    """).df()
-
-    print(f"  Found {total_searches:,} searches for {period_label}")
-    print(f"  Creating visualizations...")
-
-    # Create figures (lightweight charts only) - these work with small DataFrames
+    # Create figures
     figures = {
-        'daily_flow': create_daily_flow_chart(daily_stats),
+        'daily_flow': create_daily_flow_chart(daily_stats) if not daily_stats.empty else None,
         'daily_unique_users': create_daily_unique_users_chart(daily_unique_users) if not daily_unique_users.empty else None,
-        'client_distribution': create_client_distribution_chart(client_totals) if client_totals else None,
+        'client_distribution': create_client_distribution_chart(stats['client_totals']) if stats['client_totals'] else None,
         'top_queries': create_top_queries_chart(top_queries) if top_queries else None,
-        'query_length': create_query_length_chart(query_length_data) if not query_length_data.empty else None
+        'query_length': create_query_length_chart(query_length_dist) if not query_length_dist.empty else None
     }
 
-    # Check for article mode (only for all-time page)
-    article_content = None
-    if period_type == 'all':
-        article_content = load_article_content('docs/article.md')
-        if article_content:
-            print("  Using article mode for all-time page")
-
-    # Generate HTML with Jekyll front matter
+    # Check for article mode
+    article_content = load_article_content('docs/article.md')
     if article_content:
-        # Use article mode (with charts embedded in narrative)
+        print("  Using article mode for all-time page")
         sections = parse_article_sections(article_content)
-        html = generate_article_html_with_jekyll(stats, figures, sections, period_type, period_info)
+        html = generate_article_html_with_jekyll(stats, figures, sections)
     else:
-        # Standard dashboard page
-        html = generate_period_html(stats, figures, period_type, period_info)
+        html = generate_period_html(stats, figures, 'all', None)
 
-    # Write output
+    output_file = "docs/index.html"
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, 'w') as f:
         f.write(html)
 
-    print(f"  ✅ Generated {output_file}")
+    print(f"  Generated {output_file}")
+    return output_file
+
+
+def generate_period_page(conn, period_type: str, period_info: Dict) -> Optional[str]:
+    """Generate a dashboard page for a specific period"""
+    period_label = period_info['label']
+    start_date = period_info['start']
+    end_date = period_info['end']
+
+    # Get stats for this period
+    stats = get_period_stats(conn, start_date, end_date)
+    if stats is None:
+        print(f"  No data for {period_label}, skipping")
+        return None
+
+    print(f"  Found {stats['total_searches']:,} searches for {period_label}")
+
+    # Get chart data
+    daily_stats = get_daily_stats(conn, start_date, end_date)
+    daily_unique_users = get_daily_unique_users(conn, start_date, end_date)
+    top_queries = get_period_top_queries(conn, start_date, end_date)
+    query_length_dist = get_period_query_length_dist(conn, start_date, end_date)
+
+    # Create figures
+    figures = {
+        'daily_flow': create_daily_flow_chart(daily_stats) if not daily_stats.empty else None,
+        'daily_unique_users': create_daily_unique_users_chart(daily_unique_users) if not daily_unique_users.empty else None,
+        'client_distribution': create_client_distribution_chart(stats['client_totals']) if stats['client_totals'] else None,
+        'top_queries': create_top_queries_chart(top_queries) if top_queries else None,
+        'query_length': create_query_length_chart(query_length_dist) if not query_length_dist.empty else None
+    }
+
+    # Generate HTML
+    html = generate_period_html(stats, figures, period_type, period_info)
+
+    # Determine output path
+    if period_type == 'week':
+        output_file = f"docs/weeks/{period_info['id']}.html"
+    else:  # month
+        output_file = f"docs/months/{period_info['id']}.html"
+
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    with open(output_file, 'w') as f:
+        f.write(html)
+
+    print(f"  Generated {output_file}")
     return output_file
 
 
 def generate_article_html_with_jekyll(stats: Dict, figures: Dict[str, go.Figure],
-                                      sections: List[Dict[str, Any]],
-                                      period_type: str, period_info: Optional[Dict] = None) -> str:
+                                      sections: List[Dict[str, Any]]) -> str:
     """Generate article mode HTML with Jekyll front matter"""
-    # Jekyll front matter (article mode is only for all-time)
     front_matter = "---\nlayout: dashboard\nperiod: all\ntitle: All Time Statistics\n---\n\n"
 
-    # Convert figures to HTML
     chart_html = {}
     for name, fig in figures.items():
         if fig is not None:
@@ -801,7 +758,6 @@ def generate_article_html_with_jekyll(stats: Dict, figures: Dict[str, go.Figure]
         else:
             chart_html[name] = '<p>Not enough data for visualization</p>'
 
-    # Build body content from sections
     body_parts = []
     for section in sections:
         if section['type'] == 'prose':
@@ -818,76 +774,25 @@ def generate_article_html_with_jekyll(stats: Dict, figures: Dict[str, go.Figure]
 
     body_content = '\n'.join(body_parts)
 
-    # Add article mode specific CSS inline
     article_css = '''
     <style>
-        .prose {
-            max-width: 800px;
-            margin: 0 auto 30px auto;
-            line-height: 1.7;
-            color: #333;
-        }
-        .prose p {
-            margin: 1em 0;
-            font-size: 16px;
-        }
-        .prose h2 {
-            margin-top: 50px;
-        }
-        .prose h3 {
-            color: #333;
-            margin-top: 30px;
-            font-size: 20px;
-            font-weight: 500;
-        }
-        .prose ul, .prose ol {
-            margin: 1em 0;
-            padding-left: 2em;
-        }
-        .prose li {
-            margin: 0.5em 0;
-        }
-        .prose code {
-            background: #f5f5f5;
-            padding: 2px 6px;
-            border-radius: 3px;
-            font-size: 14px;
-        }
-        .prose pre {
-            background: #f5f5f5;
-            padding: 15px;
-            border-radius: 4px;
-            overflow-x: auto;
-        }
-        .prose pre code {
-            background: none;
-            padding: 0;
-        }
-        .prose blockquote {
-            border-left: 4px solid #333;
-            margin: 1.5em 0;
-            padding-left: 20px;
-            color: #666;
-            font-style: italic;
-        }
-        .prose a {
-            color: #333;
-            text-decoration: underline;
-        }
-        .prose strong {
-            font-weight: 600;
-        }
-        .prose em {
-            font-style: italic;
-        }
-        .chart {
-            max-width: 1200px;
-            margin: 30px auto;
-        }
+        .prose { max-width: 800px; margin: 0 auto 30px auto; line-height: 1.7; color: #333; }
+        .prose p { margin: 1em 0; font-size: 16px; }
+        .prose h2 { margin-top: 50px; }
+        .prose h3 { color: #333; margin-top: 30px; font-size: 20px; font-weight: 500; }
+        .prose ul, .prose ol { margin: 1em 0; padding-left: 2em; }
+        .prose li { margin: 0.5em 0; }
+        .prose code { background: #f5f5f5; padding: 2px 6px; border-radius: 3px; font-size: 14px; }
+        .prose pre { background: #f5f5f5; padding: 15px; border-radius: 4px; overflow-x: auto; }
+        .prose pre code { background: none; padding: 0; }
+        .prose blockquote { border-left: 4px solid #333; margin: 1.5em 0; padding-left: 20px; color: #666; font-style: italic; }
+        .prose a { color: #333; text-decoration: underline; }
+        .prose strong { font-weight: 600; }
+        .prose em { font-style: italic; }
+        .chart { max-width: 1200px; margin: 30px auto; }
     </style>
     '''
 
-    # Format date range for display
     if stats['first_search'] and stats['last_search']:
         first_dt = datetime.fromisoformat(stats['first_search'])
         last_dt = datetime.fromisoformat(stats['last_search'])
@@ -898,19 +803,16 @@ def generate_article_html_with_jekyll(stats: Dict, figures: Dict[str, go.Figure]
     content = f'''{article_css}
 <h1>All Time Statistics</h1>
 <p class="period-range">{date_range_str}</p>
-
 <p class="timestamp">Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
 
 {body_content}
 '''
-
     return front_matter + content
 
 
 def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
                          period_type: str, period_info: Optional[Dict] = None) -> str:
     """Generate HTML for a period page with Jekyll front matter"""
-    # Jekyll front matter
     if period_type == 'all':
         front_matter = "---\nlayout: dashboard\nperiod: all\ntitle: All Time Statistics\n---\n\n"
         period_title = "All Time Statistics"
@@ -921,7 +823,6 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
         front_matter = f"---\nlayout: dashboard\nperiod: month\nperiod_id: {period_info['id']}\ntitle: {period_info['label']}\n---\n\n"
         period_title = period_info['label']
 
-    # Convert figures to HTML
     chart_html = {}
     for name, fig in figures.items():
         if fig is not None:
@@ -929,7 +830,6 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
         else:
             chart_html[name] = '<p style="color: #999">Not enough data for visualization</p>'
 
-    # Generate stats grid
     days = format_days(stats['first_search'], stats['last_search'])
 
     stats_grid = f'''
@@ -967,7 +867,6 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
         </div>
     '''
 
-    # Format date range for display
     if stats['first_search'] and stats['last_search']:
         first_dt = datetime.fromisoformat(stats['first_search'])
         last_dt = datetime.fromisoformat(stats['last_search'])
@@ -975,10 +874,8 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
     else:
         date_range_str = "No data"
 
-    # Page content (no Jekyll layout, just the content)
     content = f'''<h1>{period_title}</h1>
 <p class="period-range">{date_range_str}</p>
-
 <p class="timestamp">Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
 
 <div style="background: #f5f5f5; padding: 20px; margin: 20px 0; border-left: 4px solid #333;">
@@ -1017,149 +914,62 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
 <div class="chart">
     {chart_html.get('query_length', '<p>Not enough data</p>')}
 </div>
-
 '''
-
     return front_matter + content
 
 
 def main():
-    """Main execution using DuckDB for fast analytics"""
+    """Main execution using materialized views"""
     print("Connecting to PostgreSQL database...")
     try:
-        pg_conn = get_db_connection()
+        conn = get_db_connection()
     except Exception as e:
         print(f"ERROR: Failed to connect to database: {e}")
         raise
 
-    # Create DuckDB connection (in-memory for fast analytics)
-    print("Creating DuckDB connection...")
-    duck_conn = duckdb.connect(':memory:')
-
     # Calculate cutoff: end of yesterday UTC (exclude incomplete current day)
-    # Pipeline runs at 3am, so current day only has partial data
     cutoff_date = (datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
                    - timedelta(seconds=1))
-    print(f"Data cutoff: {cutoff_date.strftime('%Y-%m-%d %H:%M:%S')} UTC (excluding incomplete current day)")
+    print(f"Data cutoff: {cutoff_date.strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
     try:
         # Get available periods from database
-        periods = get_available_periods(pg_conn, max_date=cutoff_date)
-
+        periods = get_available_periods(conn, max_date=cutoff_date)
         print(f"Found {len(periods['months'])} months and {len(periods['weeks'])} weeks")
 
         # Generate Jekyll data files for navigation
         generate_jekyll_data_files(periods)
-        print("✅ Generated Jekyll navigation data files")
+        print("Generated Jekyll navigation data files")
 
-        # CHECK FOR AND LOAD PARQUET ARCHIVES
-        print("="*80)
-        print("CHECKING FOR ARCHIVED DATA")
-        print("="*80)
-        local_archive_path = os.environ.get('ARCHIVE_PATH', './archives')
-        parquet_files = download_parquet_archives(pg_conn, local_archive_path)
-
-        # Load archives into DuckDB (if any exist)
-        archive_count = 0
-        if parquet_files:
-            archive_count = load_parquet_archives_into_duckdb(duck_conn, parquet_files)
-
-        # LOAD LIVE DATA INTO DUCKDB
-        print("="*80)
-        print("LOADING LIVE DATA INTO DUCKDB")
-        print("="*80)
-        raw_count = load_data_into_duckdb(pg_conn, duck_conn, cutoff_date=cutoff_date)
-
-        # If we have archives, union them with live data
-        if archive_count > 0:
-            print("  Combining archived and live data...")
-            # Rename live tables temporarily
-            duck_conn.execute("ALTER TABLE searches_raw RENAME TO searches_live_raw")
-
-            # Create unified raw table (union of archived + live)
-            duck_conn.execute("""
-                CREATE TABLE searches_raw AS
-                SELECT * FROM searches_archived
-                UNION ALL
-                SELECT * FROM searches_live_raw
-            """)
-
-            # Clean up
-            duck_conn.execute("DROP TABLE searches_live_raw")
-            duck_conn.execute("DROP VIEW searches_archived")
-
-            total_raw = duck_conn.execute("SELECT COUNT(*) FROM searches_raw").fetchone()[0]
-            print(f"  Combined: {archive_count:,} archived + {raw_count:,} live = {total_raw:,} total raw records")
-            raw_count = total_raw
-
-        # Rename table for simpler usage (no separate dedup table needed)
-        # Deduplication is done inline per-query using COUNT(DISTINCT ...)
-        duck_conn.execute("ALTER TABLE searches_raw RENAME TO searches")
-
-        # Generate all-time page (use full dataset)
-        print("="*80)
+        # Generate all-time page (uses cumulative stats + materialized views)
+        print("=" * 60)
         print("GENERATING ALL-TIME PAGE")
-        print("="*80)
-        print(f"  Using full dataset: {raw_count:,} records")
-        generate_period_page_with_duckdb(pg_conn, duck_conn, 'all', None)
+        print("=" * 60)
+        generate_all_time_page(conn)
 
-        # Rename base table to avoid view name conflicts
-        duck_conn.execute("ALTER TABLE searches RENAME TO searches_base")
-
-        # Generate monthly pages (filter using SQL WHERE clauses)
+        # Generate monthly pages
         for month in periods['months']:
-            print("="*80)
+            print("=" * 60)
             print(f"GENERATING MONTHLY PAGE: {month['label']}")
-            print("="*80)
-            print(f"  Filtering data for period: {month['start']} to {month['end']}")
+            print("=" * 60)
+            generate_period_page(conn, 'month', month)
 
-            # Create filtered view in DuckDB (fast SQL filtering)
-            duck_conn.execute("DROP VIEW IF EXISTS searches")
-            duck_conn.execute(f"""
-                CREATE VIEW searches AS
-                SELECT * FROM searches_base
-                WHERE timestamp >= '{month['start'].isoformat()}'
-                  AND timestamp <= '{month['end'].isoformat()}'
-            """)
-
-            month_count = duck_conn.execute("SELECT COUNT(*) FROM searches").fetchone()[0]
-            print(f"  Filtered to {month_count:,} records")
-
-            if month_count > 0:
-                generate_period_page_with_duckdb(pg_conn, duck_conn, 'month', month)
-
-        # Generate weekly pages (filter using SQL WHERE clauses)
+        # Generate weekly pages
         for week in periods['weeks']:
-            print("="*80)
+            print("=" * 60)
             print(f"GENERATING WEEKLY PAGE: CW {week['label']}")
-            print("="*80)
-            print(f"  Filtering data for period: {week['start']} to {week['end']}")
+            print("=" * 60)
+            generate_period_page(conn, 'week', week)
 
-            # Create filtered view in DuckDB (fast SQL filtering)
-            duck_conn.execute("DROP VIEW IF EXISTS searches")
-            duck_conn.execute(f"""
-                CREATE VIEW searches AS
-                SELECT * FROM searches_base
-                WHERE timestamp >= '{week['start'].isoformat()}'
-                  AND timestamp <= '{week['end'].isoformat()}'
-            """)
-
-            week_count = duck_conn.execute("SELECT COUNT(*) FROM searches").fetchone()[0]
-            print(f"  Filtered to {week_count:,} records")
-
-            if week_count > 0:
-                generate_period_page_with_duckdb(pg_conn, duck_conn, 'week', week)
-
-        print("\n" + "="*80)
-        print(f"✅ Generated {1 + len(periods['months']) + len(periods['weeks'])} dashboard pages")
-        print(f"   - 1 all-time page")
-        print(f"   - {len(periods['months'])} monthly pages")
-        print(f"   - {len(periods['weeks'])} weekly pages")
-        print("="*80)
+        print("\n" + "=" * 60)
+        print(f"Generated {1 + len(periods['months']) + len(periods['weeks'])} dashboard pages")
+        print(f"  - 1 all-time page")
+        print(f"  - {len(periods['months'])} monthly pages")
+        print(f"  - {len(periods['weeks'])} weekly pages")
+        print("=" * 60)
 
     finally:
-        pg_conn.close()
-        duck_conn.close()
+        conn.close()
 
 
 if __name__ == '__main__':

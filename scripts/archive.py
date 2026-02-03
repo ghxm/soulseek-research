@@ -4,6 +4,7 @@ Monthly archival script for Soulseek research data.
 Exports old months to Parquet files and deletes from database.
 """
 
+import json
 import os
 from datetime import datetime, timedelta
 from typing import List, Tuple
@@ -65,6 +66,105 @@ def get_months_to_archive(conn, min_age_days: int = 7) -> List[str]:
     """, (cutoff, cutoff))
 
     return [row[0] for row in cursor.fetchall()]
+
+
+def update_cumulative_stats(conn, month: str):
+    """
+    Compute stats for a month and add them to the cumulative stats table.
+    Must be called BEFORE deleting the month's data from searches table.
+
+    Note: total_users, total_queries, total_search_pairs are approximate when
+    summed across months (no cross-month deduplication). This is an acceptable
+    tradeoff for avoiding full data retention.
+    """
+    cursor = conn.cursor()
+
+    # Compute stats for this month
+    cursor.execute("""
+        SELECT
+            COUNT(*) as searches,
+            COUNT(DISTINCT username) as users,
+            COUNT(DISTINCT LOWER(TRIM(query))) as queries,
+            COUNT(DISTINCT (username || '|' || LOWER(TRIM(query)))) as search_pairs,
+            MIN(timestamp) as first_search,
+            MAX(timestamp) as last_search
+        FROM searches
+        WHERE TO_CHAR(timestamp, 'YYYY-MM') = %s
+    """, (month,))
+
+    month_stats = cursor.fetchone()
+    searches, users, queries, search_pairs, first_search, last_search = month_stats
+
+    if searches == 0:
+        print(f"  No data found for month {month}, skipping cumulative update")
+        return
+
+    # Get per-client counts for this month
+    cursor.execute("""
+        SELECT client_id, COUNT(*) as count
+        FROM searches
+        WHERE TO_CHAR(timestamp, 'YYYY-MM') = %s
+        GROUP BY client_id
+    """, (month,))
+    month_client_totals = {row[0]: row[1] for row in cursor.fetchall()}
+
+    # Get current cumulative stats
+    cursor.execute("""
+        SELECT total_searches, total_users, total_queries, total_search_pairs,
+               first_search, last_search, client_totals, last_archive_month
+        FROM stats_cumulative
+        WHERE id = 1
+    """)
+    current = cursor.fetchone()
+
+    if current is None:
+        # Initialize if not exists
+        cursor.execute("""
+            INSERT INTO stats_cumulative (id, total_searches, total_users, total_queries,
+                total_search_pairs, first_search, last_search, client_totals, last_archive_month)
+            VALUES (1, 0, 0, 0, 0, NULL, NULL, '{}', NULL)
+        """)
+        conn.commit()
+        current = (0, 0, 0, 0, None, None, {}, None)
+
+    (curr_searches, curr_users, curr_queries, curr_pairs,
+     curr_first, curr_last, curr_clients, curr_last_month) = current
+
+    # Parse client_totals if it's a string
+    if isinstance(curr_clients, str):
+        curr_clients = json.loads(curr_clients) if curr_clients else {}
+
+    # Merge client totals
+    new_client_totals = curr_clients.copy() if curr_clients else {}
+    for client_id, count in month_client_totals.items():
+        new_client_totals[client_id] = new_client_totals.get(client_id, 0) + count
+
+    # Calculate new cumulative values
+    new_searches = curr_searches + searches
+    new_users = curr_users + users  # Approximate (sum of monthly)
+    new_queries = curr_queries + queries  # Approximate
+    new_pairs = curr_pairs + search_pairs  # Approximate
+    new_first = first_search if curr_first is None else min(curr_first, first_search)
+    new_last = last_search if curr_last is None else max(curr_last, last_search)
+
+    # Update cumulative stats
+    cursor.execute("""
+        UPDATE stats_cumulative SET
+            total_searches = %s,
+            total_users = %s,
+            total_queries = %s,
+            total_search_pairs = %s,
+            first_search = %s,
+            last_search = %s,
+            client_totals = %s,
+            last_archive_month = %s,
+            updated_at = NOW()
+        WHERE id = 1
+    """, (new_searches, new_users, new_queries, new_pairs,
+          new_first, new_last, json.dumps(new_client_totals), month))
+
+    conn.commit()
+    print(f"  Updated cumulative stats: +{searches:,} searches, +{users:,} users")
 
 
 def export_month_to_parquet(conn, month: str, archive_path: str) -> Tuple[str, int, int]:
@@ -159,10 +259,14 @@ def archive_month(conn, month: str, archive_path: str, delete_after: bool = Fals
 
     # 3. Optionally delete from database
     if delete_after:
+        # 3a. Update cumulative stats BEFORE deleting (preserves all-time totals)
+        update_cumulative_stats(conn, month)
+
+        # 3b. Delete from database
         deleted = delete_archived_data(conn, month)
         print(f"  Deleted {deleted:,} records from database")
 
-        # Mark as deleted
+        # 3c. Mark as deleted
         mark_archive_deleted(conn, month)
 
 

@@ -2,7 +2,7 @@ name: Update Statistics Dashboard
 
 on:
   schedule:
-    - cron: '0 3 * * *'  # Daily at 3 AM UTC
+    - cron: '0 5 * * *'  # Daily at 5 AM UTC (after 4 AM view refresh)
   workflow_dispatch:
 
 permissions:
@@ -13,7 +13,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     environment: github-pages
     steps:
       - uses: actions/checkout@v4
@@ -29,18 +29,7 @@ jobs:
       - name: Generate statistics
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          ARCHIVE_PATH: ./archives
-          DB_SERVER_IP: ${{ secrets.DB_SERVER_IP }}
-          DB_SERVER_SSH_KEY: ${{ secrets.DB_SERVER_SSH_KEY }}
-        run: |
-          # Set up SSH key if provided
-          if [ -n "$DB_SERVER_SSH_KEY" ]; then
-            mkdir -p ~/.ssh
-            echo "$DB_SERVER_SSH_KEY" > ~/.ssh/db_server_key
-            chmod 600 ~/.ssh/db_server_key
-            export DB_SERVER_SSH_KEY=~/.ssh/db_server_key
-          fi
-          python -u scripts/generate_stats.py
+        run: python -u scripts/generate_stats.py
 
       - name: Build with Jekyll
         uses: actions/jekyll-build-pages@v1
