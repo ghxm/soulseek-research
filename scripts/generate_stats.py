@@ -947,25 +947,27 @@ def main():
         print("=" * 60)
         generate_all_time_page(conn)
 
-        # Generate monthly pages
-        for month in periods['months']:
-            print("=" * 60)
-            print(f"GENERATING MONTHLY PAGE: {month['label']}")
-            print("=" * 60)
-            generate_period_page(conn, 'month', month)
-
-        # Generate weekly pages
-        for week in periods['weeks']:
-            print("=" * 60)
-            print(f"GENERATING WEEKLY PAGE: CW {week['label']}")
-            print("=" * 60)
-            generate_period_page(conn, 'week', week)
+        # NOTE: Period pages disabled temporarily due to slow COUNT(DISTINCT) queries
+        # on 48M+ rows. The all-time page uses materialized views and works fast.
+        # To re-enable, we would need period-specific materialized views.
+        #
+        # # Generate monthly pages
+        # for month in periods['months']:
+        #     print("=" * 60)
+        #     print(f"GENERATING MONTHLY PAGE: {month['label']}")
+        #     print("=" * 60)
+        #     generate_period_page(conn, 'month', month)
+        #
+        # # Generate weekly pages
+        # for week in periods['weeks']:
+        #     print("=" * 60)
+        #     print(f"GENERATING WEEKLY PAGE: CW {week['label']}")
+        #     print("=" * 60)
+        #     generate_period_page(conn, 'week', week)
 
         print("\n" + "=" * 60)
-        print(f"Generated {1 + len(periods['months']) + len(periods['weeks'])} dashboard pages")
-        print(f"  - 1 all-time page")
-        print(f"  - {len(periods['months'])} monthly pages")
-        print(f"  - {len(periods['weeks'])} weekly pages")
+        print("Generated 1 dashboard page (all-time)")
+        print("  - Period pages disabled (would require period-specific materialized views)")
         print("=" * 60)
 
     finally:
