@@ -308,6 +308,8 @@ def get_period_stats(conn, start_date, end_date) -> Dict[str, Any]:
         return None
 
     total_searches, total_users, first_date, last_date = result
+    total_searches = int(total_searches) if total_searches else 0
+    total_users = int(total_users) if total_users else 0
 
     # Get per-client totals from mv_daily_stats
     cursor.execute("""
