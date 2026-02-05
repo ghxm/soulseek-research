@@ -9,8 +9,6 @@ import os
 from collections import deque
 from typing import Optional
 
-from cryptography.fernet import Fernet
-
 from aioslsk.client import SoulSeekClient
 from aioslsk.events import SearchRequestReceivedEvent
 from aioslsk.settings import Settings, CredentialsSettings
@@ -52,8 +50,8 @@ class ResearchClient:
         self.client_id = client_id or f"client-{username}"
         self.batch_size = batch_size
         
-        # Setup encryption for usernames
-        self._setup_encryption(encryption_key)
+        # Setup secret salt for username hashing
+        self._setup_hashing_salt(encryption_key)
         
         # Configure Settings for distributed network participation
         from aioslsk.settings import (
@@ -100,40 +98,37 @@ class ResearchClient:
         # Stats
         self.searches_logged = 0
     
-    def _setup_encryption(self, encryption_key: Optional[str] = None):
-        """Setup username encryption"""
+    def _setup_hashing_salt(self, encryption_key: Optional[str] = None):
+        """Setup secret salt for username hashing (prevents reverse-lookup attacks)"""
         if encryption_key:
             # Use provided key
             if len(encryption_key) == 32:
                 # Assume it's already base64 encoded
-                self.encryption_key = encryption_key.encode()
+                self.hash_salt = encryption_key.encode()
             else:
-                # Hash the key to get proper length
+                # Hash the key to get consistent length
                 key_hash = hashlib.sha256(encryption_key.encode()).digest()
-                self.encryption_key = base64.urlsafe_b64encode(key_hash)
+                self.hash_salt = base64.urlsafe_b64encode(key_hash)
         else:
             # Generate from environment or create deterministic key
             env_key = os.environ.get('ENCRYPTION_KEY')
             if env_key:
                 key_hash = hashlib.sha256(env_key.encode()).digest()
-                self.encryption_key = base64.urlsafe_b64encode(key_hash)
+                self.hash_salt = base64.urlsafe_b64encode(key_hash)
             else:
                 # Use a deterministic key based on database URL (not secure, but consistent)
-                logger.warning("No encryption key provided, using deterministic key. Set ENCRYPTION_KEY environment variable for security.")
+                logger.warning("No ENCRYPTION_KEY provided, using deterministic salt. Set ENCRYPTION_KEY environment variable for security.")
                 key_hash = hashlib.sha256(self.database_url.encode()).digest()
-                self.encryption_key = base64.urlsafe_b64encode(key_hash)
-        
-        self.fernet = Fernet(self.encryption_key)
+                self.hash_salt = base64.urlsafe_b64encode(key_hash)
     
-    def encrypt_username(self, username: str) -> str:
-        """Hash username for storage (SHA-256 for compact 64-char output vs 200+ for Fernet)"""
+    def hash_username(self, username: str) -> str:
+        """Hash username with secret salt for privacy (prevents reverse-lookup attacks)"""
         try:
-            # Use SHA-256 hash with salt for privacy - much more storage efficient
-            salted = f"{self.encryption_key.decode()}{username}".encode()
+            salted = f"{self.hash_salt.decode()}{username}".encode()
             return hashlib.sha256(salted).hexdigest()
         except Exception as e:
             logger.error(f"Failed to hash username: {e}")
-            # Fallback to simple hash
+            # Fallback to unsalted hash
             return hashlib.sha256(username.encode()).hexdigest()
     
     async def _setup_database(self):
@@ -226,12 +221,12 @@ class ResearchClient:
         """Handle search events"""
         logger.info(f"🔍 Search received: {event.query[:50]}... from {event.username[:10]}...")
         
-        # Encrypt username for privacy
-        encrypted_username = self.encrypt_username(event.username)
+        # Hash username for privacy
+        hashed_username = self.hash_username(event.username)
         
         search = SearchRecord(
             client_id=self.client_id,
-            username=encrypted_username,
+            username=hashed_username,
             query=event.query,
             timestamp=datetime.datetime.now(datetime.timezone.utc)
         )

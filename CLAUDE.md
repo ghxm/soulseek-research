@@ -6,7 +6,7 @@ This package collects search data from the Soulseek P2P network by monitoring se
 
 ## Core Concept
 
-**What it does**: Runs Soulseek clients that listen for search requests from other users on the network, then logs these searches (encrypted username, query, timestamp) to a centralized database.
+**What it does**: Runs Soulseek clients that listen for search requests from other users on the network, then logs these searches (hashed username, query, timestamp) to a centralized database.
 
 **Why distributed**: Different geographic regions see different search traffic due to how Soulseek's distributed network routes searches based on geographic proximity.
 
@@ -70,7 +70,7 @@ soulseek.archives:
 - Direct SQLAlchemy usage, no ORM layers
 
 **Security & Privacy:**
-- Username encryption with Fernet (research_encryption_2025 key)
+- Usernames hashed with secret salt (SHA-256) to prevent reverse-lookup attacks
 - Database name changed from "research" to "soulseek" for clarity
 - Focus on aggregate patterns, not individual tracking
 
@@ -90,13 +90,12 @@ soulseek.archives:
 1. aioslsk library receives search request from Soulseek network
 2. Fires `SearchRequestReceivedEvent` with username/query/result_count
 3. Our `_on_search_received` handler creates `SearchRecord`
-4. Username encrypted with Fernet before database storage
+4. Username hashed with secret salt before database storage
 5. Record written to PostgreSQL database
 
 ### External Dependencies
 - **aioslsk**: Handles Soulseek protocol, fires search events
 - **SQLAlchemy**: Database ORM with async support (asyncpg driver)
-- **cryptography**: Fernet encryption for usernames
 - **Click**: CLI framework for clean command interface
 
 ### Deployment Automation
@@ -194,7 +193,7 @@ germany,2025-01-01T00:00:01Z,abc123hash,artist name album
 - `DATABASE_URL`: PostgreSQL connection string
 
 ### Privacy & Compliance
-- Usernames encrypted at write time with consistent key
+- Usernames hashed at write time with secret salt (prevents reverse-lookup attacks)
 - Research focus on aggregate patterns, not individual users
 - Configurable data retention through archival system
 - No file sharing - only search request monitoring
