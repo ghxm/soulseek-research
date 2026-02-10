@@ -35,20 +35,22 @@ class SearchRecord(Base):
 
 class ResearchClient:
     """Simple research client - focus only on search collection"""
-    
-    def __init__(self, 
+
+    def __init__(self,
                  username: str,
-                 password: str, 
+                 password: str,
                  database_url: str,
                  client_id: Optional[str] = None,
-                 batch_size: int = 500,
+                 batch_size: int = 10000,
+                 max_queue_size: int = 100000,
                  encryption_key: Optional[str] = None):
-        
+
         self.username = username
         self.password = password
         self.database_url = database_url
         self.client_id = client_id or f"client-{username}"
         self.batch_size = batch_size
+        self.max_queue_size = max_queue_size
         
         # Setup secret salt for username hashing
         self._setup_hashing_salt(encryption_key)
@@ -94,9 +96,15 @@ class ResearchClient:
         self._search_queue = deque()
         self._batch_task = None
         self._running = False
-        
+
         # Stats
         self.searches_logged = 0
+        self.searches_dropped = 0
+
+        # Retry logic for database failures
+        self._db_retry_count = 0
+        self._db_retry_delay = 1.0  # Start with 1 second
+        self._max_retry_delay = 300.0  # Max 5 minutes
     
     def _setup_hashing_salt(self, encryption_key: Optional[str] = None):
         """Setup secret salt for username hashing (prevents reverse-lookup attacks)"""
@@ -193,7 +201,33 @@ class ResearchClient:
                 # Log heartbeat every 30 seconds for debugging
                 if heartbeat_counter % 30 == 0:
                     received_count = len(self.soulseek_client.searches.received_searches)
-                    logger.info(f"💓 Client {self.client_id} - logged: {self.searches_logged}, received_searches deque: {received_count}")
+                    queue_size = len(self._search_queue)
+
+                    # Database health indicator
+                    if self._db_retry_count > 0:
+                        db_status = f"⚠️  DB FAILING (retry #{self._db_retry_count}, backoff: {self._db_retry_delay:.0f}s)"
+                    elif not self._db_ready:
+                        db_status = "❌ DB NOT READY"
+                    else:
+                        db_status = "✅ DB OK"
+
+                    logger.info(
+                        f"💓 Client {self.client_id} - "
+                        f"logged: {self.searches_logged}, "
+                        f"dropped: {self.searches_dropped}, "
+                        f"queue: {queue_size}/{self.max_queue_size}, "
+                        f"received_searches deque: {received_count}, "
+                        f"{db_status}"
+                    )
+
+                    # CRITICAL ALERT: If database has been failing for a long time
+                    if self._db_retry_count > 10:
+                        logger.critical(
+                            f"🚨 DATABASE DOWN FOR EXTENDED PERIOD! "
+                            f"Failed {self._db_retry_count} times. "
+                            f"Queue: {queue_size}/{self.max_queue_size}. "
+                            f"Dropped: {self.searches_dropped} searches."
+                        )
         except KeyboardInterrupt:
             pass
         finally:
@@ -220,20 +254,34 @@ class ResearchClient:
     async def _on_search_received(self, event: SearchRequestReceivedEvent):
         """Handle search events"""
         logger.info(f"🔍 Search received: {event.query[:50]}... from {event.username[:10]}...")
-        
+
         # Hash username for privacy
         hashed_username = self.hash_username(event.username)
-        
+
         search = SearchRecord(
             client_id=self.client_id,
             username=hashed_username,
             query=event.query,
             timestamp=datetime.datetime.now(datetime.timezone.utc)
         )
-        
+
+        # Check if queue is at max size - drop oldest items if needed
+        if len(self._search_queue) >= self.max_queue_size:
+            dropped_count = len(self._search_queue) - self.max_queue_size + 1000  # Drop 1000 at a time for efficiency
+            for _ in range(min(dropped_count, len(self._search_queue))):
+                self._search_queue.popleft()
+                self.searches_dropped += 1
+
+            logger.warning(
+                f"Queue exceeded max_queue_size ({self.max_queue_size}). "
+                f"Dropped {dropped_count} oldest searches. "
+                f"Total dropped: {self.searches_dropped}. "
+                f"Database may be down - check connection!"
+            )
+
         self._search_queue.append(search)
         self.searches_logged += 1
-        
+
         # Immediate flush if queue full
         if len(self._search_queue) >= self.batch_size:
             await self._flush_searches()
@@ -246,21 +294,44 @@ class ResearchClient:
                 await self._flush_searches()
     
     async def _flush_searches(self):
-        """Flush search queue to database"""
-        if not self._search_queue or not self._db_ready:
+        """Flush search queue to database with exponential backoff on failures"""
+        if not self._search_queue:
             return
-            
+
+        if not self._db_ready:
+            logger.warning(f"Database not ready. Queue size: {len(self._search_queue)}")
+            return
+
         batch = list(self._search_queue)
         self._search_queue.clear()
-        
+
         try:
             async with self.session_maker() as session:
                 session.add_all(batch)
                 await session.commit()
-                
+
             logger.debug(f"Saved {len(batch)} searches (total: {self.searches_logged})")
-            
+
+            # Reset retry logic on success
+            if self._db_retry_count > 0:
+                logger.info(f"Database connection recovered after {self._db_retry_count} failed attempts")
+                self._db_retry_count = 0
+                self._db_retry_delay = 1.0
+
         except Exception as e:
-            logger.error(f"Failed to save searches: {e}")
-            # Put them back in queue
+            self._db_retry_count += 1
+
+            logger.error(
+                f"Failed to save {len(batch)} searches to database (attempt #{self._db_retry_count}): {e}. "
+                f"Queue size: {len(self._search_queue) + len(batch)}. "
+                f"Next retry in {self._db_retry_delay:.1f}s"
+            )
+
+            # Put batch back in queue
             self._search_queue.extendleft(reversed(batch))
+
+            # Exponential backoff: double delay each time, up to max
+            self._db_retry_delay = min(self._db_retry_delay * 2, self._max_retry_delay)
+
+            # Wait before allowing next retry
+            await asyncio.sleep(self._db_retry_delay)

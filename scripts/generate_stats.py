@@ -256,13 +256,12 @@ def get_daily_unique_users(conn, start_date=None, end_date=None) -> pd.DataFrame
 
 
 def get_top_queries(conn) -> List[tuple]:
-    """Get top 100 queries from materialized view"""
+    """Get all queries with 5+ unique users from materialized view"""
     cursor = conn.cursor()
     cursor.execute("""
         SELECT query_normalized, unique_users, total_searches
         FROM mv_top_queries
         ORDER BY unique_users DESC, total_searches DESC
-        LIMIT 100
     """)
     rows = cursor.fetchall()
     cursor.close()
@@ -462,29 +461,168 @@ def create_daily_unique_users_chart(df: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def wrap_chart_with_search(fig: go.Figure, chart_id: str = 'chart') -> str:
+    """Wrap a Plotly figure with a search box and scrollable container"""
+    chart_html = fig.to_html(full_html=False, include_plotlyjs='cdn', div_id=chart_id)
+
+    return f'''
+    <div class="searchable-chart-container">
+        <div class="search-box-wrapper">
+            <input
+                type="text"
+                id="{chart_id}_search"
+                class="chart-search-input"
+                placeholder="Filter queries by text (e.g., 'beatles', 'jazz', etc.)..."
+                autocomplete="off"
+            />
+            <div class="search-info" id="{chart_id}_info">
+                Showing all results
+            </div>
+        </div>
+        <div class="scrollable-chart" id="{chart_id}_container">
+            {chart_html}
+        </div>
+    </div>
+    <script>
+    (function() {{
+        const searchInput = document.getElementById('{chart_id}_search');
+        const chartDiv = document.getElementById('{chart_id}');
+        const infoDiv = document.getElementById('{chart_id}_info');
+
+        if (!searchInput || !chartDiv) return;
+
+        // Store original data
+        let originalData = null;
+
+        // Wait for Plotly to render
+        const checkPlotly = setInterval(() => {{
+            if (typeof Plotly !== 'undefined' && chartDiv.data) {{
+                clearInterval(checkPlotly);
+                originalData = JSON.parse(JSON.stringify(chartDiv.data[0]));
+
+                searchInput.addEventListener('input', function() {{
+                    const searchTerm = this.value.toLowerCase().trim();
+
+                    if (!searchTerm) {{
+                        // Reset to original
+                        Plotly.restyle(chartDiv, {{
+                            'y': [originalData.y],
+                            'x': [originalData.x],
+                            'customdata': [originalData.customdata]
+                        }}, 0);
+                        infoDiv.textContent = `Showing all ${{originalData.y.length}} results`;
+                        return;
+                    }}
+
+                    // Filter data
+                    const filteredY = [];
+                    const filteredX = [];
+                    const filteredCustomdata = [];
+
+                    for (let i = 0; i < originalData.y.length; i++) {{
+                        const query = originalData.y[i].toLowerCase();
+                        if (query.includes(searchTerm)) {{
+                            filteredY.push(originalData.y[i]);
+                            filteredX.push(originalData.x[i]);
+                            filteredCustomdata.push(originalData.customdata[i]);
+                        }}
+                    }}
+
+                    // Update chart
+                    if (filteredY.length > 0) {{
+                        Plotly.restyle(chartDiv, {{
+                            'y': [filteredY],
+                            'x': [filteredX],
+                            'customdata': [filteredCustomdata]
+                        }}, 0);
+                        infoDiv.textContent = `Showing ${{filteredY.length}} of ${{originalData.y.length}} results`;
+                    }} else {{
+                        Plotly.restyle(chartDiv, {{
+                            'y': [['No results found']],
+                            'x': [[0]],
+                            'customdata': [['No results']]
+                        }}, 0);
+                        infoDiv.textContent = 'No results found';
+                    }}
+                }});
+            }}
+        }}, 100);
+    }})();
+    </script>
+    <style>
+        .searchable-chart-container {{
+            margin: 20px 0;
+        }}
+        .search-box-wrapper {{
+            background: #f5f5f5;
+            padding: 15px;
+            border-radius: 4px;
+            margin-bottom: 15px;
+        }}
+        .chart-search-input {{
+            width: 100%;
+            padding: 12px 15px;
+            font-size: 16px;
+            border: 2px solid #333;
+            border-radius: 4px;
+            box-sizing: border-box;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+        }}
+        .chart-search-input:focus {{
+            outline: none;
+            border-color: #000;
+            background: #fff;
+        }}
+        .search-info {{
+            margin-top: 8px;
+            font-size: 14px;
+            color: #666;
+            font-style: italic;
+        }}
+        .scrollable-chart {{
+            max-height: 800px;
+            overflow-y: auto;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            background: white;
+        }}
+    </style>
+    '''
+
+
 def create_top_queries_chart(top_queries: List[tuple]) -> go.Figure:
-    """Create bar chart of top queries"""
-    queries = [q[0][:50] for q in top_queries[:100]]
-    unique_users = [q[1] for q in top_queries[:100]]
+    """Create interactive, searchable bar chart of top queries (5+ users)"""
+    # Don't truncate - show all queries with 5+ users
+    queries = [q[0] for q in top_queries]
+    unique_users = [q[1] for q in top_queries]
+
+    # Calculate dynamic height based on number of queries (20px per query, min 800px)
+    chart_height = max(800, len(queries) * 20)
 
     fig = go.Figure(data=[
         go.Bar(
-            y=queries[::-1],
+            y=queries[::-1],  # Reverse for top-to-bottom display
             x=unique_users[::-1],
             orientation='h',
-            marker=dict(color='#333333', line=dict(color='black', width=1))
+            marker=dict(color='#333333', line=dict(color='black', width=1)),
+            customdata=queries[::-1],  # Store full query for search
+            hovertemplate='<b>%{customdata}</b><br>Unique Users: %{x}<extra></extra>'
         )
     ])
 
     fig.update_layout(
-        title='Top 100 Most Searched Queries (Unique Users)',
+        title=f'Top Queries with 5+ Unique Users ({len(queries):,} queries)',
         xaxis_title='Number of Unique Users',
         yaxis_title='Query',
-        height=2500,
+        height=chart_height,
         template='plotly_white',
         plot_bgcolor='white',
         paper_bgcolor='white',
-        font=dict(color='black')
+        font=dict(color='black'),
+        yaxis=dict(
+            tickmode='linear',
+            tickfont=dict(size=10)
+        )
     )
     return fig
 
@@ -733,7 +871,11 @@ def generate_article_html_with_jekyll(stats: Dict, figures: Dict[str, go.Figure]
     chart_html = {}
     for name, fig in figures.items():
         if fig is not None:
-            chart_html[name] = fig.to_html(full_html=False, include_plotlyjs='cdn')
+            # Add search wrapper for top_queries chart
+            if name == 'top_queries':
+                chart_html[name] = wrap_chart_with_search(fig, chart_id='top_queries_chart')
+            else:
+                chart_html[name] = fig.to_html(full_html=False, include_plotlyjs='cdn')
         else:
             chart_html[name] = '<p>Not enough data for visualization</p>'
 
@@ -805,7 +947,11 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
     chart_html = {}
     for name, fig in figures.items():
         if fig is not None:
-            chart_html[name] = fig.to_html(full_html=False, include_plotlyjs='cdn')
+            # Add search wrapper for top_queries chart
+            if name == 'top_queries':
+                chart_html[name] = wrap_chart_with_search(fig, chart_id=f'top_queries_chart_{period_type}')
+            else:
+                chart_html[name] = fig.to_html(full_html=False, include_plotlyjs='cdn')
         else:
             chart_html[name] = '<p style="color: #999">Not enough data for visualization</p>'
 

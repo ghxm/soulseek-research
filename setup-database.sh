@@ -88,6 +88,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_daily_stats_unique
 ON mv_daily_stats (date, client_id);
 
 -- Top queries by unique users (global, not per-period)
+-- Changed to include all queries with 5+ unique users (no LIMIT)
 CREATE MATERIALIZED VIEW IF NOT EXISTS mv_top_queries AS
 SELECT
     LOWER(TRIM(query)) as query_normalized,
@@ -95,8 +96,8 @@ SELECT
     COUNT(*) as total_searches
 FROM searches
 GROUP BY LOWER(TRIM(query))
-ORDER BY unique_users DESC, total_searches DESC
-LIMIT 100;
+HAVING COUNT(DISTINCT username) >= 5
+ORDER BY unique_users DESC, total_searches DESC;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_top_queries_unique
 ON mv_top_queries (query_normalized);
