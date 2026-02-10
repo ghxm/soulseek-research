@@ -461,143 +461,22 @@ def create_daily_unique_users_chart(df: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def wrap_chart_with_search(fig: go.Figure, chart_id: str = 'chart') -> str:
-    """Wrap a Plotly figure with a search box and scrollable container"""
-    chart_html = fig.to_html(full_html=False, include_plotlyjs='cdn', div_id=chart_id)
+def create_top_queries_chart(top_queries: List[tuple], limit: int = 1000) -> go.Figure:
+    """Create interactive bar chart of top N queries for performance.
 
-    return f'''
-    <div class="searchable-chart-container">
-        <div class="search-box-wrapper">
-            <input
-                type="text"
-                id="{chart_id}_search"
-                class="chart-search-input"
-                placeholder="Filter queries by text (e.g., 'beatles', 'jazz', etc.)..."
-                autocomplete="off"
-            />
-            <div class="search-info" id="{chart_id}_info">
-                Showing all results
-            </div>
-        </div>
-        <div class="scrollable-chart" id="{chart_id}_container">
-            {chart_html}
-        </div>
-    </div>
-    <script>
-    (function() {{
-        const searchInput = document.getElementById('{chart_id}_search');
-        const chartDiv = document.getElementById('{chart_id}');
-        const infoDiv = document.getElementById('{chart_id}_info');
+    Args:
+        top_queries: List of (query, unique_users, total_searches) tuples
+        limit: Maximum number of queries to show in chart (default 1000)
 
-        if (!searchInput || !chartDiv) return;
+    Returns:
+        Plotly figure with top N queries
+    """
+    total_count = len(top_queries)
+    queries = [q[0] for q in top_queries[:limit]]
+    unique_users = [q[1] for q in top_queries[:limit]]
 
-        // Store original data
-        let originalData = null;
-
-        // Wait for Plotly to render
-        const checkPlotly = setInterval(() => {{
-            if (typeof Plotly !== 'undefined' && chartDiv.data) {{
-                clearInterval(checkPlotly);
-                originalData = JSON.parse(JSON.stringify(chartDiv.data[0]));
-
-                searchInput.addEventListener('input', function() {{
-                    const searchTerm = this.value.toLowerCase().trim();
-
-                    if (!searchTerm) {{
-                        // Reset to original
-                        Plotly.restyle(chartDiv, {{
-                            'y': [originalData.y],
-                            'x': [originalData.x],
-                            'customdata': [originalData.customdata]
-                        }}, 0);
-                        infoDiv.textContent = `Showing all ${{originalData.y.length}} results`;
-                        return;
-                    }}
-
-                    // Filter data
-                    const filteredY = [];
-                    const filteredX = [];
-                    const filteredCustomdata = [];
-
-                    for (let i = 0; i < originalData.y.length; i++) {{
-                        const query = originalData.y[i].toLowerCase();
-                        if (query.includes(searchTerm)) {{
-                            filteredY.push(originalData.y[i]);
-                            filteredX.push(originalData.x[i]);
-                            filteredCustomdata.push(originalData.customdata[i]);
-                        }}
-                    }}
-
-                    // Update chart
-                    if (filteredY.length > 0) {{
-                        Plotly.restyle(chartDiv, {{
-                            'y': [filteredY],
-                            'x': [filteredX],
-                            'customdata': [filteredCustomdata]
-                        }}, 0);
-                        infoDiv.textContent = `Showing ${{filteredY.length}} of ${{originalData.y.length}} results`;
-                    }} else {{
-                        Plotly.restyle(chartDiv, {{
-                            'y': [['No results found']],
-                            'x': [[0]],
-                            'customdata': [['No results']]
-                        }}, 0);
-                        infoDiv.textContent = 'No results found';
-                    }}
-                }});
-            }}
-        }}, 100);
-    }})();
-    </script>
-    <style>
-        .searchable-chart-container {{
-            margin: 20px 0;
-        }}
-        .search-box-wrapper {{
-            background: #f5f5f5;
-            padding: 15px;
-            border-radius: 4px;
-            margin-bottom: 15px;
-        }}
-        .chart-search-input {{
-            width: 100%;
-            padding: 12px 15px;
-            font-size: 16px;
-            border: 2px solid #333;
-            border-radius: 4px;
-            box-sizing: border-box;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
-        }}
-        .chart-search-input:focus {{
-            outline: none;
-            border-color: #000;
-            background: #fff;
-        }}
-        .search-info {{
-            margin-top: 8px;
-            font-size: 14px;
-            color: #666;
-            font-style: italic;
-        }}
-        .scrollable-chart {{
-            max-height: 800px;
-            overflow-y: auto;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            background: white;
-        }}
-    </style>
-    '''
-
-
-def create_top_queries_chart(top_queries: List[tuple]) -> go.Figure:
-    """Create interactive, searchable bar chart of top queries (5+ users)"""
-    # Don't truncate - show all queries with 5+ users
-    queries = [q[0] for q in top_queries]
-    unique_users = [q[1] for q in top_queries]
-
-    # Calculate dynamic height based on number of queries (20px per query, min 800px)
-    chart_height = max(800, len(queries) * 20)
+    # Fixed reasonable height for performance
+    chart_height = 800
 
     fig = go.Figure(data=[
         go.Bar(
@@ -610,8 +489,10 @@ def create_top_queries_chart(top_queries: List[tuple]) -> go.Figure:
         )
     ])
 
+    title_text = f'Top {limit:,} Queries (of {total_count:,} total with 5+ users)'
+
     fig.update_layout(
-        title=f'Top Queries with 5+ Unique Users ({len(queries):,} queries)',
+        title=title_text,
         xaxis_title='Number of Unique Users',
         yaxis_title='Query',
         height=chart_height,
@@ -625,6 +506,343 @@ def create_top_queries_chart(top_queries: List[tuple]) -> go.Figure:
         )
     )
     return fig
+
+
+def create_queries_data_table(top_queries: List[tuple]) -> str:
+    """Create a lightweight, searchable HTML table for all queries.
+
+    Uses a simple HTML table with CSS for virtual scrolling and JavaScript
+    for client-side search/filter. Uses a compact binary-like format to reduce size.
+
+    Args:
+        top_queries: List of (query, unique_users, total_searches) tuples
+
+    Returns:
+        HTML string with interactive table and CSV download link
+    """
+    total_count = len(top_queries)
+
+    # Generate CSV data as base64 for download link
+    import csv
+    import io
+    import base64
+    import gzip
+
+    csv_buffer = io.StringIO()
+    writer = csv.writer(csv_buffer)
+    writer.writerow(['Rank', 'Query', 'Unique Users', 'Total Searches'])
+    for i, (query, users, searches) in enumerate(top_queries, 1):
+        writer.writerow([i, query, users, searches])
+
+    csv_data = csv_buffer.getvalue()
+    # Gzip compress for smaller download
+    csv_gzipped = gzip.compress(csv_data.encode('utf-8'))
+    csv_base64 = base64.b64encode(csv_gzipped).decode('utf-8')
+
+    # Generate table rows (limit to first 200 for initial render)
+    initial_limit = min(200, total_count)
+    initial_rows = []
+    for i, (query, users, searches) in enumerate(top_queries[:initial_limit]):
+        # Escape HTML in query text
+        query_escaped = query.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        initial_rows.append(f'''
+            <tr data-rank="{i+1}" data-query="{query.lower()}" data-users="{users}">
+                <td class="rank-col">{i+1}</td>
+                <td class="query-col">{query_escaped}</td>
+                <td class="users-col">{users:,}</td>
+                <td class="searches-col">{searches:,}</td>
+            </tr>
+        ''')
+
+    initial_rows_html = '\n'.join(initial_rows)
+
+    # For remaining data, use a very compact format: [rank, query, users, searches]
+    # Only store data if there's more than initial_limit
+    if total_count > initial_limit:
+        # Use array format instead of objects to reduce size
+        remaining_data = []
+        for i, (query, users, searches) in enumerate(top_queries[initial_limit:], start=initial_limit):
+            remaining_data.append([i + 1, query, users, searches])
+
+        import json
+        remaining_json = json.dumps(remaining_data)
+    else:
+        remaining_json = "[]"
+
+    note_text = "Note: Initially showing top 200 queries. Scroll down or search to load more." if total_count > initial_limit else ""
+
+    return f'''
+    <div class="queries-table-container">
+        <div class="table-header">
+            <h3>Complete Query Dataset ({total_count:,} queries)</h3>
+            <div class="table-controls">
+                <input
+                    type="text"
+                    id="table_search"
+                    class="table-search-input"
+                    placeholder="Search queries..."
+                    autocomplete="off"
+                />
+                <button
+                    onclick="window.downloadQueriesCSV()"
+                    class="download-btn"
+                >
+                    Download CSV
+                </button>
+            </div>
+            <div class="search-results" id="search_results">
+                Showing top {initial_limit:,} of {total_count:,} queries. {note_text}
+            </div>
+        </div>
+
+        <div class="table-scroll-container">
+            <table class="queries-table" id="queries_table">
+                <thead>
+                    <tr>
+                        <th class="rank-col">Rank</th>
+                        <th class="query-col">Query</th>
+                        <th class="users-col">Unique Users</th>
+                        <th class="searches-col">Total Searches</th>
+                    </tr>
+                </thead>
+                <tbody id="table_body">
+                    {initial_rows_html}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+    (function() {{
+        const searchInput = document.getElementById('table_search');
+        const tableBody = document.getElementById('table_body');
+        const resultsDiv = document.getElementById('search_results');
+        const scrollContainer = document.querySelector('.table-scroll-container');
+
+        // Store remaining data (compact array format: [rank, query, users, searches])
+        const remainingData = {remaining_json};
+        let allLoaded = {str(total_count <= initial_limit).lower()};
+        let currentFilter = '';
+
+        // CSV download function
+        window.downloadQueriesCSV = function() {{
+            // Decompress base64 gzipped CSV
+            const base64 = '{csv_base64}';
+            const binary = atob(base64);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) {{
+                bytes[i] = binary.charCodeAt(i);
+            }}
+            const decompressed = pako.inflate(bytes, {{ to: 'string' }});
+
+            const blob = new Blob([decompressed], {{ type: 'text/csv' }});
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'top_queries.csv';
+            a.click();
+            window.URL.revokeObjectURL(url);
+        }};
+
+        // Lazy load remaining rows on scroll
+        scrollContainer.addEventListener('scroll', function() {{
+            if (allLoaded || currentFilter) return;
+
+            const scrollPercent = (scrollContainer.scrollTop + scrollContainer.clientHeight) /
+                                scrollContainer.scrollHeight;
+
+            if (scrollPercent > 0.7) {{
+                loadRemainingRows();
+            }}
+        }});
+
+        function loadRemainingRows() {{
+            if (allLoaded || remainingData.length === 0) return;
+
+            console.log('Loading remaining {{0}} rows...'.replace('{{0}}', remainingData.length));
+            const fragment = document.createDocumentFragment();
+
+            // Process in batches for better performance
+            const batchSize = 500;
+            for (let i = 0; i < remainingData.length; i += batchSize) {{
+                const batch = remainingData.slice(i, Math.min(i + batchSize, remainingData.length));
+                batch.forEach(item => {{
+                    const [rank, query, users, searches] = item;
+                    const tr = document.createElement('tr');
+                    tr.setAttribute('data-rank', rank);
+                    tr.setAttribute('data-query', query.toLowerCase());
+                    tr.setAttribute('data-users', users);
+
+                    const queryEscaped = query.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                    tr.innerHTML = `
+                        <td class="rank-col">${{rank}}</td>
+                        <td class="query-col">${{queryEscaped}}</td>
+                        <td class="users-col">${{users.toLocaleString()}}</td>
+                        <td class="searches-col">${{searches.toLocaleString()}}</td>
+                    `;
+                    fragment.appendChild(tr);
+                }});
+            }}
+
+            tableBody.appendChild(fragment);
+            allLoaded = true;
+            resultsDiv.textContent = 'Showing all {total_count:,} queries';
+            console.log('All {total_count:,} rows loaded');
+        }}
+
+        // Search functionality
+        searchInput.addEventListener('input', function() {{
+            const searchTerm = this.value.toLowerCase().trim();
+            currentFilter = searchTerm;
+
+            // Load all data if searching
+            if (searchTerm && !allLoaded) {{
+                loadRemainingRows();
+            }}
+
+            const rows = tableBody.querySelectorAll('tr');
+            let visibleCount = 0;
+
+            rows.forEach(row => {{
+                const query = row.getAttribute('data-query');
+                if (!searchTerm || query.includes(searchTerm)) {{
+                    row.style.display = '';
+                    visibleCount++;
+                }} else {{
+                    row.style.display = 'none';
+                }}
+            }});
+
+            if (searchTerm) {{
+                resultsDiv.textContent = `Showing ${{visibleCount.toLocaleString()}} of {total_count:,} queries`;
+            }} else if (allLoaded) {{
+                resultsDiv.textContent = `Showing all {total_count:,} queries`;
+            }} else {{
+                resultsDiv.textContent = `Showing top {initial_limit:,} of {total_count:,} queries`;
+            }}
+        }});
+    }})();
+    </script>
+    <!-- Include pako for gzip decompression -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
+
+    <style>
+        .queries-table-container {{
+            margin: 30px 0;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            background: white;
+        }}
+
+        .table-header {{
+            padding: 20px;
+            background: #f5f5f5;
+            border-bottom: 1px solid #ddd;
+        }}
+
+        .table-header h3 {{
+            margin: 0 0 15px 0;
+            color: #333;
+            font-size: 18px;
+        }}
+
+        .table-controls {{
+            display: flex;
+            gap: 10px;
+            margin-bottom: 10px;
+        }}
+
+        .table-search-input {{
+            flex: 1;
+            padding: 10px 15px;
+            font-size: 15px;
+            border: 2px solid #333;
+            border-radius: 4px;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+        }}
+
+        .table-search-input:focus {{
+            outline: none;
+            border-color: #000;
+            background: #fff;
+        }}
+
+        .download-btn {{
+            padding: 10px 20px;
+            background: #333;
+            color: white;
+            text-decoration: none;
+            border-radius: 4px;
+            font-weight: 500;
+            white-space: nowrap;
+            font-size: 14px;
+        }}
+
+        .download-btn:hover {{
+            background: #000;
+        }}
+
+        .search-results {{
+            font-size: 14px;
+            color: #666;
+            font-style: italic;
+        }}
+
+        .table-scroll-container {{
+            max-height: 600px;
+            overflow-y: auto;
+            position: relative;
+        }}
+
+        .queries-table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 14px;
+        }}
+
+        .queries-table thead {{
+            position: sticky;
+            top: 0;
+            background: white;
+            z-index: 10;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+
+        .queries-table th {{
+            padding: 12px 15px;
+            text-align: left;
+            font-weight: 600;
+            color: #333;
+            border-bottom: 2px solid #333;
+        }}
+
+        .queries-table td {{
+            padding: 10px 15px;
+            border-bottom: 1px solid #eee;
+        }}
+
+        .queries-table tbody tr:hover {{
+            background: #f9f9f9;
+        }}
+
+        .rank-col {{
+            width: 80px;
+            text-align: right;
+            color: #999;
+        }}
+
+        .query-col {{
+            min-width: 300px;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+        }}
+
+        .users-col, .searches-col {{
+            width: 120px;
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+        }}
+    </style>
+    '''
 
 
 def create_query_length_chart(df: pd.DataFrame) -> go.Figure:
@@ -804,9 +1022,9 @@ def generate_all_time_page(conn) -> str:
     if article_content:
         print("  Using article mode for all-time page")
         sections = parse_article_sections(article_content)
-        html = generate_article_html_with_jekyll(stats, figures, sections)
+        html = generate_article_html_with_jekyll(stats, figures, sections, top_queries_data=top_queries)
     else:
-        html = generate_period_html(stats, figures, 'all', None)
+        html = generate_period_html(stats, figures, 'all', None, top_queries_data=top_queries)
 
     output_file = "docs/index.html"
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
@@ -847,7 +1065,7 @@ def generate_period_page(conn, period_type: str, period_info: Dict) -> Optional[
     }
 
     # Generate HTML
-    html = generate_period_html(stats, figures, period_type, period_info)
+    html = generate_period_html(stats, figures, period_type, period_info, top_queries_data=top_queries)
 
     # Determine output path
     if period_type == 'week':
@@ -864,16 +1082,18 @@ def generate_period_page(conn, period_type: str, period_info: Dict) -> Optional[
 
 
 def generate_article_html_with_jekyll(stats: Dict, figures: Dict[str, go.Figure],
-                                      sections: List[Dict[str, Any]]) -> str:
+                                      sections: List[Dict[str, Any]], top_queries_data: List[tuple] = None) -> str:
     """Generate article mode HTML with Jekyll front matter"""
     front_matter = "---\nlayout: dashboard\nperiod: all\ntitle: All Time Statistics\n---\n\n"
 
     chart_html = {}
     for name, fig in figures.items():
         if fig is not None:
-            # Add search wrapper for top_queries chart
-            if name == 'top_queries':
-                chart_html[name] = wrap_chart_with_search(fig, chart_id='top_queries_chart')
+            # For top_queries, combine chart + table
+            if name == 'top_queries' and top_queries_data:
+                chart_part = fig.to_html(full_html=False, include_plotlyjs='cdn')
+                table_part = create_queries_data_table(top_queries_data)
+                chart_html[name] = f'{chart_part}\n{table_part}'
             else:
                 chart_html[name] = fig.to_html(full_html=False, include_plotlyjs='cdn')
         else:
@@ -932,7 +1152,8 @@ def generate_article_html_with_jekyll(stats: Dict, figures: Dict[str, go.Figure]
 
 
 def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
-                         period_type: str, period_info: Optional[Dict] = None) -> str:
+                         period_type: str, period_info: Optional[Dict] = None,
+                         top_queries_data: List[tuple] = None) -> str:
     """Generate HTML for a period page with Jekyll front matter"""
     if period_type == 'all':
         front_matter = "---\nlayout: dashboard\nperiod: all\ntitle: All Time Statistics\n---\n\n"
@@ -947,9 +1168,11 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
     chart_html = {}
     for name, fig in figures.items():
         if fig is not None:
-            # Add search wrapper for top_queries chart
-            if name == 'top_queries':
-                chart_html[name] = wrap_chart_with_search(fig, chart_id=f'top_queries_chart_{period_type}')
+            # For top_queries, combine chart + table
+            if name == 'top_queries' and top_queries_data:
+                chart_part = fig.to_html(full_html=False, include_plotlyjs='cdn')
+                table_part = create_queries_data_table(top_queries_data)
+                chart_html[name] = f'{chart_part}\n{table_part}'
             else:
                 chart_html[name] = fig.to_html(full_html=False, include_plotlyjs='cdn')
         else:
