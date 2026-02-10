@@ -461,12 +461,12 @@ def create_daily_unique_users_chart(df: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def create_top_queries_chart(top_queries: List[tuple], limit: int = 1000) -> go.Figure:
+def create_top_queries_chart(top_queries: List[tuple], limit: int = 100) -> go.Figure:
     """Create interactive bar chart of top N queries for performance.
 
     Args:
         top_queries: List of (query, unique_users, total_searches) tuples
-        limit: Maximum number of queries to show in chart (default 1000)
+        limit: Maximum number of queries to show in chart (default 100)
 
     Returns:
         Plotly figure with top N queries
@@ -476,7 +476,7 @@ def create_top_queries_chart(top_queries: List[tuple], limit: int = 1000) -> go.
     unique_users = [q[1] for q in top_queries[:limit]]
 
     # Fixed reasonable height for performance
-    chart_height = 800
+    chart_height = 600
 
     fig = go.Figure(data=[
         go.Bar(
@@ -509,10 +509,10 @@ def create_top_queries_chart(top_queries: List[tuple], limit: int = 1000) -> go.
 
 
 def create_queries_data_table(top_queries: List[tuple]) -> str:
-    """Create a lightweight, searchable HTML table for all queries.
+    """Create a lightweight, searchable HTML table for all queries using Clusterize.js.
 
-    Uses a simple HTML table with CSS for virtual scrolling and JavaScript
-    for client-side search/filter. Uses a compact binary-like format to reduce size.
+    Uses Clusterize.js for virtual scrolling (only renders visible rows),
+    enabling smooth performance with 400k+ rows. Data stored in compact array format.
 
     Args:
         top_queries: List of (query, unique_users, total_searches) tuples
@@ -539,37 +539,14 @@ def create_queries_data_table(top_queries: List[tuple]) -> str:
     csv_gzipped = gzip.compress(csv_data.encode('utf-8'))
     csv_base64 = base64.b64encode(csv_gzipped).decode('utf-8')
 
-    # Generate table rows (limit to first 200 for initial render)
-    initial_limit = min(200, total_count)
-    initial_rows = []
-    for i, (query, users, searches) in enumerate(top_queries[:initial_limit]):
-        # Escape HTML in query text
-        query_escaped = query.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-        initial_rows.append(f'''
-            <tr data-rank="{i+1}" data-query="{query.lower()}" data-users="{users}">
-                <td class="rank-col">{i+1}</td>
-                <td class="query-col">{query_escaped}</td>
-                <td class="users-col">{users:,}</td>
-                <td class="searches-col">{searches:,}</td>
-            </tr>
-        ''')
+    # Store ALL data in compact array format: [rank, query, users, searches]
+    # Clusterize.js will handle virtual rendering
+    import json
+    all_data = []
+    for i, (query, users, searches) in enumerate(top_queries, 1):
+        all_data.append([i, query, users, searches])
 
-    initial_rows_html = '\n'.join(initial_rows)
-
-    # For remaining data, use a very compact format: [rank, query, users, searches]
-    # Only store data if there's more than initial_limit
-    if total_count > initial_limit:
-        # Use array format instead of objects to reduce size
-        remaining_data = []
-        for i, (query, users, searches) in enumerate(top_queries[initial_limit:], start=initial_limit):
-            remaining_data.append([i + 1, query, users, searches])
-
-        import json
-        remaining_json = json.dumps(remaining_data)
-    else:
-        remaining_json = "[]"
-
-    note_text = "Note: Initially showing top 200 queries. Scroll down or search to load more." if total_count > initial_limit else ""
+    all_data_json = json.dumps(all_data)
 
     return f'''
     <div class="queries-table-container">
@@ -591,12 +568,12 @@ def create_queries_data_table(top_queries: List[tuple]) -> str:
                 </button>
             </div>
             <div class="search-results" id="search_results">
-                Showing top {initial_limit:,} of {total_count:,} queries. {note_text}
+                Showing all {total_count:,} queries (virtual scrolling enabled)
             </div>
         </div>
 
-        <div class="table-scroll-container">
-            <table class="queries-table" id="queries_table">
+        <div id="scroll_area" class="table-scroll-container">
+            <table class="queries-table">
                 <thead>
                     <tr>
                         <th class="rank-col">Rank</th>
@@ -605,28 +582,31 @@ def create_queries_data_table(top_queries: List[tuple]) -> str:
                         <th class="searches-col">Total Searches</th>
                     </tr>
                 </thead>
-                <tbody id="table_body">
-                    {initial_rows_html}
+                <tbody id="content_area">
+                    <!-- Clusterize.js will populate this -->
                 </tbody>
             </table>
         </div>
     </div>
 
+    <!-- Include Clusterize.js (2.3KB gzipped) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/clusterize.js/0.19.0/clusterize.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/clusterize.js/0.19.0/clusterize.min.css">
+
+    <!-- Include pako for gzip decompression -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
+
     <script>
     (function() {{
         const searchInput = document.getElementById('table_search');
-        const tableBody = document.getElementById('table_body');
         const resultsDiv = document.getElementById('search_results');
-        const scrollContainer = document.querySelector('.table-scroll-container');
 
-        // Store remaining data (compact array format: [rank, query, users, searches])
-        const remainingData = {remaining_json};
-        let allLoaded = {str(total_count <= initial_limit).lower()};
-        let currentFilter = '';
+        // Store all data (compact array format: [rank, query, users, searches])
+        const allData = {all_data_json};
+        let filteredData = allData;
 
         // CSV download function
         window.downloadQueriesCSV = function() {{
-            // Decompress base64 gzipped CSV
             const base64 = '{csv_base64}';
             const binary = atob(base64);
             const bytes = new Uint8Array(binary.length);
@@ -644,87 +624,63 @@ def create_queries_data_table(top_queries: List[tuple]) -> str:
             window.URL.revokeObjectURL(url);
         }};
 
-        // Lazy load remaining rows on scroll
-        scrollContainer.addEventListener('scroll', function() {{
-            if (allLoaded || currentFilter) return;
+        // Convert data to HTML rows for Clusterize.js
+        function dataToRows(data) {{
+            return data.map(function(item) {{
+                const rank = item[0];
+                const query = item[1];
+                const users = item[2];
+                const searches = item[3];
 
-            const scrollPercent = (scrollContainer.scrollTop + scrollContainer.clientHeight) /
-                                scrollContainer.scrollHeight;
+                // Escape HTML in query text
+                const queryEscaped = query
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;');
 
-            if (scrollPercent > 0.7) {{
-                loadRemainingRows();
-            }}
+                return '<tr>' +
+                    '<td class="rank-col">' + rank + '</td>' +
+                    '<td class="query-col">' + queryEscaped + '</td>' +
+                    '<td class="users-col">' + users.toLocaleString() + '</td>' +
+                    '<td class="searches-col">' + searches.toLocaleString() + '</td>' +
+                    '</tr>';
+            }});
+        }}
+
+        // Initialize Clusterize.js with all data
+        const clusterize = new Clusterize({{
+            rows: dataToRows(allData),
+            scrollId: 'scroll_area',
+            contentId: 'content_area',
+            rows_in_block: 50,  // Render 50 rows per block for smooth scrolling
+            blocks_in_cluster: 4  // Keep 4 blocks (200 rows) in DOM at once
         }});
 
-        function loadRemainingRows() {{
-            if (allLoaded || remainingData.length === 0) return;
-
-            console.log('Loading remaining {{0}} rows...'.replace('{{0}}', remainingData.length));
-            const fragment = document.createDocumentFragment();
-
-            // Process in batches for better performance
-            const batchSize = 500;
-            for (let i = 0; i < remainingData.length; i += batchSize) {{
-                const batch = remainingData.slice(i, Math.min(i + batchSize, remainingData.length));
-                batch.forEach(item => {{
-                    const [rank, query, users, searches] = item;
-                    const tr = document.createElement('tr');
-                    tr.setAttribute('data-rank', rank);
-                    tr.setAttribute('data-query', query.toLowerCase());
-                    tr.setAttribute('data-users', users);
-
-                    const queryEscaped = query.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-                    tr.innerHTML = `
-                        <td class="rank-col">${{rank}}</td>
-                        <td class="query-col">${{queryEscaped}}</td>
-                        <td class="users-col">${{users.toLocaleString()}}</td>
-                        <td class="searches-col">${{searches.toLocaleString()}}</td>
-                    `;
-                    fragment.appendChild(tr);
-                }});
-            }}
-
-            tableBody.appendChild(fragment);
-            allLoaded = true;
-            resultsDiv.textContent = 'Showing all {total_count:,} queries';
-            console.log('All {total_count:,} rows loaded');
-        }}
+        console.log('Clusterize.js initialized with {total_count:,} queries');
 
         // Search functionality
         searchInput.addEventListener('input', function() {{
             const searchTerm = this.value.toLowerCase().trim();
-            currentFilter = searchTerm;
 
-            // Load all data if searching
-            if (searchTerm && !allLoaded) {{
-                loadRemainingRows();
+            if (!searchTerm) {{
+                // No filter - show all data
+                filteredData = allData;
+                clusterize.update(dataToRows(filteredData));
+                resultsDiv.textContent = 'Showing all {total_count:,} queries (virtual scrolling enabled)';
+                return;
             }}
 
-            const rows = tableBody.querySelectorAll('tr');
-            let visibleCount = 0;
-
-            rows.forEach(row => {{
-                const query = row.getAttribute('data-query');
-                if (!searchTerm || query.includes(searchTerm)) {{
-                    row.style.display = '';
-                    visibleCount++;
-                }} else {{
-                    row.style.display = 'none';
-                }}
+            // Filter data based on search term
+            filteredData = allData.filter(function(item) {{
+                const query = item[1].toLowerCase();
+                return query.includes(searchTerm);
             }});
 
-            if (searchTerm) {{
-                resultsDiv.textContent = `Showing ${{visibleCount.toLocaleString()}} of {total_count:,} queries`;
-            }} else if (allLoaded) {{
-                resultsDiv.textContent = `Showing all {total_count:,} queries`;
-            }} else {{
-                resultsDiv.textContent = `Showing top {initial_limit:,} of {total_count:,} queries`;
-            }}
+            clusterize.update(dataToRows(filteredData));
+            resultsDiv.textContent = 'Showing ' + filteredData.length.toLocaleString() + ' of {total_count:,} queries';
         }});
     }})();
     </script>
-    <!-- Include pako for gzip decompression -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
 
     <style>
         .queries-table-container {{
@@ -776,6 +732,8 @@ def create_queries_data_table(top_queries: List[tuple]) -> str:
             font-weight: 500;
             white-space: nowrap;
             font-size: 14px;
+            border: none;
+            cursor: pointer;
         }}
 
         .download-btn:hover {{
@@ -840,6 +798,15 @@ def create_queries_data_table(top_queries: List[tuple]) -> str:
             width: 120px;
             text-align: right;
             font-variant-numeric: tabular-nums;
+        }}
+
+        /* Clusterize.js adjustments */
+        .clusterize-scroll {{
+            max-height: 600px;
+        }}
+
+        .clusterize-content {{
+            /* Clusterize.js manages this */
         }}
     </style>
     '''
