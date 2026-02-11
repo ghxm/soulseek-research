@@ -346,15 +346,44 @@ def get_period_stats(conn, start_date, end_date) -> Dict[str, Any]:
 
 
 def get_period_top_queries(conn, start_date, end_date) -> List[tuple]:
-    """Get top queries - uses global mv_top_queries (approximation for period)"""
-    # Use global top queries - period-specific would require additional materialized views
-    return get_top_queries(conn)
+    """Get top queries for a specific period (uses timestamp index for performance)"""
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT
+            LOWER(TRIM(query)) as query_normalized,
+            COUNT(DISTINCT username) as unique_users,
+            COUNT(*) as total_searches
+        FROM searches
+        WHERE timestamp >= %s AND timestamp <= %s
+        GROUP BY LOWER(TRIM(query))
+        HAVING COUNT(DISTINCT username) >= 5
+        ORDER BY unique_users DESC, total_searches DESC
+    """, (start_date, end_date))
+    rows = cursor.fetchall()
+    cursor.close()
+    return rows
 
 
 def get_period_query_length_dist(conn, start_date, end_date) -> pd.DataFrame:
-    """Get query length distribution - uses global mv_query_length_dist (approximation)"""
-    # Use global distribution - period-specific would require additional materialized views
-    return get_query_length_distribution(conn)
+    """Get query length distribution for a specific period"""
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT
+            LENGTH(query) - LENGTH(REPLACE(query, ' ', '')) + 1 as query_length,
+            COUNT(DISTINCT LOWER(TRIM(query))) as count
+        FROM searches
+        WHERE timestamp >= %s AND timestamp <= %s
+          AND LENGTH(query) - LENGTH(REPLACE(query, ' ', '')) + 1 <= 100
+        GROUP BY query_length
+        ORDER BY query_length
+    """, (start_date, end_date))
+    rows = cursor.fetchall()
+    cursor.close()
+
+    if not rows:
+        return pd.DataFrame(columns=['query_length', 'count'])
+
+    return pd.DataFrame(rows, columns=['query_length', 'count'])
 
 
 def load_article_content(article_path: str = 'docs/article.md') -> Optional[str]:
