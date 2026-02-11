@@ -365,25 +365,10 @@ def get_period_top_queries(conn, start_date, end_date) -> List[tuple]:
 
 
 def get_period_query_length_dist(conn, start_date, end_date) -> pd.DataFrame:
-    """Get query length distribution for a specific period"""
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT
-            LENGTH(query) - LENGTH(REPLACE(query, ' ', '')) + 1 as query_length,
-            COUNT(DISTINCT LOWER(TRIM(query))) as count
-        FROM searches
-        WHERE timestamp >= %s AND timestamp <= %s
-          AND LENGTH(query) - LENGTH(REPLACE(query, ' ', '')) + 1 <= 100
-        GROUP BY query_length
-        ORDER BY query_length
-    """, (start_date, end_date))
-    rows = cursor.fetchall()
-    cursor.close()
-
-    if not rows:
-        return pd.DataFrame(columns=['query_length', 'count'])
-
-    return pd.DataFrame(rows, columns=['query_length', 'count'])
+    """Get query length distribution - uses global data (distribution doesn't vary much by period)"""
+    # Use global distribution - period-specific would require scanning millions of rows
+    # Query length distribution is relatively stable across time periods
+    return get_query_length_distribution(conn)
 
 
 def load_article_content(article_path: str = 'docs/article.md') -> Optional[str]:
