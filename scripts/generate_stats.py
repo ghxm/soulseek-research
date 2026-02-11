@@ -504,8 +504,8 @@ def create_top_queries_chart(top_queries: List[tuple], limit: int = 100) -> go.F
     queries = [q[0] for q in top_queries[:limit]]
     unique_users = [q[1] for q in top_queries[:limit]]
 
-    # Fixed reasonable height for performance
-    chart_height = 600
+    # Fixed reasonable height for better readability
+    chart_height = 2500  # 25px per query for comfortable spacing
 
     fig = go.Figure(data=[
         go.Bar(
