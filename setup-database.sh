@@ -68,6 +68,36 @@ CREATE TABLE IF NOT EXISTS stats_cumulative (
 
 -- Initialize cumulative stats row if not exists
 INSERT INTO stats_cumulative (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+
+-- Period-specific precomputed statistics tables
+-- These store pre-aggregated top queries and query length distributions
+-- for each week/month to enable fast period page generation
+
+CREATE TABLE IF NOT EXISTS period_top_queries (
+    id SERIAL PRIMARY KEY,
+    period_type VARCHAR(10) NOT NULL,  -- 'week' or 'month'
+    period_id VARCHAR(20) NOT NULL,     -- '2026-01' or '2026-W04'
+    query_normalized TEXT NOT NULL,
+    unique_users INTEGER NOT NULL,
+    total_searches INTEGER NOT NULL,
+    rank INTEGER NOT NULL,
+    UNIQUE(period_type, period_id, query_normalized)
+);
+
+CREATE INDEX IF NOT EXISTS idx_period_top_queries_lookup
+ON period_top_queries(period_type, period_id, rank);
+
+CREATE TABLE IF NOT EXISTS period_query_length_dist (
+    id SERIAL PRIMARY KEY,
+    period_type VARCHAR(10) NOT NULL,  -- 'week' or 'month'
+    period_id VARCHAR(20) NOT NULL,     -- '2026-01' or '2026-W04'
+    query_length INTEGER NOT NULL,
+    unique_query_count INTEGER NOT NULL,
+    UNIQUE(period_type, period_id, query_length)
+);
+
+CREATE INDEX IF NOT EXISTS idx_period_ql_dist_lookup
+ON period_query_length_dist(period_type, period_id);
 "
 
 # Create materialized views for fast stats generation
@@ -197,17 +227,52 @@ REFRESH_SCRIPT
 
 chmod +x /usr/local/bin/refresh-views.sh
 
+# Create period stats refresh script
+cat > /usr/local/bin/refresh-period-stats.sh << 'PERIOD_STATS_SCRIPT'
+#!/bin/bash
+# Refresh period-specific precomputed statistics
+# Runs daily at 4:30 AM UTC (after view refresh, before GitHub Actions at 5 AM)
+
+cd /opt/soulseek-research
+
+DB_URL="postgresql://soulseek:${db_password}@localhost:5432/soulseek"
+
+# Run period stats refresh using Docker
+docker run --rm \
+  --network=host \
+  -e DATABASE_URL="$DB_URL" \
+  soulseek-research:latest \
+  uv run python /app/scripts/refresh_period_stats.py
+
+echo "$(date): Period stats refreshed" >> /var/log/soulseek-period-stats.log
+PERIOD_STATS_SCRIPT
+
+chmod +x /usr/local/bin/refresh-period-stats.sh
+
 # Set up cron jobs:
 # - Weekly archive: Sunday 2 AM
-# - Daily view refresh: 4 AM (before GitHub Actions at 5 AM)
+# - Daily view refresh: 4 AM (before period stats)
+# - Daily period stats refresh: 4:30 AM (after views, before GitHub Actions at 5 AM)
 (
 echo "0 2 * * 0 /usr/local/bin/weekly-archive.sh"
 echo "0 4 * * * /usr/local/bin/refresh-views.sh"
+echo "30 4 * * * /usr/local/bin/refresh-period-stats.sh"
 ) | crontab -
 
 # View refresh log rotation
 cat > /etc/logrotate.d/soulseek-views << EOF
 /var/log/soulseek-views.log {
+    rotate 30
+    daily
+    compress
+    missingok
+    delaycompress
+}
+EOF
+
+# Period stats log rotation
+cat > /etc/logrotate.d/soulseek-period-stats << EOF
+/var/log/soulseek-period-stats.log {
     rotate 30
     daily
     compress

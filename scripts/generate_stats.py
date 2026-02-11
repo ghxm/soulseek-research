@@ -345,30 +345,54 @@ def get_period_stats(conn, start_date, end_date) -> Dict[str, Any]:
     }
 
 
-def get_period_top_queries(conn, start_date, end_date) -> List[tuple]:
-    """Get top queries for a specific period (uses timestamp index for performance)"""
+def get_period_top_queries(conn, period_type: str, period_id: str) -> List[tuple]:
+    """Get top queries for a specific period from precomputed table.
+
+    Args:
+        conn: Database connection
+        period_type: 'week' or 'month'
+        period_id: Period identifier like '2026-01' or '2026-W04'
+
+    Returns:
+        List of (query_normalized, unique_users, total_searches) tuples
+    """
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT
-            LOWER(TRIM(query)) as query_normalized,
-            COUNT(DISTINCT username) as unique_users,
-            COUNT(*) as total_searches
-        FROM searches
-        WHERE timestamp >= %s AND timestamp <= %s
-        GROUP BY LOWER(TRIM(query))
-        HAVING COUNT(DISTINCT username) >= 5
-        ORDER BY unique_users DESC, total_searches DESC
-    """, (start_date, end_date))
+        SELECT query_normalized, unique_users, total_searches
+        FROM period_top_queries
+        WHERE period_type = %s AND period_id = %s
+        ORDER BY rank
+    """, (period_type, period_id))
     rows = cursor.fetchall()
     cursor.close()
     return rows
 
 
-def get_period_query_length_dist(conn, start_date, end_date) -> pd.DataFrame:
-    """Get query length distribution - uses global data (distribution doesn't vary much by period)"""
-    # Use global distribution - period-specific would require scanning millions of rows
-    # Query length distribution is relatively stable across time periods
-    return get_query_length_distribution(conn)
+def get_period_query_length_dist(conn, period_type: str, period_id: str) -> pd.DataFrame:
+    """Get query length distribution for a specific period from precomputed table.
+
+    Args:
+        conn: Database connection
+        period_type: 'week' or 'month'
+        period_id: Period identifier like '2026-01' or '2026-W04'
+
+    Returns:
+        DataFrame with query_length and count columns
+    """
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT query_length, unique_query_count as count
+        FROM period_query_length_dist
+        WHERE period_type = %s AND period_id = %s
+        ORDER BY query_length
+    """, (period_type, period_id))
+    rows = cursor.fetchall()
+    cursor.close()
+
+    if not rows:
+        return pd.DataFrame(columns=['query_length', 'count'])
+
+    return pd.DataFrame(rows, columns=['query_length', 'count'])
 
 
 def load_article_content(article_path: str = 'docs/article.md') -> Optional[str]:
@@ -1019,6 +1043,7 @@ def generate_all_time_page(conn) -> str:
 def generate_period_page(conn, period_type: str, period_info: Dict) -> Optional[str]:
     """Generate a dashboard page for a specific period"""
     period_label = period_info['label']
+    period_id = period_info['id']
     start_date = period_info['start']
     end_date = period_info['end']
 
@@ -1030,11 +1055,11 @@ def generate_period_page(conn, period_type: str, period_info: Dict) -> Optional[
 
     print(f"  Found {stats['total_searches']:,} searches for {period_label}")
 
-    # Get chart data
+    # Get chart data (using precomputed tables for top_queries and query_length_dist)
     daily_stats = get_daily_stats(conn, start_date, end_date)
     daily_unique_users = get_daily_unique_users(conn, start_date, end_date)
-    top_queries = get_period_top_queries(conn, start_date, end_date)
-    query_length_dist = get_period_query_length_dist(conn, start_date, end_date)
+    top_queries = get_period_top_queries(conn, period_type, period_id)
+    query_length_dist = get_period_query_length_dist(conn, period_type, period_id)
 
     # Create figures
     figures = {

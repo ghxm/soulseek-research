@@ -34,12 +34,14 @@ src/soulseek_research/
 ├── __init__.py    # Package exports
 
 scripts/
-├── deploy.sh         # Terraform deployment
-├── destroy.sh        # Infrastructure teardown
-├── monitor.sh        # Live monitoring
-├── test-local.sh     # Local testing
-├── archive.py        # Monthly data archival script
-└── generate_stats.py # Dashboard generation with cumulative stats
+├── deploy.sh               # Terraform deployment
+├── destroy.sh              # Infrastructure teardown
+├── monitor.sh              # Live monitoring
+├── test-local.sh           # Local testing
+├── archive.py              # Monthly data archival script
+├── generate_stats.py       # Dashboard generation with cumulative stats
+├── refresh_views.py        # Refresh materialized views (4 AM daily)
+└── refresh_period_stats.py # Precompute period statistics (4:30 AM daily)
 
 Infrastructure:
 ├── database.yml       # PostgreSQL container
@@ -56,9 +58,26 @@ Infrastructure:
 soulseek.searches:
   id, client_id, timestamp, username, query
 
--- Archive tracking  
+-- Archive tracking
 soulseek.archives:
   id, month, file_path, record_count, file_size, archived_at, deleted
+
+-- Cumulative statistics (archived + live data combined)
+soulseek.stats_cumulative:
+  id, total_searches, total_users, total_queries, total_search_pairs,
+  first_search, last_search, client_totals, last_archive_month, updated_at
+
+-- Materialized views for fast dashboard generation (live data only)
+soulseek.mv_daily_stats:        -- Daily aggregates by client
+soulseek.mv_top_queries:        -- Global top queries (5+ users)
+soulseek.mv_query_length_dist:  -- Query word count distribution
+soulseek.mv_summary_stats:      -- Overall summary statistics
+
+-- Period-specific precomputed tables (solves timeout issue)
+soulseek.period_top_queries:
+  id, period_type, period_id, query_normalized, unique_users, total_searches, rank
+soulseek.period_query_length_dist:
+  id, period_type, period_id, query_length, unique_query_count
 ```
 
 ### Key Design Decisions
@@ -187,6 +206,20 @@ germany,2025-01-01T00:00:01Z,abc123hash,artist name album
 - Plotly range sliders on all time-series charts for interactive filtering
 - GitHub Actions downloads archives via SSH/SCP for stats generation
 
+**Period-Specific Statistics** (`scripts/refresh_period_stats.py`):
+- Precomputes top queries and query length distributions for each week/month
+- Stores results in `period_top_queries` and `period_query_length_dist` tables
+- Runs daily at 4:30 AM (after materialized view refresh, before dashboard generation)
+- Solves timeout issue: period pages now load in seconds instead of 9+ minutes
+- CRITICAL: Period pages show ONLY period-specific data (never global data)
+- Automatic updates via cron maintain fresh statistics
+
+**Automated Refresh Schedule** (all times UTC):
+- **2:00 AM Sunday**: Weekly archival (`/usr/local/bin/weekly-archive.sh`)
+- **4:00 AM Daily**: Refresh materialized views (`/usr/local/bin/refresh-views.sh`)
+- **4:30 AM Daily**: Refresh period statistics (`/usr/local/bin/refresh-period-stats.sh`)
+- **5:00 AM Daily**: GitHub Actions dashboard generation
+
 **GitHub Secrets Required**:
 - `DB_SERVER_SSH_KEY`: SSH private key for database server access
 - `DB_SERVER_IP`: Database server IP address
@@ -240,6 +273,12 @@ ssh root@$(terraform output -raw database_ip) 'docker exec $(docker-compose -f /
 SELECT client_id, COUNT(*) FROM searches GROUP BY client_id;
 SELECT COUNT(*) FROM searches WHERE timestamp > NOW() - INTERVAL '1 hour';
 SELECT client_id, timestamp, query FROM searches ORDER BY timestamp DESC LIMIT 10;
+
+# Check materialized view refresh status:
+SELECT schemaname, matviewname, last_refresh FROM pg_matviews WHERE schemaname = 'public';
+
+# Check period statistics coverage:
+SELECT period_type, COUNT(*) as periods, MIN(period_id), MAX(period_id) FROM period_top_queries GROUP BY period_type;
 ```
 
 ### CRITICAL: Terraform Safety
