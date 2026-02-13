@@ -208,6 +208,13 @@ def get_daily_stats(conn, start_date=None, end_date=None) -> pd.DataFrame:
             WHERE date >= %s AND date <= %s
             ORDER BY date, client_id
         """, (start_date.date(), end_date.date()))
+    elif end_date:
+        cursor.execute("""
+            SELECT client_id, date, search_count, unique_users
+            FROM mv_daily_stats
+            WHERE date <= %s
+            ORDER BY date, client_id
+        """, (end_date.date(),))
     else:
         cursor.execute("""
             SELECT client_id, date, search_count, unique_users
@@ -229,7 +236,6 @@ def get_daily_unique_users(conn, start_date=None, end_date=None) -> pd.DataFrame
     cursor = conn.cursor()
 
     if start_date and end_date:
-        # Use mv_daily_stats for fast pre-aggregated results
         cursor.execute("""
             SELECT date, MAX(unique_users) as unique_users
             FROM mv_daily_stats
@@ -237,8 +243,15 @@ def get_daily_unique_users(conn, start_date=None, end_date=None) -> pd.DataFrame
             GROUP BY date
             ORDER BY date
         """, (start_date.date(), end_date.date()))
+    elif end_date:
+        cursor.execute("""
+            SELECT date, MAX(unique_users) as unique_users
+            FROM mv_daily_stats
+            WHERE date <= %s
+            GROUP BY date
+            ORDER BY date
+        """, (end_date.date(),))
     else:
-        # For all-time: use mv_daily_stats (approximation - max across clients per day)
         cursor.execute("""
             SELECT date, MAX(unique_users) as unique_users
             FROM mv_daily_stats
@@ -993,7 +1006,7 @@ def generate_jekyll_data_files(periods: Dict[str, List[Dict]]):
         yaml.dump(weeks_data, f, default_flow_style=False, allow_unicode=True)
 
 
-def generate_all_time_page(conn) -> str:
+def generate_all_time_page(conn, cutoff_date=None) -> str:
     """Generate the all-time dashboard page using cumulative stats + materialized views"""
     print("  Computing all-time statistics from cumulative + live data...")
 
@@ -1006,10 +1019,10 @@ def generate_all_time_page(conn) -> str:
 
     print(f"  Total all-time: {stats['total_searches']:,} searches, {stats['total_users']:,} users")
 
-    # Get chart data from materialized views
+    # Get chart data from materialized views (exclude incomplete current day)
     print("  Loading chart data from materialized views...")
-    daily_stats = get_daily_stats(conn)
-    daily_unique_users = get_daily_unique_users(conn)
+    daily_stats = get_daily_stats(conn, end_date=cutoff_date)
+    daily_unique_users = get_daily_unique_users(conn, end_date=cutoff_date)
     top_queries = get_top_queries(conn)
     query_length_dist = get_query_length_distribution(conn)
 
@@ -1040,12 +1053,15 @@ def generate_all_time_page(conn) -> str:
     return output_file
 
 
-def generate_period_page(conn, period_type: str, period_info: Dict) -> Optional[str]:
+def generate_period_page(conn, period_type: str, period_info: Dict, cutoff_date=None) -> Optional[str]:
     """Generate a dashboard page for a specific period"""
     period_label = period_info['label']
     period_id = period_info['id']
     start_date = period_info['start']
     end_date = period_info['end']
+    # Cap end_date to cutoff to exclude incomplete current day
+    if cutoff_date and end_date > cutoff_date:
+        end_date = cutoff_date
 
     # Get stats for this period
     stats = get_period_stats(conn, start_date, end_date)
@@ -1299,21 +1315,21 @@ def main():
         print("=" * 60)
         print("GENERATING ALL-TIME PAGE")
         print("=" * 60)
-        generate_all_time_page(conn)
+        generate_all_time_page(conn, cutoff_date)
 
         # Generate monthly pages
         for month in periods['months']:
             print("=" * 60)
             print(f"GENERATING MONTHLY PAGE: {month['label']}")
             print("=" * 60)
-            generate_period_page(conn, 'month', month)
+            generate_period_page(conn, 'month', month, cutoff_date)
 
         # Generate weekly pages
         for week in periods['weeks']:
             print("=" * 60)
             print(f"GENERATING WEEKLY PAGE: CW {week['label']}")
             print("=" * 60)
-            generate_period_page(conn, 'week', week)
+            generate_period_page(conn, 'week', week, cutoff_date)
 
         total_pages = 1 + len(periods['months']) + len(periods['weeks'])
         print("\n" + "=" * 60)
