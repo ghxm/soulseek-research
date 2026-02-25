@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Tuple
 
 import psycopg2
+from psycopg2.extras import execute_values
 
 
 def get_db_connection():
@@ -39,7 +40,11 @@ def get_db_connection():
         password=user_pass[1] if len(user_pass) > 1 else '',
         dbname=host_db[1],
         connect_timeout=30,
-        options='-c statement_timeout=3600000'  # 60 min timeout for period processing
+        options='-c statement_timeout=3600000',  # 60 min timeout for period processing
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=5
     )
 
 
@@ -92,39 +97,65 @@ def compute_period_top_queries(conn, period_type: str, period_id: str,
                                 start_date: datetime, end_date: datetime) -> int:
     """Compute top queries for a period and store in period_top_queries table.
 
+    Uses a two-step approach: SELECT aggregation first, then batch INSERT.
+    This avoids holding a long write transaction during the expensive aggregation.
+
     Returns number of queries inserted.
     """
+    # Step 1: Run the expensive aggregation as a read-only query
     cursor = conn.cursor()
+    cursor.execute("""
+        SELECT
+            LOWER(TRIM(query)) as query_normalized,
+            COUNT(DISTINCT username) as unique_users,
+            COUNT(*) as total_searches
+        FROM searches
+        WHERE timestamp >= %s AND timestamp <= %s
+        GROUP BY LOWER(TRIM(query))
+        HAVING COUNT(DISTINCT username) >= 5
+        ORDER BY COUNT(DISTINCT username) DESC, COUNT(*) DESC
+    """, (start_date, end_date))
 
-    # Delete existing data for this period
+    rows = cursor.fetchall()
+    cursor.close()
+
+    if not rows:
+        # Still delete old data even if no new results
+        cursor = conn.cursor()
+        cursor.execute("""
+            DELETE FROM period_top_queries
+            WHERE period_type = %s AND period_id = %s
+        """, (period_type, period_id))
+        conn.commit()
+        cursor.close()
+        return 0
+
+    # Step 2: Delete old data and batch insert new results
+    cursor = conn.cursor()
     cursor.execute("""
         DELETE FROM period_top_queries
         WHERE period_type = %s AND period_id = %s
     """, (period_type, period_id))
 
-    # Compute top queries with ranking
-    cursor.execute("""
-        WITH ranked_queries AS (
-            SELECT
-                LOWER(TRIM(query)) as query_normalized,
-                COUNT(DISTINCT username) as unique_users,
-                COUNT(*) as total_searches,
-                ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT username) DESC, COUNT(*) DESC) as rank
-            FROM searches
-            WHERE timestamp >= %s AND timestamp <= %s
-            GROUP BY LOWER(TRIM(query))
-            HAVING COUNT(DISTINCT username) >= 5
-        )
-        INSERT INTO period_top_queries (period_type, period_id, query_normalized, unique_users, total_searches, rank)
-        SELECT %s, %s, query_normalized, unique_users, total_searches, rank
-        FROM ranked_queries
-    """, (start_date, end_date, period_type, period_id))
+    # Add rank and period info to each row
+    values = [
+        (period_type, period_id, row[0], int(row[1]), int(row[2]), rank)
+        for rank, row in enumerate(rows, 1)
+    ]
 
-    inserted = cursor.rowcount
+    execute_values(
+        cursor,
+        """INSERT INTO period_top_queries
+           (period_type, period_id, query_normalized, unique_users, total_searches, rank)
+           VALUES %s""",
+        values,
+        page_size=5000
+    )
+
     conn.commit()
     cursor.close()
 
-    return inserted
+    return len(values)
 
 
 def compute_period_query_length_dist(conn, period_type: str, period_id: str,
@@ -133,20 +164,10 @@ def compute_period_query_length_dist(conn, period_type: str, period_id: str,
 
     Returns number of rows inserted.
     """
+    # Step 1: Run aggregation query
     cursor = conn.cursor()
-
-    # Delete existing data for this period
     cursor.execute("""
-        DELETE FROM period_query_length_dist
-        WHERE period_type = %s AND period_id = %s
-    """, (period_type, period_id))
-
-    # Compute query length distribution (word count)
-    cursor.execute("""
-        INSERT INTO period_query_length_dist (period_type, period_id, query_length, unique_query_count)
         SELECT
-            %s,
-            %s,
             LENGTH(query) - LENGTH(REPLACE(query, ' ', '')) + 1 as query_length,
             COUNT(DISTINCT LOWER(TRIM(query))) as unique_query_count
         FROM searches
@@ -154,13 +175,45 @@ def compute_period_query_length_dist(conn, period_type: str, period_id: str,
           AND LENGTH(query) - LENGTH(REPLACE(query, ' ', '')) + 1 <= 100
         GROUP BY query_length
         ORDER BY query_length
-    """, (period_type, period_id, start_date, end_date))
+    """, (start_date, end_date))
 
-    inserted = cursor.rowcount
+    rows = cursor.fetchall()
+    cursor.close()
+
+    if not rows:
+        cursor = conn.cursor()
+        cursor.execute("""
+            DELETE FROM period_query_length_dist
+            WHERE period_type = %s AND period_id = %s
+        """, (period_type, period_id))
+        conn.commit()
+        cursor.close()
+        return 0
+
+    # Step 2: Delete old data and batch insert
+    cursor = conn.cursor()
+    cursor.execute("""
+        DELETE FROM period_query_length_dist
+        WHERE period_type = %s AND period_id = %s
+    """, (period_type, period_id))
+
+    values = [
+        (period_type, period_id, int(row[0]), int(row[1]))
+        for row in rows
+    ]
+
+    execute_values(
+        cursor,
+        """INSERT INTO period_query_length_dist
+           (period_type, period_id, query_length, unique_query_count)
+           VALUES %s""",
+        values
+    )
+
     conn.commit()
     cursor.close()
 
-    return inserted
+    return len(values)
 
 
 def refresh_period_stats(conn):
@@ -199,7 +252,7 @@ def refresh_period_stats(conn):
         print(f"  Query length dist: {dists_inserted} rows in {elapsed:.1f}s")
         total_dists += dists_inserted
 
-    print(f"\n✓ Processed {len(periods)} periods successfully")
+    print(f"\nProcessed {len(periods)} periods successfully")
     print(f"  - {total_queries} top query entries")
     print(f"  - {total_dists} query length distribution rows")
 
