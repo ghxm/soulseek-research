@@ -40,6 +40,53 @@ def get_db_connection():
     )
 
 
+def ensure_user_query_pairs_table(conn):
+    """Create the persistent user-query co-occurrence table if it doesn't exist."""
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_query_pairs (
+            username TEXT NOT NULL,
+            query_normalized TEXT NOT NULL,
+            PRIMARY KEY (username, query_normalized)
+        )
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_uqp_query
+        ON user_query_pairs (query_normalized)
+    """)
+    conn.commit()
+    cursor.close()
+
+
+def populate_user_query_pairs(conn, month: str = None):
+    """Insert distinct user-query pairs from searches into user_query_pairs.
+
+    Args:
+        conn: Database connection
+        month: Optional 'YYYY-MM' to scope to a single month. If None, scans all searches.
+    """
+    cursor = conn.cursor()
+    if month:
+        cursor.execute("""
+            INSERT INTO user_query_pairs (username, query_normalized)
+            SELECT DISTINCT username, LOWER(TRIM(query))
+            FROM searches
+            WHERE TO_CHAR(timestamp, 'YYYY-MM') = %s
+            ON CONFLICT DO NOTHING
+        """, (month,))
+    else:
+        cursor.execute("""
+            INSERT INTO user_query_pairs (username, query_normalized)
+            SELECT DISTINCT username, LOWER(TRIM(query))
+            FROM searches
+            ON CONFLICT DO NOTHING
+        """)
+    inserted = cursor.rowcount
+    conn.commit()
+    cursor.close()
+    return inserted
+
+
 def get_months_to_archive(conn, min_age_days: int = 7) -> List[str]:
     """
     Find months that are complete and old enough to archive.
@@ -259,14 +306,17 @@ def archive_month(conn, month: str, archive_path: str, delete_after: bool = Fals
 
     # 3. Optionally delete from database
     if delete_after:
-        # 3a. Update cumulative stats BEFORE deleting (preserves all-time totals)
+        # 3a. Preserve user-query pairs BEFORE deleting
+        populate_user_query_pairs(conn, month)
+
+        # 3b. Update cumulative stats BEFORE deleting (preserves all-time totals)
         update_cumulative_stats(conn, month)
 
-        # 3b. Delete from database
+        # 3c. Delete from database
         deleted = delete_archived_data(conn, month)
         print(f"  Deleted {deleted:,} records from database")
 
-        # 3c. Mark as deleted
+        # 3d. Mark as deleted
         mark_archive_deleted(conn, month)
 
 
@@ -280,6 +330,11 @@ def main():
     conn = get_db_connection()
 
     try:
+        # Ensure persistent user-query pairs table exists and seed from current data
+        ensure_user_query_pairs_table(conn)
+        inserted = populate_user_query_pairs(conn)
+        print(f"Seeded user_query_pairs table ({inserted} new pairs)")
+
         # Find months to archive (complete and 7+ days old)
         months = get_months_to_archive(conn)
 

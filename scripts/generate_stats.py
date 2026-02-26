@@ -1449,9 +1449,9 @@ def compute_query_similarities(conn, eligible_queries: set, top_n: int = 20,
     cursor = conn.cursor('similarity_cursor')
     cursor.itersize = 50000
     cursor.execute("""
-        SELECT DISTINCT username, LOWER(TRIM(query)) as query_normalized
-        FROM searches
-        WHERE LOWER(TRIM(query)) = ANY(%s)
+        SELECT username, query_normalized
+        FROM user_query_pairs
+        WHERE query_normalized = ANY(%s)
     """, (list(eligible_queries),))
 
     for username, query_norm in cursor:
@@ -1740,6 +1740,30 @@ def main():
         # Generate Jekyll data files for navigation
         generate_jekyll_data_files(periods)
         print("Generated Jekyll navigation data files")
+
+        # Ensure user_query_pairs table exists and is up to date with live data
+        print("Updating user_query_pairs table...")
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_query_pairs (
+                username TEXT NOT NULL,
+                query_normalized TEXT NOT NULL,
+                PRIMARY KEY (username, query_normalized)
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_uqp_query
+            ON user_query_pairs (query_normalized)
+        """)
+        cursor.execute("""
+            INSERT INTO user_query_pairs (username, query_normalized)
+            SELECT DISTINCT username, LOWER(TRIM(query))
+            FROM searches
+            ON CONFLICT DO NOTHING
+        """)
+        conn.commit()
+        print(f"  Merged {cursor.rowcount} new pairs from live searches")
+        cursor.close()
 
         # Get eligible queries for similarity computation (queries with detail pages)
         print("=" * 60)
