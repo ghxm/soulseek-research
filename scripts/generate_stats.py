@@ -761,8 +761,8 @@ def create_queries_data_table(top_queries: List[tuple], query_slug_map: Dict[str
 
     <script>
     (function() {{
-        // Base URL for query links (empty for root-hosted GitHub Pages)
-        window.baseUrl = '';
+        // Base URL for query links (set by Jekyll template processing)
+        window.baseUrl = '{{{{ site.baseurl }}}}';
 
         const searchInput = document.getElementById('table_search');
         const resultsDiv = document.getElementById('search_results');
