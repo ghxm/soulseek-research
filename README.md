@@ -1,23 +1,12 @@
 # Soulseek Research
 
-Monitors Soulseek P2P network search requests for research purposes. Collects search patterns from distributed geographic locations and stores anonymized data for analysis.
+## Project Description
 
-## Architecture
+This project monitors the Soulseek peer-to-peer file-sharing network by passively collecting search queries issued by other users. It is designed for research purposes in computational social science. The system consists of one or more geographically distributed clients that connect to the Soulseek network, observe incoming search requests, and log anonymized metadata (client ID, timestamp, hashed username, query text) to a central PostgreSQL database.
 
-The system supports multiple geographically distributed clients collecting data into a central PostgreSQL database. Currently, one client is running in production (Germany/Nuremberg, Hetzner Cloud).
+Precomputed statistics and materialized views support a static dashboard deployed via GitHub Pages. Data archival, view refresh, and dashboard generation run on automated daily/weekly schedules through GitHub Actions.
 
-**Data flow:**
-1. Clients connect to the Soulseek network and monitor incoming search requests from other users
-2. Search metadata (client_id, timestamp, hashed username, query) is logged to the central database
-3. Materialized views are refreshed daily for fast dashboard queries
-4. Period-specific statistics (weekly/monthly top queries, query length distributions) are precomputed daily
-5. A GitHub Actions workflow generates a static dashboard and deploys it to GitHub Pages
-
-**Automated schedule (UTC):**
-- 2:00 AM Sunday: Monthly data archival
-- 4:00 AM Daily: Materialized view refresh
-- 4:30 AM Daily: Period statistics precomputation
-- 5:00 AM Daily: Dashboard generation and deployment
+The current production deployment runs a single client on Hetzner Cloud (Nuremberg, Germany).
 
 ## Database Schema
 
@@ -47,28 +36,30 @@ mv_query_length_dist    -- Query word count distribution
 mv_summary_stats        -- Overall summary statistics
 ```
 
-## Statistics Dashboard
+## Deployment and Production
 
-Auto-generated static site with interactive charts and searchable data tables. Includes:
-- All-time, monthly, and weekly period pages with search volume, top queries, and query length distributions
-- Individual query detail pages (~23k) with daily search activity charts (searches and unique users)
-- Lazy-loaded query data tables with search and virtual scrolling
+### Requirements
 
-**Setup:**
-1. Add `DATABASE_URL` secret in repo Settings > Secrets
-2. Enable Pages in Settings > Pages > Source: GitHub Actions
-3. Run workflow: Actions > Update Statistics Dashboard > Run workflow
-
-## Deployment
-
-**Prerequisites:**
-- Hetzner Cloud account with SSH key named "soulseek-research"
+- Python 3.11+
+- Docker
+- PostgreSQL database
 - Soulseek account credentials (one per client)
+- Hetzner Cloud account with an SSH key named "soulseek-research"
+
+### Automated Schedule (UTC)
+
+| Time | Frequency | Task |
+|------|-----------|------|
+| 2:00 AM | Sunday | Monthly data archival |
+| 4:00 AM | Daily | Materialized view refresh |
+| 4:30 AM | Daily | Period statistics precomputation |
+| 5:00 AM | Daily | Dashboard generation and deployment |
+
+### Infrastructure Deployment
 
 ```bash
-# Configure credentials
+# Copy and fill in API tokens and Soulseek credentials
 cp terraform.tfvars.example terraform.tfvars
-# Edit terraform.tfvars with your API tokens and Soulseek credentials
 
 # Deploy infrastructure
 make deploy
@@ -76,11 +67,17 @@ make deploy
 # Monitor data collection
 make monitor
 
-# Destroy infrastructure
+# Tear down infrastructure
 make destroy
 ```
 
-## Local Development
+### Dashboard Setup
+
+1. Add a `DATABASE_URL` secret in the repository under Settings > Secrets.
+2. Enable GitHub Pages in Settings > Pages > Source: GitHub Actions.
+3. Trigger the workflow manually: Actions > Update Statistics Dashboard > Run workflow.
+
+### Local Development
 
 ```bash
 pip install -e .
@@ -91,10 +88,3 @@ soulseek-research start \
   --client-id local-test \
   --encryption-key your_encryption_key
 ```
-
-## Requirements
-
-- Python 3.11+
-- Docker
-- Soulseek account credentials
-- PostgreSQL database
