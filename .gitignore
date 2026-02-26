@@ -323,8 +323,9 @@ maintenance-*.md
 /.terraform.lock.hcl
 /tfplan
 
-# Generated docs (except setup guide)
-/docs/index.html
-/docs/stats.json
-/docs/queries/
-/docs/data/
+# Generated docs (ignore everything except templates and config)
+/docs/*
+!/docs/.nojekyll
+!/docs/_config.yml
+!/docs/_includes/
+!/docs/_layouts/
