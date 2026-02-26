@@ -468,20 +468,20 @@ def slugify_query(query: str) -> str:
 
 
 def create_svg_line_chart(daily_data: List[tuple]) -> str:
-    """Create an inline SVG line chart for daily search counts.
+    """Create an inline SVG line chart with dual Y-axes for searches and unique users.
 
     Args:
         daily_data: List of (date, search_count, unique_users) tuples, sorted by date
 
     Returns:
-        SVG string (~1.5-2KB)
+        SVG string
     """
     if not daily_data or len(daily_data) < 2:
         return '<p style="color: #999;">Not enough data for chart</p>'
 
-    # Chart dimensions
-    width, height = 800, 300
-    pad_left, pad_right, pad_top, pad_bottom = 60, 20, 20, 50
+    # Chart dimensions - extra right padding for second Y-axis
+    width, height = 800, 320
+    pad_left, pad_right, pad_top, pad_bottom = 60, 60, 40, 50
 
     plot_w = width - pad_left - pad_right
     plot_h = height - pad_top - pad_bottom
@@ -490,21 +490,30 @@ def create_svg_line_chart(daily_data: List[tuple]) -> str:
     counts = [d[1] for d in daily_data]
     users = [d[2] for d in daily_data]
     max_count = max(counts) if counts else 1
+    max_users = max(users) if users else 1
     n = len(dates)
+
+    search_color = '#333'
+    user_color = '#b04040'
 
     # Scale functions
     def x_pos(i):
         return pad_left + (i / max(n - 1, 1)) * plot_w
 
-    def y_pos(val):
+    def y_count(val):
         return pad_top + plot_h - (val / max(max_count, 1)) * plot_h
 
-    # Build line path
-    points = [(x_pos(i), y_pos(counts[i])) for i in range(n)]
-    line_path = 'M ' + ' L '.join(f'{x:.1f},{y:.1f}' for x, y in points)
+    def y_user(val):
+        return pad_top + plot_h - (val / max(max_users, 1)) * plot_h
 
-    # Build area path (line + close to bottom)
-    area_path = line_path + f' L {points[-1][0]:.1f},{pad_top + plot_h:.1f} L {points[0][0]:.1f},{pad_top + plot_h:.1f} Z'
+    # Build search line path
+    search_pts = [(x_pos(i), y_count(counts[i])) for i in range(n)]
+    search_line = 'M ' + ' L '.join(f'{x:.1f},{y:.1f}' for x, y in search_pts)
+    search_area = search_line + f' L {search_pts[-1][0]:.1f},{pad_top + plot_h:.1f} L {search_pts[0][0]:.1f},{pad_top + plot_h:.1f} Z'
+
+    # Build users line path
+    user_pts = [(x_pos(i), y_user(users[i])) for i in range(n)]
+    user_line = 'M ' + ' L '.join(f'{x:.1f},{y:.1f}' for x, y in user_pts)
 
     # X-axis labels (show ~8 labels evenly spaced)
     x_labels = []
@@ -515,37 +524,46 @@ def create_svg_line_chart(daily_data: List[tuple]) -> str:
         label = dates[idx].strftime('%b %d') if hasattr(dates[idx], 'strftime') else str(dates[idx])
         x_labels.append(f'<text x="{x:.1f}" y="{height - 5}" text-anchor="middle" font-size="11" fill="#999">{label}</text>')
 
-    # Y-axis labels (5 ticks)
+    # Left Y-axis labels (searches, 5 ticks)
     y_labels = []
     for i in range(5):
         val = int(max_count * i / 4)
-        y = y_pos(val)
-        y_labels.append(f'<text x="{pad_left - 8}" y="{y:.1f}" text-anchor="end" font-size="11" fill="#999" dominant-baseline="middle">{val:,}</text>')
+        y = y_count(val)
+        y_labels.append(f'<text x="{pad_left - 8}" y="{y:.1f}" text-anchor="end" font-size="11" fill="{search_color}" dominant-baseline="middle">{val:,}</text>')
         y_labels.append(f'<line x1="{pad_left}" y1="{y:.1f}" x2="{width - pad_right}" y2="{y:.1f}" stroke="#eee" stroke-width="1"/>')
 
-    # Tooltip circles with <title> elements
-    circles = []
-    for i in range(n):
-        x, y = points[i]
-        date_str = dates[i].strftime('%Y-%m-%d') if hasattr(dates[i], 'strftime') else str(dates[i])
-        circles.append(
-            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3" fill="#333" opacity="0">'
-            f'<title>{date_str}: {counts[i]:,} searches, {users[i]:,} users</title></circle>'
-        )
-    # Hover-sensitive overlay circles (larger hit area)
+    # Right Y-axis labels (users, 5 ticks)
+    for i in range(5):
+        val = int(max_users * i / 4)
+        y = y_user(val)
+        y_labels.append(f'<text x="{width - pad_right + 8}" y="{y:.1f}" text-anchor="start" font-size="11" fill="{user_color}" dominant-baseline="middle">{val:,}</text>')
+
+    # Legend (top of chart)
+    legend = (
+        f'<line x1="{pad_left}" y1="12" x2="{pad_left + 20}" y2="12" stroke="{search_color}" stroke-width="2"/>'
+        f'<text x="{pad_left + 25}" y="12" font-size="11" fill="{search_color}" dominant-baseline="middle">Searches</text>'
+        f'<line x1="{pad_left + 100}" y1="12" x2="{pad_left + 120}" y2="12" stroke="{user_color}" stroke-width="2" stroke-dasharray="4,3"/>'
+        f'<text x="{pad_left + 125}" y="12" font-size="11" fill="{user_color}" dominant-baseline="middle">Unique users</text>'
+    )
+
+    # Hover-sensitive overlay circles (larger hit area, both values in tooltip)
     hover_circles = []
     for i in range(n):
-        x, y = points[i]
+        x = x_pos(i)
+        # Place circle on search line
+        _, y_s = search_pts[i]
         date_str = dates[i].strftime('%Y-%m-%d') if hasattr(dates[i], 'strftime') else str(dates[i])
         hover_circles.append(
-            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="8" fill="transparent" style="cursor:pointer">'
-            f'<title>{date_str}: {counts[i]:,} searches, {users[i]:,} users</title></circle>'
+            f'<circle cx="{x:.1f}" cy="{y_s:.1f}" r="8" fill="transparent" style="cursor:pointer">'
+            f'<title>{date_str}: {counts[i]:,} searches, {users[i]:,} unique users</title></circle>'
         )
 
     svg = f'''<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;max-width:{width}px;">
+  {legend}
   {''.join(y_labels)}
-  <path d="{area_path}" fill="rgba(51,51,51,0.08)" stroke="none"/>
-  <path d="{line_path}" fill="none" stroke="#333" stroke-width="2"/>
+  <path d="{search_area}" fill="rgba(51,51,51,0.06)" stroke="none"/>
+  <path d="{search_line}" fill="none" stroke="{search_color}" stroke-width="2"/>
+  <path d="{user_line}" fill="none" stroke="{user_color}" stroke-width="1.5" stroke-dasharray="4,3"/>
   {''.join(x_labels)}
   {''.join(hover_circles)}
 </svg>'''
@@ -1523,6 +1541,7 @@ query_display: "{display_escaped}"
 <div class="chart-container">
     {svg_chart}
 </div>
+<p style="font-size: 12px; color: #999; margin-top: 8px;">Unique users are counted per day based on distinct (hashed) usernames. A user searching the same query multiple times in one day counts once for that day. All dates are in UTC.</p>
 
 <div class="back-link">
     <a href="{{{{ site.baseurl }}}}/">Back to dashboard</a>
