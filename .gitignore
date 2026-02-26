@@ -316,3 +316,4 @@ maintenance-*.md
 /docs/index.html
 /docs/stats.json
 /docs/queries/
+/docs/data/

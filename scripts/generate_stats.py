@@ -662,54 +662,45 @@ def create_top_queries_chart(top_queries: List[tuple], limit: int = 100) -> go.F
     return fig
 
 
-def create_queries_data_table(top_queries: List[tuple], query_slug_map: Dict[str, str] = None) -> str:
-    """Create a lightweight, searchable HTML table for all queries using Clusterize.js.
-
-    Uses Clusterize.js for virtual scrolling (only renders visible rows),
-    enabling smooth performance with 400k+ rows. Data stored in compact array format.
+def write_queries_data_file(top_queries: List[tuple], data_file_path: str,
+                            query_slug_map: Dict[str, str] = None):
+    """Write query data + slug map to an external JSON file for lazy loading.
 
     Args:
         top_queries: List of (query, unique_users, total_searches) tuples
-        query_slug_map: Optional dict mapping query_normalized -> slug for linking
-
-    Returns:
-        HTML string with interactive table and CSV download link
+        data_file_path: Path to write the JSON file (e.g. docs/data/queries_all.json)
+        query_slug_map: Optional dict mapping query_normalized -> slug
     """
-    total_count = len(top_queries)
-
-    # Generate CSV data as base64 for download link
-    import csv
-    import io
-    import base64
-    import gzip
-
-    csv_buffer = io.StringIO()
-    writer = csv.writer(csv_buffer)
-    writer.writerow(['Rank', 'Query', 'Unique Users', 'Total Searches'])
-    for i, (query, users, searches) in enumerate(top_queries, 1):
-        writer.writerow([i, query, users, searches])
-
-    csv_data = csv_buffer.getvalue()
-    # Gzip compress for smaller download
-    csv_gzipped = gzip.compress(csv_data.encode('utf-8'))
-    csv_base64 = base64.b64encode(csv_gzipped).decode('utf-8')
-
-    # Store ALL data in compact array format: [rank, query, users, searches]
-    # Clusterize.js will handle virtual rendering
-    import json
     all_data = []
     for i, (query, users, searches) in enumerate(top_queries, 1):
         all_data.append([i, query, users, searches])
-
-    all_data_json = json.dumps(all_data)
 
     # Filter slug map to only include queries in this table's data
     if query_slug_map:
         table_queries = {q[0] for q in top_queries}
         filtered_slugs = {q: s for q, s in query_slug_map.items() if q in table_queries}
-        slug_map_json = json.dumps(filtered_slugs)
     else:
-        slug_map_json = '{}'
+        filtered_slugs = {}
+
+    os.makedirs(os.path.dirname(data_file_path), exist_ok=True)
+    with open(data_file_path, 'w', encoding='utf-8') as f:
+        json.dump({'data': all_data, 'slugs': filtered_slugs}, f, separators=(',', ':'))
+
+
+def create_queries_data_table(top_queries: List[tuple], data_json_url: str) -> str:
+    """Create a searchable HTML table that lazy-loads query data from an external JSON file.
+
+    Uses Clusterize.js for virtual scrolling. Data is fetched on page load
+    from an external JSON file to keep HTML pages small.
+
+    Args:
+        top_queries: List of (query, unique_users, total_searches) tuples (for count only)
+        data_json_url: URL path to the external JSON data file
+
+    Returns:
+        HTML string with interactive table and loading state
+    """
+    total_count = len(top_queries)
 
     return f'''
     <div class="queries-table-container">
@@ -722,16 +713,11 @@ def create_queries_data_table(top_queries: List[tuple], query_slug_map: Dict[str
                     class="table-search-input"
                     placeholder="Search queries..."
                     autocomplete="off"
+                    disabled
                 />
-                <button
-                    onclick="window.downloadQueriesCSV()"
-                    class="download-btn"
-                >
-                    Download CSV
-                </button>
             </div>
             <div class="search-results" id="search_results">
-                Showing all {total_count:,} queries (virtual scrolling enabled)
+                Loading query data...
             </div>
         </div>
 
@@ -746,7 +732,7 @@ def create_queries_data_table(top_queries: List[tuple], query_slug_map: Dict[str
                     </tr>
                 </thead>
                 <tbody id="content_area">
-                    <!-- Clusterize.js will populate this -->
+                    <tr><td colspan="4" class="loading-cell">Loading {total_count:,} queries...</td></tr>
                 </tbody>
             </table>
         </div>
@@ -756,59 +742,36 @@ def create_queries_data_table(top_queries: List[tuple], query_slug_map: Dict[str
     <script src="https://cdnjs.cloudflare.com/ajax/libs/clusterize.js/0.19.0/clusterize.min.js"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/clusterize.js/0.19.0/clusterize.min.css">
 
-    <!-- Include pako for gzip decompression -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
-
     <script>
     (function() {{
         // Base URL for query links (set by Jekyll template processing)
-        window.baseUrl = '{{{{ site.baseurl }}}}';
+        var baseUrl = '{{{{ site.baseurl }}}}';
+        var dataUrl = baseUrl + '/{data_json_url}';
 
-        const searchInput = document.getElementById('table_search');
-        const resultsDiv = document.getElementById('search_results');
-
-        // Store all data (compact array format: [rank, query, users, searches])
-        const allData = {all_data_json};
-        const slugMap = {slug_map_json};
-        let filteredData = allData;
-
-        // CSV download function
-        window.downloadQueriesCSV = function() {{
-            const base64 = '{csv_base64}';
-            const binary = atob(base64);
-            const bytes = new Uint8Array(binary.length);
-            for (let i = 0; i < binary.length; i++) {{
-                bytes[i] = binary.charCodeAt(i);
-            }}
-            const decompressed = pako.inflate(bytes, {{ to: 'string' }});
-
-            const blob = new Blob([decompressed], {{ type: 'text/csv' }});
-            const url = window.URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = 'top_queries.csv';
-            a.click();
-            window.URL.revokeObjectURL(url);
-        }};
+        var searchInput = document.getElementById('table_search');
+        var resultsDiv = document.getElementById('search_results');
+        var totalCount = {total_count};
+        var allData = null;
+        var slugMap = {{}};
+        var filteredData = null;
+        var clusterize = null;
 
         // Convert data to HTML rows for Clusterize.js
         function dataToRows(data) {{
             return data.map(function(item) {{
-                const rank = item[0];
-                const query = item[1];
-                const users = item[2];
-                const searches = item[3];
+                var rank = item[0];
+                var query = item[1];
+                var users = item[2];
+                var searches = item[3];
 
-                // Escape HTML in query text
-                const queryEscaped = query
+                var queryEscaped = query
                     .replace(/&/g, '&amp;')
                     .replace(/</g, '&lt;')
                     .replace(/>/g, '&gt;');
 
-                // Link to query detail page if slug exists
-                const slug = slugMap[query];
-                const queryCell = slug
-                    ? '<a href="' + window.baseUrl + '/queries/' + slug + '.html" class="query-link">' + queryEscaped + '</a>'
+                var slug = slugMap[query];
+                var queryCell = slug
+                    ? '<a href="' + baseUrl + '/queries/' + slug + '.html" class="query-link">' + queryEscaped + '</a>'
                     : queryEscaped;
 
                 return '<tr>' +
@@ -820,37 +783,49 @@ def create_queries_data_table(top_queries: List[tuple], query_slug_map: Dict[str
             }});
         }}
 
-        // Initialize Clusterize.js with all data
-        const clusterize = new Clusterize({{
-            rows: dataToRows(allData),
-            scrollId: 'scroll_area',
-            contentId: 'content_area',
-            rows_in_block: 50,  // Render 50 rows per block for smooth scrolling
-            blocks_in_cluster: 4  // Keep 4 blocks (200 rows) in DOM at once
-        }});
+        // Fetch data and initialize table
+        fetch(dataUrl)
+            .then(function(response) {{ return response.json(); }})
+            .then(function(json) {{
+                allData = json.data;
+                slugMap = json.slugs || {{}};
+                filteredData = allData;
 
-        console.log('Clusterize.js initialized with {total_count:,} queries');
+                clusterize = new Clusterize({{
+                    rows: dataToRows(allData),
+                    scrollId: 'scroll_area',
+                    contentId: 'content_area',
+                    rows_in_block: 50,
+                    blocks_in_cluster: 4
+                }});
+
+                searchInput.disabled = false;
+                resultsDiv.textContent = 'Showing all ' + allData.length.toLocaleString() + ' queries (virtual scrolling enabled)';
+            }})
+            .catch(function(err) {{
+                resultsDiv.textContent = 'Failed to load query data';
+                console.error('Query data load error:', err);
+            }});
 
         // Search functionality
         searchInput.addEventListener('input', function() {{
-            const searchTerm = this.value.toLowerCase().trim();
+            if (!allData || !clusterize) return;
+
+            var searchTerm = this.value.toLowerCase().trim();
 
             if (!searchTerm) {{
-                // No filter - show all data
                 filteredData = allData;
                 clusterize.update(dataToRows(filteredData));
-                resultsDiv.textContent = 'Showing all {total_count:,} queries (virtual scrolling enabled)';
+                resultsDiv.textContent = 'Showing all ' + allData.length.toLocaleString() + ' queries (virtual scrolling enabled)';
                 return;
             }}
 
-            // Filter data based on search term
             filteredData = allData.filter(function(item) {{
-                const query = item[1].toLowerCase();
-                return query.includes(searchTerm);
+                return item[1].toLowerCase().includes(searchTerm);
             }});
 
             clusterize.update(dataToRows(filteredData));
-            resultsDiv.textContent = 'Showing ' + filteredData.length.toLocaleString() + ' of {total_count:,} queries';
+            resultsDiv.textContent = 'Showing ' + filteredData.length.toLocaleString() + ' of ' + allData.length.toLocaleString() + ' queries';
         }});
     }})();
     </script>
@@ -896,26 +871,22 @@ def create_queries_data_table(top_queries: List[tuple], query_slug_map: Dict[str
             background: #fff;
         }}
 
-        .download-btn {{
-            padding: 10px 20px;
-            background: #333;
-            color: white;
-            text-decoration: none;
-            border-radius: 4px;
-            font-weight: 500;
-            white-space: nowrap;
-            font-size: 14px;
-            border: none;
-            cursor: pointer;
-        }}
-
-        .download-btn:hover {{
-            background: #000;
+        .table-search-input:disabled {{
+            background: #f0f0f0;
+            color: #999;
+            cursor: wait;
         }}
 
         .search-results {{
             font-size: 14px;
             color: #666;
+            font-style: italic;
+        }}
+
+        .loading-cell {{
+            text-align: center;
+            padding: 40px 15px;
+            color: #999;
             font-style: italic;
         }}
 
@@ -1173,9 +1144,9 @@ def generate_all_time_page(conn, cutoff_date=None, query_slug_map=None) -> str:
     if article_content:
         print("  Using article mode for all-time page")
         sections = parse_article_sections(article_content)
-        html = generate_article_html_with_jekyll(stats, figures, sections, top_queries_data=top_queries, query_slug_map=query_slug_map)
+        html = generate_article_html_with_jekyll(stats, figures, sections, top_queries_data=top_queries, query_slug_map=query_slug_map, data_file_id='all')
     else:
-        html = generate_period_html(stats, figures, 'all', None, top_queries_data=top_queries, query_slug_map=query_slug_map)
+        html = generate_period_html(stats, figures, 'all', None, top_queries_data=top_queries, query_slug_map=query_slug_map, data_file_id='all')
 
     output_file = "docs/index.html"
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
@@ -1220,7 +1191,7 @@ def generate_period_page(conn, period_type: str, period_info: Dict, cutoff_date=
     }
 
     # Generate HTML
-    html = generate_period_html(stats, figures, period_type, period_info, top_queries_data=top_queries, query_slug_map=query_slug_map)
+    html = generate_period_html(stats, figures, period_type, period_info, top_queries_data=top_queries, query_slug_map=query_slug_map, data_file_id=period_info['id'])
 
     # Determine output path
     if period_type == 'week':
@@ -1238,7 +1209,8 @@ def generate_period_page(conn, period_type: str, period_info: Dict, cutoff_date=
 
 def generate_article_html_with_jekyll(stats: Dict, figures: Dict[str, go.Figure],
                                       sections: List[Dict[str, Any]], top_queries_data: List[tuple] = None,
-                                      query_slug_map: Dict[str, str] = None) -> str:
+                                      query_slug_map: Dict[str, str] = None,
+                                      data_file_id: str = 'all') -> str:
     """Generate article mode HTML with Jekyll front matter"""
     front_matter = "---\nlayout: dashboard\nperiod: all\ntitle: All Time Statistics\n---\n\n"
 
@@ -1248,7 +1220,9 @@ def generate_article_html_with_jekyll(stats: Dict, figures: Dict[str, go.Figure]
             # For top_queries, combine chart + table
             if name == 'top_queries' and top_queries_data:
                 chart_part = fig.to_html(full_html=False, include_plotlyjs='cdn')
-                table_part = create_queries_data_table(top_queries_data, query_slug_map)
+                data_json_url = f'data/queries_{data_file_id}.json'
+                write_queries_data_file(top_queries_data, f'docs/{data_json_url}', query_slug_map)
+                table_part = create_queries_data_table(top_queries_data, data_json_url)
                 chart_html[name] = f'{chart_part}\n{table_part}'
             else:
                 chart_html[name] = fig.to_html(full_html=False, include_plotlyjs='cdn')
@@ -1310,7 +1284,8 @@ def generate_article_html_with_jekyll(stats: Dict, figures: Dict[str, go.Figure]
 def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
                          period_type: str, period_info: Optional[Dict] = None,
                          top_queries_data: List[tuple] = None,
-                         query_slug_map: Dict[str, str] = None) -> str:
+                         query_slug_map: Dict[str, str] = None,
+                         data_file_id: str = 'all') -> str:
     """Generate HTML for a period page with Jekyll front matter"""
     if period_type == 'all':
         front_matter = "---\nlayout: dashboard\nperiod: all\ntitle: All Time Statistics\n---\n\n"
@@ -1328,7 +1303,9 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
             # For top_queries, combine chart + table
             if name == 'top_queries' and top_queries_data:
                 chart_part = fig.to_html(full_html=False, include_plotlyjs='cdn')
-                table_part = create_queries_data_table(top_queries_data, query_slug_map)
+                data_json_url = f'data/queries_{data_file_id}.json'
+                write_queries_data_file(top_queries_data, f'docs/{data_json_url}', query_slug_map)
+                table_part = create_queries_data_table(top_queries_data, data_json_url)
                 chart_html[name] = f'{chart_part}\n{table_part}'
             else:
                 chart_html[name] = fig.to_html(full_html=False, include_plotlyjs='cdn')
