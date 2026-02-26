@@ -39,9 +39,9 @@ scripts/
 ├── monitor.sh              # Live monitoring
 ├── test-local.sh           # Local testing
 ├── archive.py              # Monthly data archival script
-├── generate_stats.py       # Dashboard generation with cumulative stats
+├── generate_stats.py       # Dashboard generation with cumulative stats + query detail pages
 ├── refresh_views.py        # Refresh materialized views (4 AM daily)
-└── refresh_period_stats.py # Precompute period statistics (4:30 AM daily)
+└── refresh_period_stats.py # Precompute period + query daily statistics (4:30 AM daily)
 
 Infrastructure:
 ├── database.yml       # PostgreSQL container
@@ -78,6 +78,12 @@ soulseek.period_top_queries:
   id, period_type, period_id, query_normalized, unique_users, total_searches, rank
 soulseek.period_query_length_dist:
   id, period_type, period_id, query_length, unique_query_count
+
+-- Per-query daily statistics for query detail pages
+soulseek.query_daily_stats:
+  query_normalized, date, search_count, unique_users
+  -- Only queries with 50+ all-time unique users
+  -- Indexed on query_normalized for fast per-query lookups
 ```
 
 ### Key Design Decisions
@@ -205,6 +211,9 @@ germany,2025-01-01T00:00:01Z,abc123hash,artist name album
 - Current period stats separate from historical
 - Plotly range sliders on all time-series charts for interactive filtering
 - GitHub Actions downloads archives via SSH/SCP for stats generation
+- Individual query detail pages with inline SVG charts (queries with 50+ users)
+- Clickable query names in data tables link to detail pages
+- Query pages at `docs/queries/<slug>.html` using `query.html` layout
 
 **Period-Specific Statistics** (`scripts/refresh_period_stats.py`):
 - Precomputes top queries and query length distributions for each week/month

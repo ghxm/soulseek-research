@@ -98,6 +98,19 @@ CREATE TABLE IF NOT EXISTS period_query_length_dist (
 
 CREATE INDEX IF NOT EXISTS idx_period_ql_dist_lookup
 ON period_query_length_dist(period_type, period_id);
+
+-- Per-query daily statistics for query detail pages
+-- Stores daily search_count and unique_users for queries with 50+ all-time users
+CREATE TABLE IF NOT EXISTS query_daily_stats (
+    query_normalized TEXT NOT NULL,
+    date DATE NOT NULL,
+    search_count INTEGER NOT NULL,
+    unique_users INTEGER NOT NULL,
+    UNIQUE(query_normalized, date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_query_daily_stats_query
+ON query_daily_stats(query_normalized);
 "
 
 # Create materialized views for fast stats generation

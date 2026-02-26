@@ -4,9 +4,11 @@ Generate statistics dashboard for Soulseek research data.
 Queries pre-computed materialized views and cumulative stats table.
 """
 
+import hashlib
 import json
 import os
 import re
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 
@@ -450,6 +452,107 @@ def parse_article_sections(markdown_content: str) -> List[Dict[str, Any]]:
     return sections
 
 
+def slugify_query(query: str) -> str:
+    """Convert a query string to a URL-safe slug with hash for uniqueness.
+
+    Example: "Pink Floyd" -> "pink-floyd-7a8c2e1d"
+    """
+    # Lowercase, replace non-alphanumeric with hyphens, collapse multiple hyphens
+    slug = re.sub(r'[^a-z0-9]+', '-', query.lower()).strip('-')
+    # Truncate long slugs
+    if len(slug) > 80:
+        slug = slug[:80].rstrip('-')
+    # Append 8-char hash for uniqueness
+    hash_suffix = hashlib.sha256(query.encode('utf-8')).hexdigest()[:8]
+    return f"{slug}-{hash_suffix}" if slug else hash_suffix
+
+
+def create_svg_line_chart(daily_data: List[tuple]) -> str:
+    """Create an inline SVG line chart for daily search counts.
+
+    Args:
+        daily_data: List of (date, search_count, unique_users) tuples, sorted by date
+
+    Returns:
+        SVG string (~1.5-2KB)
+    """
+    if not daily_data or len(daily_data) < 2:
+        return '<p style="color: #999;">Not enough data for chart</p>'
+
+    # Chart dimensions
+    width, height = 800, 300
+    pad_left, pad_right, pad_top, pad_bottom = 60, 20, 20, 50
+
+    plot_w = width - pad_left - pad_right
+    plot_h = height - pad_top - pad_bottom
+
+    dates = [d[0] for d in daily_data]
+    counts = [d[1] for d in daily_data]
+    users = [d[2] for d in daily_data]
+    max_count = max(counts) if counts else 1
+    n = len(dates)
+
+    # Scale functions
+    def x_pos(i):
+        return pad_left + (i / max(n - 1, 1)) * plot_w
+
+    def y_pos(val):
+        return pad_top + plot_h - (val / max(max_count, 1)) * plot_h
+
+    # Build line path
+    points = [(x_pos(i), y_pos(counts[i])) for i in range(n)]
+    line_path = 'M ' + ' L '.join(f'{x:.1f},{y:.1f}' for x, y in points)
+
+    # Build area path (line + close to bottom)
+    area_path = line_path + f' L {points[-1][0]:.1f},{pad_top + plot_h:.1f} L {points[0][0]:.1f},{pad_top + plot_h:.1f} Z'
+
+    # X-axis labels (show ~8 labels evenly spaced)
+    x_labels = []
+    label_count = min(8, n)
+    for i in range(label_count):
+        idx = int(i * (n - 1) / max(label_count - 1, 1))
+        x = x_pos(idx)
+        label = dates[idx].strftime('%b %d') if hasattr(dates[idx], 'strftime') else str(dates[idx])
+        x_labels.append(f'<text x="{x:.1f}" y="{height - 5}" text-anchor="middle" font-size="11" fill="#999">{label}</text>')
+
+    # Y-axis labels (5 ticks)
+    y_labels = []
+    for i in range(5):
+        val = int(max_count * i / 4)
+        y = y_pos(val)
+        y_labels.append(f'<text x="{pad_left - 8}" y="{y:.1f}" text-anchor="end" font-size="11" fill="#999" dominant-baseline="middle">{val:,}</text>')
+        y_labels.append(f'<line x1="{pad_left}" y1="{y:.1f}" x2="{width - pad_right}" y2="{y:.1f}" stroke="#eee" stroke-width="1"/>')
+
+    # Tooltip circles with <title> elements
+    circles = []
+    for i in range(n):
+        x, y = points[i]
+        date_str = dates[i].strftime('%Y-%m-%d') if hasattr(dates[i], 'strftime') else str(dates[i])
+        circles.append(
+            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3" fill="#333" opacity="0">'
+            f'<title>{date_str}: {counts[i]:,} searches, {users[i]:,} users</title></circle>'
+        )
+    # Hover-sensitive overlay circles (larger hit area)
+    hover_circles = []
+    for i in range(n):
+        x, y = points[i]
+        date_str = dates[i].strftime('%Y-%m-%d') if hasattr(dates[i], 'strftime') else str(dates[i])
+        hover_circles.append(
+            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="8" fill="transparent" style="cursor:pointer">'
+            f'<title>{date_str}: {counts[i]:,} searches, {users[i]:,} users</title></circle>'
+        )
+
+    svg = f'''<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;max-width:{width}px;">
+  {''.join(y_labels)}
+  <path d="{area_path}" fill="rgba(51,51,51,0.08)" stroke="none"/>
+  <path d="{line_path}" fill="none" stroke="#333" stroke-width="2"/>
+  {''.join(x_labels)}
+  {''.join(hover_circles)}
+</svg>'''
+
+    return svg
+
+
 def create_daily_flow_chart(df: pd.DataFrame) -> go.Figure:
     """Create line chart showing daily search flow per client"""
     fig = go.Figure()
@@ -559,7 +662,7 @@ def create_top_queries_chart(top_queries: List[tuple], limit: int = 100) -> go.F
     return fig
 
 
-def create_queries_data_table(top_queries: List[tuple]) -> str:
+def create_queries_data_table(top_queries: List[tuple], query_slug_map: Dict[str, str] = None) -> str:
     """Create a lightweight, searchable HTML table for all queries using Clusterize.js.
 
     Uses Clusterize.js for virtual scrolling (only renders visible rows),
@@ -567,6 +670,7 @@ def create_queries_data_table(top_queries: List[tuple]) -> str:
 
     Args:
         top_queries: List of (query, unique_users, total_searches) tuples
+        query_slug_map: Optional dict mapping query_normalized -> slug for linking
 
     Returns:
         HTML string with interactive table and CSV download link
@@ -598,6 +702,14 @@ def create_queries_data_table(top_queries: List[tuple]) -> str:
         all_data.append([i, query, users, searches])
 
     all_data_json = json.dumps(all_data)
+
+    # Filter slug map to only include queries in this table's data
+    if query_slug_map:
+        table_queries = {q[0] for q in top_queries}
+        filtered_slugs = {q: s for q, s in query_slug_map.items() if q in table_queries}
+        slug_map_json = json.dumps(filtered_slugs)
+    else:
+        slug_map_json = '{}'
 
     return f'''
     <div class="queries-table-container">
@@ -649,11 +761,15 @@ def create_queries_data_table(top_queries: List[tuple]) -> str:
 
     <script>
     (function() {{
+        // Base URL for query links (empty for root-hosted GitHub Pages)
+        window.baseUrl = '';
+
         const searchInput = document.getElementById('table_search');
         const resultsDiv = document.getElementById('search_results');
 
         // Store all data (compact array format: [rank, query, users, searches])
         const allData = {all_data_json};
+        const slugMap = {slug_map_json};
         let filteredData = allData;
 
         // CSV download function
@@ -689,9 +805,15 @@ def create_queries_data_table(top_queries: List[tuple]) -> str:
                     .replace(/</g, '&lt;')
                     .replace(/>/g, '&gt;');
 
+                // Link to query detail page if slug exists
+                const slug = slugMap[query];
+                const queryCell = slug
+                    ? '<a href="' + window.baseUrl + '/queries/' + slug + '.html" class="query-link">' + queryEscaped + '</a>'
+                    : queryEscaped;
+
                 return '<tr>' +
                     '<td class="rank-col">' + rank + '</td>' +
-                    '<td class="query-col">' + queryEscaped + '</td>' +
+                    '<td class="query-col">' + queryCell + '</td>' +
                     '<td class="users-col">' + users.toLocaleString() + '</td>' +
                     '<td class="searches-col">' + searches.toLocaleString() + '</td>' +
                     '</tr>';
@@ -843,6 +965,17 @@ def create_queries_data_table(top_queries: List[tuple]) -> str:
         .query-col {{
             min-width: 300px;
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+        }}
+
+        .query-link {{
+            color: #333;
+            text-decoration: none;
+            border-bottom: 1px solid #ccc;
+        }}
+
+        .query-link:hover {{
+            color: #000;
+            border-color: #333;
         }}
 
         .users-col, .searches-col {{
@@ -1006,7 +1139,7 @@ def generate_jekyll_data_files(periods: Dict[str, List[Dict]]):
         yaml.dump(weeks_data, f, default_flow_style=False, allow_unicode=True)
 
 
-def generate_all_time_page(conn, cutoff_date=None) -> str:
+def generate_all_time_page(conn, cutoff_date=None, query_slug_map=None) -> str:
     """Generate the all-time dashboard page using cumulative stats + materialized views"""
     print("  Computing all-time statistics from cumulative + live data...")
 
@@ -1040,9 +1173,9 @@ def generate_all_time_page(conn, cutoff_date=None) -> str:
     if article_content:
         print("  Using article mode for all-time page")
         sections = parse_article_sections(article_content)
-        html = generate_article_html_with_jekyll(stats, figures, sections, top_queries_data=top_queries)
+        html = generate_article_html_with_jekyll(stats, figures, sections, top_queries_data=top_queries, query_slug_map=query_slug_map)
     else:
-        html = generate_period_html(stats, figures, 'all', None, top_queries_data=top_queries)
+        html = generate_period_html(stats, figures, 'all', None, top_queries_data=top_queries, query_slug_map=query_slug_map)
 
     output_file = "docs/index.html"
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
@@ -1053,7 +1186,7 @@ def generate_all_time_page(conn, cutoff_date=None) -> str:
     return output_file
 
 
-def generate_period_page(conn, period_type: str, period_info: Dict, cutoff_date=None) -> Optional[str]:
+def generate_period_page(conn, period_type: str, period_info: Dict, cutoff_date=None, query_slug_map=None) -> Optional[str]:
     """Generate a dashboard page for a specific period"""
     period_label = period_info['label']
     period_id = period_info['id']
@@ -1087,7 +1220,7 @@ def generate_period_page(conn, period_type: str, period_info: Dict, cutoff_date=
     }
 
     # Generate HTML
-    html = generate_period_html(stats, figures, period_type, period_info, top_queries_data=top_queries)
+    html = generate_period_html(stats, figures, period_type, period_info, top_queries_data=top_queries, query_slug_map=query_slug_map)
 
     # Determine output path
     if period_type == 'week':
@@ -1104,7 +1237,8 @@ def generate_period_page(conn, period_type: str, period_info: Dict, cutoff_date=
 
 
 def generate_article_html_with_jekyll(stats: Dict, figures: Dict[str, go.Figure],
-                                      sections: List[Dict[str, Any]], top_queries_data: List[tuple] = None) -> str:
+                                      sections: List[Dict[str, Any]], top_queries_data: List[tuple] = None,
+                                      query_slug_map: Dict[str, str] = None) -> str:
     """Generate article mode HTML with Jekyll front matter"""
     front_matter = "---\nlayout: dashboard\nperiod: all\ntitle: All Time Statistics\n---\n\n"
 
@@ -1114,7 +1248,7 @@ def generate_article_html_with_jekyll(stats: Dict, figures: Dict[str, go.Figure]
             # For top_queries, combine chart + table
             if name == 'top_queries' and top_queries_data:
                 chart_part = fig.to_html(full_html=False, include_plotlyjs='cdn')
-                table_part = create_queries_data_table(top_queries_data)
+                table_part = create_queries_data_table(top_queries_data, query_slug_map)
                 chart_html[name] = f'{chart_part}\n{table_part}'
             else:
                 chart_html[name] = fig.to_html(full_html=False, include_plotlyjs='cdn')
@@ -1175,7 +1309,8 @@ def generate_article_html_with_jekyll(stats: Dict, figures: Dict[str, go.Figure]
 
 def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
                          period_type: str, period_info: Optional[Dict] = None,
-                         top_queries_data: List[tuple] = None) -> str:
+                         top_queries_data: List[tuple] = None,
+                         query_slug_map: Dict[str, str] = None) -> str:
     """Generate HTML for a period page with Jekyll front matter"""
     if period_type == 'all':
         front_matter = "---\nlayout: dashboard\nperiod: all\ntitle: All Time Statistics\n---\n\n"
@@ -1193,7 +1328,7 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
             # For top_queries, combine chart + table
             if name == 'top_queries' and top_queries_data:
                 chart_part = fig.to_html(full_html=False, include_plotlyjs='cdn')
-                table_part = create_queries_data_table(top_queries_data)
+                table_part = create_queries_data_table(top_queries_data, query_slug_map)
                 chart_html[name] = f'{chart_part}\n{table_part}'
             else:
                 chart_html[name] = fig.to_html(full_html=False, include_plotlyjs='cdn')
@@ -1288,6 +1423,147 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
     return front_matter + content
 
 
+def generate_query_pages(conn, cutoff_date=None) -> Dict[str, str]:
+    """Generate individual query detail pages with SVG charts.
+
+    Args:
+        conn: Database connection
+        cutoff_date: Exclude data after this date
+
+    Returns:
+        Dict mapping query_normalized -> slug for linking
+    """
+    cursor = conn.cursor()
+
+    # Fetch all daily data from query_daily_stats
+    if cutoff_date:
+        cursor.execute("""
+            SELECT query_normalized, date, search_count, unique_users
+            FROM query_daily_stats
+            WHERE date <= %s
+            ORDER BY query_normalized, date
+        """, (cutoff_date.date(),))
+    else:
+        cursor.execute("""
+            SELECT query_normalized, date, search_count, unique_users
+            FROM query_daily_stats
+            ORDER BY query_normalized, date
+        """)
+
+    all_rows = cursor.fetchall()
+    cursor.close()
+
+    if not all_rows:
+        print("  No query daily stats data found")
+        return {}
+
+    # Group by query_normalized
+    query_daily = defaultdict(list)
+    for query_norm, date, search_count, unique_users in all_rows:
+        query_daily[query_norm].append((date, search_count, unique_users))
+
+    print(f"  Found daily data for {len(query_daily)} queries")
+
+    # Fetch all-time stats per query from mv_top_queries
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT query_normalized, unique_users, total_searches
+        FROM mv_top_queries
+        WHERE unique_users >= 50
+    """)
+    query_stats = {row[0]: {'unique_users': row[1], 'total_searches': row[2]} for row in cursor.fetchall()}
+    cursor.close()
+
+    # Generate pages
+    os.makedirs('docs/queries', exist_ok=True)
+    slug_map = {}
+    count = 0
+
+    for query_norm, daily_data in query_daily.items():
+        slug = slugify_query(query_norm)
+        slug_map[query_norm] = slug
+
+        stats = query_stats.get(query_norm, {'unique_users': 0, 'total_searches': 0})
+        first_seen = daily_data[0][0]
+        last_seen = daily_data[-1][0]
+        total_days = len(daily_data)
+
+        # Display name: capitalize first letter of each word for readability
+        display_name = query_norm
+
+        # Generate SVG chart
+        svg_chart = create_svg_line_chart(daily_data)
+
+        # Format dates
+        first_str = first_seen.strftime('%Y-%m-%d') if hasattr(first_seen, 'strftime') else str(first_seen)
+        last_str = last_seen.strftime('%Y-%m-%d') if hasattr(last_seen, 'strftime') else str(last_seen)
+
+        # Escape HTML in query display
+        display_escaped = (display_name
+                           .replace('&', '&amp;')
+                           .replace('<', '&lt;')
+                           .replace('>', '&gt;')
+                           .replace('"', '&quot;'))
+
+        content = f'''---
+layout: query
+query_display: "{display_escaped}"
+---
+
+<div class="breadcrumb">
+    <a href="{{{{ site.baseurl }}}}/">All Time</a> / Query Detail
+</div>
+
+<h1>{display_escaped}</h1>
+
+<div class="stats-grid">
+    <div class="stat-card">
+        <h3>Unique Users</h3>
+        <div class="value">{stats["unique_users"]:,}</div>
+        <div class="label">All-time unique searchers</div>
+    </div>
+    <div class="stat-card">
+        <h3>Total Searches</h3>
+        <div class="value">{stats["total_searches"]:,}</div>
+        <div class="label">All-time search events</div>
+    </div>
+    <div class="stat-card">
+        <h3>First Seen</h3>
+        <div class="value">{first_str}</div>
+    </div>
+    <div class="stat-card">
+        <h3>Last Seen</h3>
+        <div class="value">{last_str}</div>
+    </div>
+    <div class="stat-card">
+        <h3>Active Days</h3>
+        <div class="value">{total_days:,}</div>
+        <div class="label">Days with at least 1 search</div>
+    </div>
+</div>
+
+<h2>Daily Search Activity</h2>
+<div class="chart-container">
+    {svg_chart}
+</div>
+
+<div class="back-link">
+    <a href="{{{{ site.baseurl }}}}/">Back to dashboard</a>
+</div>
+'''
+
+        output_file = f"docs/queries/{slug}.html"
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write(content)
+
+        count += 1
+        if count % 500 == 0:
+            print(f"  Generated {count}/{len(query_daily)} query pages...")
+
+    print(f"  Generated {count} query pages in docs/queries/")
+    return slug_map
+
+
 def main():
     """Main execution using materialized views"""
     print("Connecting to PostgreSQL database...")
@@ -1311,30 +1587,36 @@ def main():
         generate_jekyll_data_files(periods)
         print("Generated Jekyll navigation data files")
 
+        # Generate query detail pages first (to get slug map for linking)
+        print("=" * 60)
+        print("GENERATING QUERY DETAIL PAGES")
+        print("=" * 60)
+        query_slug_map = generate_query_pages(conn, cutoff_date)
+
         # Generate all-time page (uses cumulative stats + materialized views)
         print("=" * 60)
         print("GENERATING ALL-TIME PAGE")
         print("=" * 60)
-        generate_all_time_page(conn, cutoff_date)
+        generate_all_time_page(conn, cutoff_date, query_slug_map)
 
         # Generate monthly pages
         for month in periods['months']:
             print("=" * 60)
             print(f"GENERATING MONTHLY PAGE: {month['label']}")
             print("=" * 60)
-            generate_period_page(conn, 'month', month, cutoff_date)
+            generate_period_page(conn, 'month', month, cutoff_date, query_slug_map)
 
         # Generate weekly pages
         for week in periods['weeks']:
             print("=" * 60)
             print(f"GENERATING WEEKLY PAGE: CW {week['label']}")
             print("=" * 60)
-            generate_period_page(conn, 'week', week, cutoff_date)
+            generate_period_page(conn, 'week', week, cutoff_date, query_slug_map)
 
-        total_pages = 1 + len(periods['months']) + len(periods['weeks'])
+        total_pages = 1 + len(periods['months']) + len(periods['weeks']) + len(query_slug_map)
         print("\n" + "=" * 60)
-        print(f"Generated {total_pages} dashboard pages")
-        print(f"  - 1 all-time, {len(periods['months'])} monthly, {len(periods['weeks'])} weekly")
+        print(f"Generated {total_pages} total pages")
+        print(f"  - 1 all-time, {len(periods['months'])} monthly, {len(periods['weeks'])} weekly, {len(query_slug_map)} query detail")
         print("=" * 60)
 
     finally:

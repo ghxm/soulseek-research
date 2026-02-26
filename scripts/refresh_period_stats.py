@@ -216,6 +216,87 @@ def compute_period_query_length_dist(conn, period_type: str, period_id: str,
     return len(values)
 
 
+def compute_query_daily_stats(conn):
+    """Compute daily stats for queries with 50+ all-time unique users.
+
+    Uses mv_top_queries (already refreshed) to identify eligible queries,
+    then aggregates daily counts from the searches table.
+    """
+    cursor = conn.cursor()
+
+    # Get eligible queries (50+ unique users) from materialized view
+    cursor.execute("""
+        SELECT query_normalized FROM mv_top_queries
+        WHERE unique_users >= 50
+    """)
+    eligible = [row[0] for row in cursor.fetchall()]
+    cursor.close()
+
+    if not eligible:
+        print("  No queries with 50+ users found")
+        return 0
+
+    print(f"  Found {len(eligible)} eligible queries (50+ users)")
+
+    # Process in chunks to avoid query size limits
+    chunk_size = 500
+    total_inserted = 0
+
+    for chunk_start in range(0, len(eligible), chunk_size):
+        chunk = eligible[chunk_start:chunk_start + chunk_size]
+        chunk_label = f"[{chunk_start + 1}-{min(chunk_start + chunk_size, len(eligible))}/{len(eligible)}]"
+
+        cursor = conn.cursor()
+        # Use ANY(%s) with array parameter for clean parameterized query
+        cursor.execute("""
+            SELECT
+                LOWER(TRIM(query)) as query_normalized,
+                DATE(timestamp) as date,
+                COUNT(*) as search_count,
+                COUNT(DISTINCT username) as unique_users
+            FROM searches
+            WHERE LOWER(TRIM(query)) = ANY(%s)
+            GROUP BY LOWER(TRIM(query)), DATE(timestamp)
+            ORDER BY query_normalized, date
+        """, (chunk,))
+
+        rows = cursor.fetchall()
+        cursor.close()
+
+        if not rows:
+            print(f"  {chunk_label} No daily data found")
+            continue
+
+        # Delete old data for this chunk and insert new
+        cursor = conn.cursor()
+        cursor.execute("""
+            DELETE FROM query_daily_stats
+            WHERE query_normalized = ANY(%s)
+        """, (chunk,))
+
+        values = [
+            (row[0], row[1], int(row[2]), int(row[3]))
+            for row in rows
+        ]
+
+        execute_values(
+            cursor,
+            """INSERT INTO query_daily_stats
+               (query_normalized, date, search_count, unique_users)
+               VALUES %s""",
+            values,
+            page_size=5000
+        )
+
+        conn.commit()
+        cursor.close()
+
+        total_inserted += len(values)
+        print(f"  {chunk_label} Inserted {len(values)} daily rows")
+
+    return total_inserted
+
+
 def refresh_period_stats(conn):
     """Refresh all period statistics"""
     print("Getting date range from searches table...")
@@ -265,6 +346,15 @@ def main():
     try:
         conn = get_db_connection()
         refresh_period_stats(conn)
+
+        print("\n" + "=" * 60)
+        print("COMPUTING QUERY DAILY STATS")
+        print("=" * 60)
+        start = datetime.now(timezone.utc)
+        total_daily = compute_query_daily_stats(conn)
+        elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+        print(f"  Query daily stats: {total_daily} rows in {elapsed:.1f}s")
+
         conn.close()
 
         print("=" * 60)

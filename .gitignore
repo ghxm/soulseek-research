@@ -315,3 +315,4 @@ maintenance-*.md
 # Generated docs (except setup guide)
 /docs/index.html
 /docs/stats.json
+/docs/queries/

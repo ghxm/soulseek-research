@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ page.query_display }} - Soulseek Search Monitor</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            background: white;
+            color: #333;
+        }
+
+        /* Reuse nav styles from dashboard layout */
+        nav.period-nav {
+            background: #f8f8f8;
+            border-bottom: 2px solid #333;
+            padding: 12px 20px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            position: sticky;
+            top: 0;
+            z-index: 1000;
+        }
+
+        .nav-logo {
+            width: 24px;
+            height: 24px;
+            flex-shrink: 0;
+            filter: grayscale(100%) brightness(0.4);
+        }
+
+        .nav-brand {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            text-decoration: none;
+            flex-shrink: 0;
+        }
+
+        .nav-brand:hover { opacity: 0.8; }
+
+        .nav-title {
+            font-size: 16px;
+            font-weight: 600;
+            color: #333;
+            margin: 0;
+        }
+
+        .nav-menu {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            flex-wrap: wrap;
+        }
+
+        .hamburger {
+            display: none;
+            flex-direction: column;
+            justify-content: space-around;
+            width: 24px;
+            height: 20px;
+            background: transparent;
+            border: none;
+            cursor: pointer;
+            padding: 0;
+            margin-left: auto;
+        }
+
+        .hamburger span {
+            width: 100%;
+            height: 2px;
+            background: #333;
+            border-radius: 2px;
+            transition: all 0.3s;
+        }
+
+        @media (max-width: 768px) {
+            nav.period-nav { flex-wrap: wrap; }
+            .hamburger { display: flex; }
+            .nav-menu {
+                display: none;
+                width: 100%;
+                flex-direction: column;
+                align-items: flex-start;
+                padding-top: 15px;
+                gap: 10px;
+            }
+            .nav-menu.open { display: flex; }
+            .nav-menu .nav-separator { display: none; }
+            .nav-menu .dropdown { width: 100%; }
+            .nav-menu .dropdown > span { display: block; width: 100%; }
+            .nav-menu .dropdown-content {
+                position: static;
+                box-shadow: none;
+                border: none;
+                border-left: 2px solid #ccc;
+                margin-left: 10px;
+                display: none;
+            }
+            .nav-menu .dropdown.open .dropdown-content { display: block; }
+            .nav-menu .dropdown:hover .dropdown-content { display: none; }
+            .nav-menu .dropdown.open:hover .dropdown-content { display: block; }
+            .nav-menu > a { width: 100%; }
+        }
+
+        .nav-separator {
+            color: #ccc;
+            font-weight: 300;
+            margin: 0 5px;
+        }
+
+        nav.period-nav a {
+            color: #333;
+            text-decoration: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            transition: background 0.2s;
+        }
+
+        nav.period-nav a:hover { background: #e0e0e0; }
+        nav.period-nav a.active { background: #333; color: white; font-weight: 600; }
+
+        .dropdown { position: relative; display: inline-block; }
+        .dropdown > span {
+            cursor: pointer;
+            padding: 8px 16px;
+            border-radius: 4px;
+            transition: background 0.2s;
+        }
+        .dropdown > span:hover { background: #e0e0e0; }
+        .dropdown-content {
+            display: none;
+            position: absolute;
+            background-color: white;
+            min-width: 160px;
+            box-shadow: 0px 8px 16px 0px rgba(0,0,0,0.2);
+            z-index: 1;
+            max-height: 400px;
+            overflow-y: auto;
+            border: 1px solid #333;
+        }
+        .dropdown-content a {
+            color: black;
+            padding: 12px 16px;
+            text-decoration: none;
+            display: block;
+            border-radius: 0;
+        }
+        .dropdown-content a:hover { background-color: #f5f5f5; }
+        .dropdown:hover .dropdown-content { display: block; }
+
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 30px;
+        }
+
+        .breadcrumb {
+            font-size: 14px;
+            color: #999;
+            margin-bottom: 10px;
+        }
+
+        .breadcrumb a {
+            color: #666;
+            text-decoration: none;
+            border-bottom: 1px solid #ccc;
+        }
+
+        .breadcrumb a:hover { color: #333; border-color: #333; }
+
+        h1 {
+            color: black;
+            border-bottom: 2px solid black;
+            padding-bottom: 10px;
+            font-weight: 600;
+            word-break: break-word;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 15px;
+            margin: 25px 0;
+        }
+
+        .stat-card {
+            background: white;
+            padding: 15px;
+            border: 1px solid #333;
+        }
+
+        .stat-card h3 {
+            margin: 0;
+            font-size: 12px;
+            font-weight: 400;
+            color: #666;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .stat-card .value {
+            font-size: 24px;
+            font-weight: 600;
+            margin: 8px 0 4px 0;
+            color: black;
+        }
+
+        .stat-card .label {
+            font-size: 11px;
+            color: #999;
+        }
+
+        .chart-container {
+            margin: 30px 0;
+        }
+
+        .chart-container svg {
+            width: 100%;
+            height: auto;
+        }
+
+        .back-link {
+            margin-top: 40px;
+            padding-top: 20px;
+            border-top: 1px solid #eee;
+        }
+
+        .back-link a {
+            color: #666;
+            text-decoration: none;
+            border-bottom: 1px solid #ccc;
+            font-size: 14px;
+        }
+
+        .back-link a:hover { color: #333; border-color: #333; }
+
+        .footer {
+            margin-top: 50px;
+            text-align: center;
+            color: #999;
+            font-size: 14px;
+            border-top: 1px solid #eee;
+            padding-top: 20px;
+        }
+
+        .footer a {
+            color: #666;
+            text-decoration: none;
+            border-bottom: 1px solid #666;
+        }
+    </style>
+</head>
+<body>
+    {% include nav.html %}
+
+    <div class="container">
+        {{ content }}
+
+        <div class="footer">
+            <p>Soulseek Research Project | Data collected from distributed geographic locations</p>
+            <p>All usernames are cryptographically hashed for privacy</p>
+            <p><a href="https://github.com/ghxm/soulseek-research">View on GitHub</a></p>
+        </div>
+    </div>
+</body>
+</html>
