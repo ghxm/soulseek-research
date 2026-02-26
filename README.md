@@ -2,7 +2,7 @@
 
 ## Project Description
 
-This project monitors the Soulseek peer-to-peer file-sharing network by passively collecting search queries issued by other users. It is designed for research purposes in computational social science. The system consists of one or more geographically distributed clients that connect to the Soulseek network, observe incoming search requests, and log anonymized metadata (client ID, timestamp, hashed username, query text) to a central PostgreSQL database.
+This project monitors the Soulseek peer-to-peer file-sharing network by passively collecting search queries issued by other users for research purposes. The system consists of one or more geographically distributed clients that connect to the Soulseek network, observe incoming search requests, and log anonymized metadata (client ID, timestamp, hashed username, query text) to a central PostgreSQL database.
 
 Precomputed statistics and materialized views support a static dashboard deployed via GitHub Pages. Data archival, view refresh, and dashboard generation run on automated daily/weekly schedules through GitHub Actions.
 
