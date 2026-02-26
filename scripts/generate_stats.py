@@ -12,11 +12,14 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 
+import numpy as np
 import psycopg2
 import pandas as pd
 import plotly.graph_objects as go
 import mistune
 import yaml
+from scipy.sparse import csr_matrix
+from sklearn.metrics.pairwise import cosine_similarity
 
 
 def format_days(first_search_str, last_search_str):
@@ -1418,16 +1421,168 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
     return front_matter + content
 
 
-def generate_query_pages(conn, cutoff_date=None) -> Dict[str, str]:
+def compute_query_similarities(conn, eligible_queries: set, top_n: int = 20,
+                                min_shared_users: int = 5) -> Dict[str, list]:
+    """Compute cosine similarity between queries based on user co-occurrence.
+
+    Builds a binary user-query co-occurrence matrix and computes cosine
+    similarity in chunks to stay within memory budget.
+
+    Args:
+        conn: Database connection
+        eligible_queries: Set of query_normalized strings to include
+        top_n: Number of most similar queries to return per query
+        min_shared_users: Minimum shared users to include a pair
+
+    Returns:
+        Dict mapping query_normalized -> [(similar_query, score, shared_users), ...]
+    """
+    import time
+    t0 = time.time()
+    print("  Loading user-query pairs from database...")
+
+    # Build index mappings and sparse matrix data in a single pass
+    query_to_idx = {}
+    user_to_idx = {}
+    rows, cols = [], []
+
+    cursor = conn.cursor('similarity_cursor')
+    cursor.itersize = 50000
+    cursor.execute("""
+        SELECT DISTINCT username, LOWER(TRIM(query)) as query_normalized
+        FROM searches
+        WHERE LOWER(TRIM(query)) = ANY(%s)
+    """, (list(eligible_queries),))
+
+    for username, query_norm in cursor:
+        if query_norm not in query_to_idx:
+            query_to_idx[query_norm] = len(query_to_idx)
+        if username not in user_to_idx:
+            user_to_idx[username] = len(user_to_idx)
+        rows.append(query_to_idx[query_norm])
+        cols.append(user_to_idx[username])
+
+    cursor.close()
+
+    n_queries = len(query_to_idx)
+    n_users = len(user_to_idx)
+    print(f"  Built index: {n_queries} queries x {n_users} users, {len(rows)} pairs "
+          f"({time.time() - t0:.1f}s)")
+
+    if n_queries < 2:
+        return {}
+
+    # Build sparse binary matrix (queries x users)
+    data = np.ones(len(rows), dtype=np.float32)
+    matrix = csr_matrix((data, (rows, cols)), shape=(n_queries, n_users))
+
+    # Reverse mapping for output
+    idx_to_query = {idx: q for q, idx in query_to_idx.items()}
+
+    # Compute similarities in chunks
+    chunk_size = 500
+    similarities = {}
+
+    for start in range(0, n_queries, chunk_size):
+        end = min(start + chunk_size, n_queries)
+        chunk = matrix[start:end]
+
+        # Cosine similarity: chunk (500 x users) vs full matrix (queries x users)
+        sim_chunk = cosine_similarity(chunk, matrix)
+
+        # Shared user counts: dot product of binary matrices
+        shared_chunk = (chunk @ matrix.T).toarray()
+
+        for i in range(end - start):
+            global_idx = start + i
+            query = idx_to_query[global_idx]
+
+            # Zero out self-similarity
+            sim_chunk[i, global_idx] = 0.0
+
+            # Filter by min shared users
+            valid_mask = shared_chunk[i] >= min_shared_users
+            if not valid_mask.any():
+                continue
+
+            # Get top-N from valid entries
+            valid_indices = np.where(valid_mask)[0]
+            scores = sim_chunk[i, valid_indices]
+
+            if len(valid_indices) <= top_n:
+                top_local = np.argsort(-scores)
+            else:
+                top_local = np.argpartition(-scores, top_n)[:top_n]
+                top_local = top_local[np.argsort(-scores[top_local])]
+
+            result = []
+            for li in top_local:
+                gi = valid_indices[li]
+                score = float(scores[li])
+                if score <= 0:
+                    continue
+                result.append((idx_to_query[gi], score, int(shared_chunk[i, gi])))
+            if result:
+                similarities[query] = result
+
+        if end % 2000 == 0 or end == n_queries:
+            print(f"  Similarity progress: {end}/{n_queries} queries ({time.time() - t0:.1f}s)")
+
+    print(f"  Computed similarities for {len(similarities)} queries ({time.time() - t0:.1f}s)")
+    return similarities
+
+
+def build_similar_queries_html(query_norm: str, query_similarities: Dict[str, list],
+                               slug_map: Dict[str, str]) -> str:
+    """Build HTML for the 'Users who searched this also searched' section.
+
+    Returns empty string if no similar queries exist for this query.
+    """
+    similar = query_similarities.get(query_norm)
+    if not similar:
+        return ''
+
+    items = []
+    for sim_query, score, shared_users in similar:
+        sim_slug = slug_map.get(sim_query)
+        sim_escaped = (sim_query
+                       .replace('&', '&amp;')
+                       .replace('<', '&lt;')
+                       .replace('>', '&gt;')
+                       .replace('"', '&quot;'))
+        pct = f"{score * 100:.0f}%"
+
+        if sim_slug:
+            link = f'<a href="{{{{ site.baseurl }}}}/queries/{sim_slug}.html">{sim_escaped}</a>'
+        else:
+            link = sim_escaped
+
+        items.append(
+            f'<li>{link} '
+            f'<span class="sim-meta">{pct} similar, {shared_users:,} shared users</span></li>'
+        )
+
+    return f'''<div class="similar-queries">
+<h2>Users who searched this also searched</h2>
+<ul>
+{"".join(items)}
+</ul>
+</div>'''
+
+
+def generate_query_pages(conn, cutoff_date=None, query_similarities=None) -> Dict[str, str]:
     """Generate individual query detail pages with SVG charts.
 
     Args:
         conn: Database connection
         cutoff_date: Exclude data after this date
+        query_similarities: Dict mapping query -> [(similar_query, score, shared_users), ...]
 
     Returns:
         Dict mapping query_normalized -> slug for linking
     """
+    if query_similarities is None:
+        query_similarities = {}
     cursor = conn.cursor()
 
     # Fetch all daily data from query_daily_stats
@@ -1471,12 +1626,13 @@ def generate_query_pages(conn, cutoff_date=None) -> Dict[str, str]:
 
     # Generate pages
     os.makedirs('docs/queries', exist_ok=True)
-    slug_map = {}
+
+    # Pre-build slug map so we can link between similar query pages
+    slug_map = {q: slugify_query(q) for q in query_daily}
     count = 0
 
     for query_norm, daily_data in query_daily.items():
-        slug = slugify_query(query_norm)
-        slug_map[query_norm] = slug
+        slug = slug_map[query_norm]
 
         stats = query_stats.get(query_norm, {'unique_users': 0, 'total_searches': 0})
         first_seen = daily_data[0][0]
@@ -1543,6 +1699,8 @@ query_display: "{display_escaped}"
 </div>
 <p style="font-size: 12px; color: #999; margin-top: 8px;">Unique users are counted per day based on distinct (hashed) usernames. A user searching the same query multiple times in one day counts once for that day. All dates are in UTC.</p>
 
+{build_similar_queries_html(query_norm, query_similarities, slug_map)}
+
 <div class="back-link">
     <a href="{{{{ site.baseurl }}}}/">Back to dashboard</a>
 </div>
@@ -1583,11 +1741,22 @@ def main():
         generate_jekyll_data_files(periods)
         print("Generated Jekyll navigation data files")
 
-        # Generate query detail pages first (to get slug map for linking)
+        # Get eligible queries for similarity computation (queries with detail pages)
+        print("=" * 60)
+        print("COMPUTING QUERY SIMILARITIES")
+        print("=" * 60)
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT query_normalized FROM query_daily_stats")
+        eligible_queries = {row[0] for row in cursor.fetchall()}
+        cursor.close()
+        print(f"  {len(eligible_queries)} eligible queries")
+        query_similarities = compute_query_similarities(conn, eligible_queries)
+
+        # Generate query detail pages (to get slug map for linking)
         print("=" * 60)
         print("GENERATING QUERY DETAIL PAGES")
         print("=" * 60)
-        query_slug_map = generate_query_pages(conn, cutoff_date)
+        query_slug_map = generate_query_pages(conn, cutoff_date, query_similarities)
 
         # Generate all-time page (uses cumulative stats + materialized views)
         print("=" * 60)
