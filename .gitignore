@@ -286,12 +286,23 @@ cython_debug/
 # Test files
 test_*.py
 
-# Generated/temporary docs
+# Internal dev/AI docs
+CLAUDE.md
+DEPLOYMENT_GUIDE.md
+IMPLEMENTATION_SUMMARY.md
+PERIOD_STATS_IMPLEMENTATION.md
+TESTING_PERIOD_STATS.md
 DATA_RETENTION.md
 DEPLOYMENT_STEPS.md
 SECURITY_NOTE.md
+SOLUTION_SUMMARY.md
+VISUALIZATION_GUIDE.md
 docs/ARTICLE_MODE.md
 docs/article.md.example
+
+# Internal scripts
+scripts/analyze_experiment.py
+scripts/experiment_send_queries.py
 
 # Secrets & Credentials
 terraform.tfvars
