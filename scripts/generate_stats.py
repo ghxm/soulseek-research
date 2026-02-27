@@ -1428,15 +1428,6 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
     {chart_html.get('query_length', '<p>Not enough data</p>')}
 </div>
 
-<div style="background: #f5f5f5; padding: 20px; margin: 20px 0; border-left: 4px solid #333;">
-    <h3 style="margin-top: 0; color: #333;">Data Collection Note</h3>
-    <p style="margin-bottom: 0; color: #666;">
-        <strong>Total Search Events</strong> shows the raw count of search requests received by
-        the research client including duplicate queries made by the same user(s). Top queries are ranked by
-        <strong>unique users searching for that term</strong>, not raw event count.
-    </p>
-</div>
-
 <h2>Data Collection Overview <span style="font-weight: normal; font-size: 14px; color: #999;">(Raw Counts)</span></h2>
 <div class="chart">
     {chart_html['daily_flow']}
@@ -1444,6 +1435,15 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
 
 <div class="chart">
     {chart_html.get('client_distribution', '<p>Not enough data</p>')}
+</div>
+
+<div style="background: #f5f5f5; padding: 20px; margin: 20px 0; border-left: 4px solid #333;">
+    <h3 style="margin-top: 0; color: #333;">Data Collection Note</h3>
+    <p style="margin-bottom: 0; color: #666;">
+        <strong>Total Search Events</strong> shows the raw count of search requests received by
+        the research client including duplicate queries made by the same user(s). Top queries are ranked by
+        <strong>unique users searching for that term</strong>, not raw event count.
+    </p>
 </div>
 '''
     return front_matter + content
