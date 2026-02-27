@@ -47,6 +47,7 @@ def ensure_user_query_pairs_table(conn):
         CREATE TABLE IF NOT EXISTS user_query_pairs (
             username TEXT NOT NULL,
             query_normalized TEXT NOT NULL,
+            last_seen DATE,
             PRIMARY KEY (username, query_normalized)
         )
     """)
@@ -68,18 +69,20 @@ def populate_user_query_pairs(conn, month: str = None):
     cursor = conn.cursor()
     if month:
         cursor.execute("""
-            INSERT INTO user_query_pairs (username, query_normalized)
-            SELECT DISTINCT username, LOWER(TRIM(query))
+            INSERT INTO user_query_pairs (username, query_normalized, last_seen)
+            SELECT DISTINCT username, LOWER(TRIM(query)), CURRENT_DATE
             FROM searches
             WHERE TO_CHAR(timestamp, 'YYYY-MM') = %s
-            ON CONFLICT DO NOTHING
+            ON CONFLICT (username, query_normalized)
+            DO UPDATE SET last_seen = EXCLUDED.last_seen
         """, (month,))
     else:
         cursor.execute("""
-            INSERT INTO user_query_pairs (username, query_normalized)
-            SELECT DISTINCT username, LOWER(TRIM(query))
+            INSERT INTO user_query_pairs (username, query_normalized, last_seen)
+            SELECT DISTINCT username, LOWER(TRIM(query)), CURRENT_DATE
             FROM searches
-            ON CONFLICT DO NOTHING
+            ON CONFLICT (username, query_normalized)
+            DO UPDATE SET last_seen = EXCLUDED.last_seen
         """)
     inserted = cursor.rowcount
     conn.commit()

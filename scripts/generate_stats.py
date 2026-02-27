@@ -1410,27 +1410,8 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
 <p class="period-range">{date_range_str}</p>
 <p class="timestamp">Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
 
-<div style="background: #f5f5f5; padding: 20px; margin: 20px 0; border-left: 4px solid #333;">
-    <h3 style="margin-top: 0; color: #333;">Data Collection Note</h3>
-    <p style="margin-bottom: 0; color: #666;">
-        <strong>Total Search Events</strong> shows the raw count of search requests received by
-        the research client. <strong>Unique Users</strong> and <strong>Unique Queries</strong>
-        are counted distinctly to show actual network diversity. Top queries are ranked by
-        <strong>unique users searching for that term</strong>, not raw event count.
-    </p>
-</div>
-
 <h2>Summary Statistics</h2>
 {stats_grid}
-
-<h2>Data Collection Overview <span style="font-weight: normal; font-size: 14px; color: #999;">(Raw Counts)</span></h2>
-<div class="chart">
-    {chart_html['daily_flow']}
-</div>
-
-<div class="chart">
-    {chart_html.get('client_distribution', '<p>Not enough data</p>')}
-</div>
 
 <h2>User Activity Trends <span style="font-weight: normal; font-size: 14px; color: #999;">(Unique Users per Day)</span></h2>
 <div class="chart">
@@ -1445,6 +1426,24 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
 <h2>Query Length Distribution <span style="font-weight: normal; font-size: 14px; color: #999;">(Unique Queries)</span></h2>
 <div class="chart">
     {chart_html.get('query_length', '<p>Not enough data</p>')}
+</div>
+
+<div style="background: #f5f5f5; padding: 20px; margin: 20px 0; border-left: 4px solid #333;">
+    <h3 style="margin-top: 0; color: #333;">Data Collection Note</h3>
+    <p style="margin-bottom: 0; color: #666;">
+        <strong>Total Search Events</strong> shows the raw count of search requests received by
+        the research client including duplicate queries made by the same user(s). Top queries are ranked by
+        <strong>unique users searching for that term</strong>, not raw event count.
+    </p>
+</div>
+
+<h2>Data Collection Overview <span style="font-weight: normal; font-size: 14px; color: #999;">(Raw Counts)</span></h2>
+<div class="chart">
+    {chart_html['daily_flow']}
+</div>
+
+<div class="chart">
+    {chart_html.get('client_distribution', '<p>Not enough data</p>')}
 </div>
 '''
     return front_matter + content
@@ -1481,6 +1480,7 @@ def compute_query_similarities(conn, eligible_queries: set, top_n: int = 20,
         SELECT username, query_normalized
         FROM user_query_pairs
         WHERE query_normalized = ANY(%s)
+          AND last_seen >= CURRENT_DATE - INTERVAL '90 days'
     """, (list(eligible_queries),))
 
     for username, query_norm in cursor:
@@ -1592,7 +1592,7 @@ def build_similar_queries_html(query_norm: str, query_similarities: Dict[str, li
         )
 
     return f'''<div class="similar-queries">
-<h2>Users who searched this also searched</h2>
+<h2>Users who searched this also searched <span style="font-weight: normal; font-size: 14px; color: #999;">(last 90 days)</span></h2>
 <ul>
 {"".join(items)}
 </ul>
@@ -1657,7 +1657,7 @@ def generate_query_pages(conn, cutoff_date=None, query_similarities=None,
     cursor.execute("""
         SELECT query_normalized, unique_users, total_searches
         FROM mv_top_queries
-        WHERE unique_users >= 50
+        WHERE unique_users >= 35
     """)
     query_stats = {row[0]: {'unique_users': row[1], 'total_searches': row[2]} for row in cursor.fetchall()}
     cursor.close()
@@ -1791,6 +1791,7 @@ def main():
             CREATE TABLE IF NOT EXISTS user_query_pairs (
                 username TEXT NOT NULL,
                 query_normalized TEXT NOT NULL,
+                last_seen DATE,
                 PRIMARY KEY (username, query_normalized)
             )
         """)

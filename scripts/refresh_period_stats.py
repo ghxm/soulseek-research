@@ -217,7 +217,7 @@ def compute_period_query_length_dist(conn, period_type: str, period_id: str,
 
 
 def compute_query_daily_stats(conn):
-    """Compute daily stats for queries with 50+ all-time unique users.
+    """Compute daily stats for queries with 35+ all-time unique users.
 
     Uses mv_top_queries (already refreshed) to identify eligible queries,
     then aggregates daily counts from the searches table.
@@ -227,16 +227,16 @@ def compute_query_daily_stats(conn):
     # Get eligible queries (50+ unique users) from materialized view
     cursor.execute("""
         SELECT query_normalized FROM mv_top_queries
-        WHERE unique_users >= 50
+        WHERE unique_users >= 35
     """)
     eligible = [row[0] for row in cursor.fetchall()]
     cursor.close()
 
     if not eligible:
-        print("  No queries with 50+ users found")
+        print("  No queries with 35+ users found")
         return 0
 
-    print(f"  Found {len(eligible)} eligible queries (50+ users)")
+    print(f"  Found {len(eligible)} eligible queries (35+ users)")
 
     # Process in chunks to avoid query size limits
     chunk_size = 500
