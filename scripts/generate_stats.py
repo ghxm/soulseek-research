@@ -4,6 +4,7 @@ Generate statistics dashboard for Soulseek research data.
 Queries pre-computed materialized views and cumulative stats table.
 """
 
+import fnmatch
 import hashlib
 import json
 import os
@@ -38,6 +39,28 @@ def format_days(first_search_str, last_search_str):
     if days_rounded == int(days_rounded):
         return str(int(days_rounded))
     return f"{days_rounded:.1f}"
+
+
+def parse_blacklist(raw: str) -> List[str]:
+    """Parse comma-separated blacklist patterns from environment variable.
+
+    Returns a list of lowercase patterns suitable for fnmatch matching.
+    Empty/whitespace-only entries are ignored.
+    """
+    if not raw or not raw.strip():
+        return []
+    return [p.strip().lower() for p in raw.split(',') if p.strip()]
+
+
+def is_blacklisted(query: str, patterns: List[str]) -> bool:
+    """Check if a query matches any blacklist pattern (case-insensitive).
+
+    Uses fnmatch for wildcard matching: * matches anything, ? matches one char.
+    """
+    if not patterns:
+        return False
+    query_lower = query.lower()
+    return any(fnmatch.fnmatch(query_lower, p) for p in patterns)
 
 
 def get_db_connection():
@@ -636,12 +659,12 @@ def create_daily_unique_users_chart(df: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def create_top_queries_chart(top_queries: List[tuple], limit: int = 100) -> go.Figure:
+def create_top_queries_chart(top_queries: List[tuple], limit: int = 25) -> go.Figure:
     """Create interactive bar chart of top N queries for performance.
 
     Args:
         top_queries: List of (query, unique_users, total_searches) tuples
-        limit: Maximum number of queries to show in chart (default 100)
+        limit: Maximum number of queries to show in chart (default 25)
 
     Returns:
         Plotly figure with top N queries
@@ -650,8 +673,7 @@ def create_top_queries_chart(top_queries: List[tuple], limit: int = 100) -> go.F
     queries = [q[0] for q in top_queries[:limit]]
     unique_users = [q[1] for q in top_queries[:limit]]
 
-    # Fixed reasonable height for better readability
-    chart_height = 2500  # 25px per query for comfortable spacing
+    chart_height = max(400, limit * 25)
 
     fig = go.Figure(data=[
         go.Bar(
@@ -1131,7 +1153,7 @@ def generate_jekyll_data_files(periods: Dict[str, List[Dict]]):
         yaml.dump(weeks_data, f, default_flow_style=False, allow_unicode=True)
 
 
-def generate_all_time_page(conn, cutoff_date=None, query_slug_map=None) -> str:
+def generate_all_time_page(conn, cutoff_date=None, query_slug_map=None, blacklist=None) -> str:
     """Generate the all-time dashboard page using cumulative stats + materialized views"""
     print("  Computing all-time statistics from cumulative + live data...")
 
@@ -1149,6 +1171,8 @@ def generate_all_time_page(conn, cutoff_date=None, query_slug_map=None) -> str:
     daily_stats = get_daily_stats(conn, end_date=cutoff_date)
     daily_unique_users = get_daily_unique_users(conn, end_date=cutoff_date)
     top_queries = get_top_queries(conn)
+    if blacklist:
+        top_queries = [q for q in top_queries if not is_blacklisted(q[0], blacklist)]
     query_length_dist = get_query_length_distribution(conn)
 
     # Create figures
@@ -1178,7 +1202,8 @@ def generate_all_time_page(conn, cutoff_date=None, query_slug_map=None) -> str:
     return output_file
 
 
-def generate_period_page(conn, period_type: str, period_info: Dict, cutoff_date=None, query_slug_map=None) -> Optional[str]:
+def generate_period_page(conn, period_type: str, period_info: Dict, cutoff_date=None,
+                         query_slug_map=None, blacklist=None) -> Optional[str]:
     """Generate a dashboard page for a specific period"""
     period_label = period_info['label']
     period_id = period_info['id']
@@ -1200,6 +1225,8 @@ def generate_period_page(conn, period_type: str, period_info: Dict, cutoff_date=
     daily_stats = get_daily_stats(conn, start_date, end_date)
     daily_unique_users = get_daily_unique_users(conn, start_date, end_date)
     top_queries = get_period_top_queries(conn, period_type, period_id)
+    if blacklist:
+        top_queries = [q for q in top_queries if not is_blacklisted(q[0], blacklist)]
     query_length_dist = get_period_query_length_dist(conn, period_type, period_id)
 
     # Create figures
@@ -1570,13 +1597,15 @@ def build_similar_queries_html(query_norm: str, query_similarities: Dict[str, li
 </div>'''
 
 
-def generate_query_pages(conn, cutoff_date=None, query_similarities=None) -> Dict[str, str]:
+def generate_query_pages(conn, cutoff_date=None, query_similarities=None,
+                         blacklist=None) -> Dict[str, str]:
     """Generate individual query detail pages with SVG charts.
 
     Args:
         conn: Database connection
         cutoff_date: Exclude data after this date
         query_similarities: Dict mapping query -> [(similar_query, score, shared_users), ...]
+        blacklist: List of lowercase fnmatch patterns to exclude
 
     Returns:
         Dict mapping query_normalized -> slug for linking
@@ -1611,6 +1640,13 @@ def generate_query_pages(conn, cutoff_date=None, query_similarities=None) -> Dic
     query_daily = defaultdict(list)
     for query_norm, date, search_count, unique_users in all_rows:
         query_daily[query_norm].append((date, search_count, unique_users))
+
+    # Remove blacklisted queries
+    if blacklist:
+        before = len(query_daily)
+        query_daily = {q: v for q, v in query_daily.items()
+                       if not is_blacklisted(q, blacklist)}
+        print(f"  Blacklist removed {before - len(query_daily)} queries from detail pages")
 
     print(f"  Found daily data for {len(query_daily)} queries")
 
@@ -1733,6 +1769,11 @@ def main():
     print(f"Data cutoff: {cutoff_date.strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
     try:
+        # Load query blacklist patterns
+        blacklist = parse_blacklist(os.environ.get('QUERY_BLACKLIST', ''))
+        if blacklist:
+            print(f"Query blacklist: {len(blacklist)} patterns loaded")
+
         # Get available periods from database
         periods = get_available_periods(conn, max_date=cutoff_date)
         print(f"Found {len(periods['months'])} months and {len(periods['weeks'])} weeks")
@@ -1741,8 +1782,8 @@ def main():
         generate_jekyll_data_files(periods)
         print("Generated Jekyll navigation data files")
 
-        # Ensure user_query_pairs table exists and is up to date with live data
-        print("Updating user_query_pairs table...")
+        # Ensure user_query_pairs table exists
+        print("Checking user_query_pairs table...")
         cursor = conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS user_query_pairs (
@@ -1755,14 +1796,24 @@ def main():
             CREATE INDEX IF NOT EXISTS idx_uqp_query
             ON user_query_pairs (query_normalized)
         """)
-        cursor.execute("""
-            INSERT INTO user_query_pairs (username, query_normalized)
-            SELECT DISTINCT username, LOWER(TRIM(query))
-            FROM searches
-            ON CONFLICT DO NOTHING
-        """)
         conn.commit()
-        print(f"  Merged {cursor.rowcount} new pairs from live searches")
+        # Quick existence check (avoids full table scan)
+        cursor.execute("SELECT EXISTS (SELECT 1 FROM user_query_pairs LIMIT 1)")
+        has_data = cursor.fetchone()[0]
+        if has_data:
+            print("  user_query_pairs table is populated")
+        else:
+            print("  WARNING: user_query_pairs is empty. Run archive.py or seed manually.")
+        # Remove blacklisted queries from user_query_pairs
+        if blacklist:
+            for pattern in blacklist:
+                sql_pattern = pattern.replace('*', '%').replace('?', '_')
+                cursor.execute(
+                    "DELETE FROM user_query_pairs WHERE LOWER(query_normalized) LIKE %s",
+                    (sql_pattern,)
+                )
+            conn.commit()
+            print(f"  Removed blacklisted query pairs")
         cursor.close()
 
         # Get eligible queries for similarity computation (queries with detail pages)
@@ -1771,7 +1822,8 @@ def main():
         print("=" * 60)
         cursor = conn.cursor()
         cursor.execute("SELECT DISTINCT query_normalized FROM query_daily_stats")
-        eligible_queries = {row[0] for row in cursor.fetchall()}
+        eligible_queries = {row[0] for row in cursor.fetchall()
+                           if not is_blacklisted(row[0], blacklist)}
         cursor.close()
         print(f"  {len(eligible_queries)} eligible queries")
         query_similarities = compute_query_similarities(conn, eligible_queries)
@@ -1780,27 +1832,27 @@ def main():
         print("=" * 60)
         print("GENERATING QUERY DETAIL PAGES")
         print("=" * 60)
-        query_slug_map = generate_query_pages(conn, cutoff_date, query_similarities)
+        query_slug_map = generate_query_pages(conn, cutoff_date, query_similarities, blacklist)
 
         # Generate all-time page (uses cumulative stats + materialized views)
         print("=" * 60)
         print("GENERATING ALL-TIME PAGE")
         print("=" * 60)
-        generate_all_time_page(conn, cutoff_date, query_slug_map)
+        generate_all_time_page(conn, cutoff_date, query_slug_map, blacklist)
 
         # Generate monthly pages
         for month in periods['months']:
             print("=" * 60)
             print(f"GENERATING MONTHLY PAGE: {month['label']}")
             print("=" * 60)
-            generate_period_page(conn, 'month', month, cutoff_date, query_slug_map)
+            generate_period_page(conn, 'month', month, cutoff_date, query_slug_map, blacklist)
 
         # Generate weekly pages
         for week in periods['weeks']:
             print("=" * 60)
             print(f"GENERATING WEEKLY PAGE: CW {week['label']}")
             print("=" * 60)
-            generate_period_page(conn, 'week', week, cutoff_date, query_slug_map)
+            generate_period_page(conn, 'week', week, cutoff_date, query_slug_map, blacklist)
 
         total_pages = 1 + len(periods['months']) + len(periods['weeks']) + len(query_slug_map)
         print("\n" + "=" * 60)
