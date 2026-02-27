@@ -29,6 +29,7 @@ jobs:
       - name: Generate statistics
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          QUERY_BLACKLIST: ${{ vars.QUERY_BLACKLIST }}
         run: python -u scripts/generate_stats.py
 
       - name: Build with Jekyll

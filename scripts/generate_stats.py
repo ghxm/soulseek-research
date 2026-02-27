@@ -42,14 +42,16 @@ def format_days(first_search_str, last_search_str):
 
 
 def parse_blacklist(raw: str) -> List[str]:
-    """Parse comma-separated blacklist patterns from environment variable.
+    """Parse blacklist patterns from environment variable (comma or newline separated).
 
     Returns a list of lowercase patterns suitable for fnmatch matching.
     Empty/whitespace-only entries are ignored.
     """
     if not raw or not raw.strip():
         return []
-    return [p.strip().lower() for p in raw.split(',') if p.strip()]
+    # Support both comma and newline as separators
+    entries = raw.replace('\n', ',').split(',')
+    return [p.strip().lower() for p in entries if p.strip()]
 
 
 def is_blacklisted(query: str, patterns: List[str]) -> bool:
