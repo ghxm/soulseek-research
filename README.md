@@ -46,14 +46,13 @@ mv_summary_stats        -- Overall summary statistics
 - Soulseek account credentials (one per client)
 - Hetzner Cloud account with an SSH key named "soulseek-research"
 
-### Automated Schedule (UTC)
+### Scripts
 
-| Time | Frequency | Task |
-|------|-----------|------|
-| 2:00 AM | Sunday | Monthly data archival |
-| 4:00 AM | Daily | Materialized view refresh |
-| 4:30 AM | Daily | Period statistics precomputation |
-| 5:00 AM | Daily | Dashboard generation and deployment |
+- `scripts/generate_stats.py` -- Generates the static dashboard pages (all-time, weekly, monthly, and per-query detail pages) from the database. Computes query similarities based on user co-occurrence within a 90-day window. Run by GitHub Actions daily at 5 AM UTC.
+- `scripts/refresh_period_stats.py` -- Precomputes top queries, query length distributions, and per-query daily stats for each week/month period. Reads from the `searches` table and writes to `period_top_queries`, `period_query_length_dist`, and `query_daily_stats`.
+- `scripts/archive.py` -- Archives completed months to Parquet files and optionally deletes them from the database. Preserves user-query pairs and updates cumulative stats before deletion.
+
+`refresh-views.sh` (materialized view refresh) and `archive.py` run as cron jobs on the database server. `generate_stats.py` runs as a GitHub Actions workflow.
 
 ### Infrastructure Deployment
 
