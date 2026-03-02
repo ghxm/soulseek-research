@@ -190,6 +190,8 @@ docker run -d \
   --restart unless-stopped \
   -p 60000:60000 \
   -p 60001:60001 \
+  --log-opt max-size=50m \
+  --log-opt max-file=3 \
   --env-file /opt/soulseek-research/client.env \
   soulseek-research:latest
 
@@ -264,12 +266,12 @@ chmod +x /usr/local/bin/refresh-period-stats.sh
 
 # Set up cron jobs:
 # - Weekly archive: Sunday 2 AM
-# - Daily view refresh: 4 AM (before period stats)
-# - Daily period stats refresh: 4:30 AM (after views, before GitHub Actions at 5 AM)
+# - Daily view refresh: midnight (takes ~2h)
+# - Daily period stats refresh: 1 AM (takes ~4h, must finish before GitHub Actions at 6 AM)
 (
 echo "0 2 * * 0 /usr/local/bin/weekly-archive.sh"
-echo "0 4 * * * /usr/local/bin/refresh-views.sh"
-echo "30 4 * * * /usr/local/bin/refresh-period-stats.sh"
+echo "0 0 * * * /usr/local/bin/refresh-views.sh"
+echo "0 1 * * * /usr/local/bin/refresh-period-stats.sh"
 ) | crontab -
 
 # View refresh log rotation
