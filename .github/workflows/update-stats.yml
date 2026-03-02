@@ -35,7 +35,7 @@ jobs:
         run: python -u scripts/generate_stats.py
 
       - name: Configure analytics
-        if: vars.GOATCOUNTER_URL
+        if: ${{ vars.GOATCOUNTER_URL != '' }}
         run: echo 'goatcounter_url: "${{ vars.GOATCOUNTER_URL }}"' >> docs/_config.yml
 
       - name: Build with Jekyll
