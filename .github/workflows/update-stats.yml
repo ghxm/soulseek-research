@@ -1,8 +1,6 @@
 name: Update Statistics Dashboard
 
 on:
-  push:
-    branches: [main]  # TEMPORARY - remove after confirming analytics
   schedule:
     - cron: '0 6 * * *'  # Daily at 6 AM UTC (after cron jobs finish)
   workflow_dispatch:
