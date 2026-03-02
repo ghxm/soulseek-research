@@ -317,6 +317,9 @@ terraform.tfvars
 # Docker
 docker-compose.override.yml
 
+# Local task tracking
+tasks/
+
 # Temporary files
 maintenance-*.md
 !/scripts/test-local.sh
