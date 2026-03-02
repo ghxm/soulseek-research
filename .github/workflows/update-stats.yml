@@ -3,7 +3,7 @@ name: Update Statistics Dashboard
 on:
   schedule:
     - cron: '0 6 * * *'  # Daily at 6 AM UTC (after cron jobs finish)
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 permissions:
   contents: read
