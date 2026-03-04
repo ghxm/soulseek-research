@@ -26,9 +26,20 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements-dashboard.txt
 
+      - name: Open SSH tunnel to database
+        env:
+          DB_SERVER_SSH_KEY: ${{ secrets.DB_SERVER_SSH_KEY }}
+          DB_SERVER_IP: ${{ secrets.DB_SERVER_IP }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$DB_SERVER_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DB_SERVER_IP" >> ~/.ssh/known_hosts
+          ssh -f -N -L 5432:localhost:5432 root@"$DB_SERVER_IP"
+
       - name: Generate statistics
         env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DATABASE_URL: postgresql://soulseek:${{ secrets.DB_PASSWORD }}@localhost:5432/soulseek
           QUERY_BLACKLIST: ${{ vars.QUERY_BLACKLIST }}
         run: python -u scripts/generate_stats.py
 

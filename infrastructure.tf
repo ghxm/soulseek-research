@@ -68,13 +68,6 @@ resource "hcloud_firewall" "soulseek_firewall" {
   
   rule {
     direction = "in"
-    source_ips = ["0.0.0.0/0", "::/0"]
-    protocol = "tcp"
-    port = "5432"
-  }
-  
-  rule {
-    direction = "in"
     source_ips = ["0.0.0.0/0", "::/0"] 
     protocol = "tcp"
     port = "60000-60001"
