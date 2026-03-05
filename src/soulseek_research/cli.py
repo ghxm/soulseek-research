@@ -1,4 +1,4 @@
-"""Simple CLI for soulseek research - FIXED VERSION"""
+"""CLI for soulseek research"""
 
 import asyncio
 import logging

@@ -1,4 +1,4 @@
-"""Simple Soulseek research package"""
+"""Soulseek research package"""
 
 from .client import ResearchClient, SearchRecord
 

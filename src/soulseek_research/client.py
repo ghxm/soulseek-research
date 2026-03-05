@@ -1,4 +1,4 @@
-"""Simple Soulseek research client - FIXED VERSION"""
+"""Soulseek research client"""
 
 import asyncio
 import base64
