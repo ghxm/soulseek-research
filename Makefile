@@ -1,10 +1,10 @@
-.PHONY: help install test-local deploy monitor destroy clean
+.PHONY: help install test-local deploy monitor destroy clean docker-build docker-test
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
 install: ## Install package in development mode
-	pip install -e .
+	pip install -e ".[dev]"
 
 test-local: ## Test local setup with Docker
 	@chmod +x scripts/test-local.sh
@@ -27,10 +27,6 @@ clean: ## Clean up cache and temporary files
 	rm -rf build/ dist/ *.egg-info/
 	rm -f .env.test
 	docker system prune -f
-
-check: ## Check code with basic validation
-	python -m py_compile src/soulseek_research/*.py
-	@echo "✅ Code validation passed"
 
 docker-build: ## Build Docker image
 	docker build -t soulseek-research:latest .
