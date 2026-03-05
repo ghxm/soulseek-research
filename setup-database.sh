@@ -1,5 +1,5 @@
 #!/bin/bash
-# Cloud-init script to set up database server
+# Cloud-init script to set up database server + client on the same machine
 
 # Install Docker and docker-compose
 curl -fsSL https://get.docker.com -o get-docker.sh
@@ -172,7 +172,7 @@ SELECT
     ) as client_totals;
 "
 
-# Build image for Germany client (repo already cloned above)
+# Build image for local / Germany client (repo already cloned above)
 docker build -t soulseek-research:latest .
 
 # Create client environment file
