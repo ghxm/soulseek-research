@@ -247,6 +247,7 @@
 
         .stats-table {
             border-collapse: collapse;
+            min-width: 280px;
         }
 
         .stats-table caption {
@@ -259,10 +260,18 @@
             padding-bottom: 12px;
         }
 
+        .stats-table td {
+            border-bottom: 1px solid #eee;
+        }
+
+        .stats-table tr:last-child td {
+            border-bottom: none;
+        }
+
         .stats-label {
             color: #666;
             font-size: 15px;
-            padding: 6px 30px 6px 0;
+            padding: 10px 30px 10px 0;
         }
 
         .stats-value {
@@ -270,7 +279,7 @@
             font-weight: 600;
             color: black;
             text-align: right;
-            padding: 6px 0;
+            padding: 10px 0;
         }
 
         .chart {

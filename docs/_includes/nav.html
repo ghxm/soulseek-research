@@ -76,7 +76,12 @@
     }
 
     function search(term) {
-        if (!index || !term) { results.style.display = 'none'; return; }
+        if (!term) { results.style.display = 'none'; return; }
+        if (!index) {
+            results.innerHTML = '<div class="query-search-empty">Loading...</div>';
+            results.style.display = 'block';
+            return;
+        }
         var lower = term.toLowerCase();
         var matches = [];
         for (var i = 0; i < index.length && matches.length < 12; i++) {
