@@ -120,6 +120,10 @@
     });
     document.addEventListener('click', function(e) {
         if (!e.target.closest('.query-search')) results.style.display = 'none';
+        if (!e.target.closest('.info-icon')) {
+            var openIcons = document.querySelectorAll('.info-icon.open');
+            for (var k = 0; k < openIcons.length; k++) openIcons[k].classList.remove('open');
+        }
     });
 })();
 </script>
