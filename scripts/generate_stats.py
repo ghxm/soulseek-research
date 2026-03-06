@@ -1365,37 +1365,23 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
     days = format_days(stats['first_search'], stats['last_search'])
 
     stats_grid = f'''
-        <div class="stats-grid">
-            <div class="stat-card">
-                <h3>Total Search Events</h3>
-                <div class="value">{stats['total_searches']:,}</div>
-                <div class="label">Raw search requests received</div>
-            </div>
-            <div class="stat-card">
-                <h3>Unique Users</h3>
-                <div class="value">{stats['total_users']:,}</div>
-                <div class="label">Anonymized users</div>
-            </div>
-            <div class="stat-card">
-                <h3>Unique Queries</h3>
-                <div class="value">{stats['total_queries']:,}</div>
-                <div class="label">Different search terms</div>
-            </div>
-            <div class="stat-card">
-                <h3>Avg Searches per User</h3>
-                <div class="value">{stats['avg_searches_per_user']:.1f}</div>
-                <div class="label">Including repeated searches</div>
-            </div>
-            <div class="stat-card">
-                <h3>Avg Unique Queries per User</h3>
-                <div class="value">{stats['avg_unique_queries_per_user']:.1f}</div>
-                <div class="label">Search diversity</div>
-            </div>
-            <div class="stat-card">
-                <h3>Period</h3>
-                <div class="value">{days}</div>
-                <div class="label">Days of data</div>
-            </div>
+        <div class="stats-tables">
+            <table class="stats-table">
+                <caption>Volume</caption>
+                <tbody>
+                    <tr><td class="stats-label">Total Searches</td><td class="stats-value">{stats['total_searches']:,}</td></tr>
+                    <tr><td class="stats-label">Unique Users</td><td class="stats-value">{stats['total_users']:,}</td></tr>
+                    <tr><td class="stats-label">Unique Queries</td><td class="stats-value">{stats['total_queries']:,}</td></tr>
+                    <tr><td class="stats-label">Period</td><td class="stats-value">{days} days</td></tr>
+                </tbody>
+            </table>
+            <table class="stats-table">
+                <caption>Per User</caption>
+                <tbody>
+                    <tr><td class="stats-label">Avg Searches</td><td class="stats-value">{stats['avg_searches_per_user']:.1f}</td></tr>
+                    <tr><td class="stats-label">Avg Unique Queries</td><td class="stats-value">{stats['avg_unique_queries_per_user']:.1f}</td></tr>
+                </tbody>
+            </table>
         </div>
     '''
 
