@@ -310,10 +310,21 @@
         .query-search {
             position: relative;
             margin-left: auto;
+            display: flex;
+            align-items: center;
+        }
+
+        .query-search-icon {
+            width: 16px;
+            height: 16px;
+            color: #999;
+            position: absolute;
+            left: 10px;
+            pointer-events: none;
         }
 
         .query-search input {
-            padding: 6px 12px;
+            padding: 6px 12px 6px 32px;
             border: 1px solid #ccc;
             border-radius: 4px;
             font-size: 14px;
