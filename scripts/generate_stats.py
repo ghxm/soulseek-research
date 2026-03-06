@@ -1753,6 +1753,22 @@ query_display: "{display_escaped}"
             print(f"  Generated {count}/{len(query_daily)} query pages...")
 
     print(f"  Generated {count} query pages in docs/queries/")
+
+    # Write search index JSON for client-side query search
+    search_index = []
+    for query_norm, slug in slug_map.items():
+        qs = query_stats.get(query_norm, {'unique_users': 0, 'total_searches': 0})
+        search_index.append({
+            'q': query_norm,
+            's': slug,
+            'u': qs['unique_users'],
+            't': qs['total_searches'],
+        })
+    search_index.sort(key=lambda x: x['u'], reverse=True)
+    with open('docs/queries/index.json', 'w', encoding='utf-8') as f:
+        json.dump(search_index, f, separators=(',', ':'), ensure_ascii=False)
+    print(f"  Wrote search index ({len(search_index)} queries)")
+
     return slug_map
 
 

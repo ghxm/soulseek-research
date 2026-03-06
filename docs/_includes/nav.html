@@ -43,5 +43,72 @@
             {% endfor %}
         </div>
     </div>
+    <span class="nav-separator">|</span>
+
+    <div class="query-search">
+        <input type="text" id="query-search-input" placeholder="Search queries..." autocomplete="off">
+        <div id="query-search-results" class="query-search-results"></div>
+    </div>
     </div>
 </nav>
+
+<script>
+(function() {
+    var index = null;
+    var input = document.getElementById('query-search-input');
+    var results = document.getElementById('query-search-results');
+    var baseUrl = '{{ site.baseurl }}';
+    var debounceTimer;
+
+    function loadIndex() {
+        if (index !== null) return;
+        fetch(baseUrl + '/queries/index.json')
+            .then(function(r) { return r.json(); })
+            .then(function(data) { index = data; });
+    }
+
+    function escapeHtml(s) {
+        return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    function formatNumber(n) {
+        return n.toLocaleString();
+    }
+
+    function search(term) {
+        if (!index || !term) { results.style.display = 'none'; return; }
+        var lower = term.toLowerCase();
+        var matches = [];
+        for (var i = 0; i < index.length && matches.length < 12; i++) {
+            if (index[i].q.indexOf(lower) !== -1) matches.push(index[i]);
+        }
+        if (matches.length === 0) {
+            results.innerHTML = '<div class="query-search-empty">No queries found</div>';
+            results.style.display = 'block';
+            return;
+        }
+        var html = '';
+        for (var j = 0; j < matches.length; j++) {
+            var m = matches[j];
+            html += '<a href="' + baseUrl + '/queries/' + m.s + '.html" class="query-search-item">'
+                + '<span class="query-search-name">' + escapeHtml(m.q) + '</span>'
+                + '<span class="query-search-meta">'
+                + formatNumber(m.u) + ' users, '
+                + formatNumber(m.t) + ' total searches'
+                + '</span>'
+                + '</a>';
+        }
+        results.innerHTML = html;
+        results.style.display = 'block';
+    }
+
+    input.addEventListener('focus', loadIndex);
+    input.addEventListener('input', function() {
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(function() { search(input.value.trim()); }, 150);
+    });
+    document.addEventListener('click', function(e) {
+        if (!e.target.closest('.query-search')) results.style.display = 'none';
+    });
+})();
+</script>
