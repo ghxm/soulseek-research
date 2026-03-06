@@ -90,13 +90,24 @@
         var html = '';
         for (var j = 0; j < matches.length; j++) {
             var m = matches[j];
-            html += '<a href="' + baseUrl + '/queries/' + m.s + '.html" class="query-search-item">'
-                + '<span class="query-search-name">' + escapeHtml(m.q) + '</span>'
-                + '<span class="query-search-meta">'
-                + formatNumber(m.u) + ' users, '
-                + formatNumber(m.t) + ' total searches'
-                + '</span>'
-                + '</a>';
+            if (m.s) {
+                html += '<a href="' + baseUrl + '/queries/' + m.s + '.html" class="query-search-item">'
+                    + '<span class="query-search-name">' + escapeHtml(m.q) + '</span>'
+                    + '<span class="query-search-meta">'
+                    + formatNumber(m.u) + ' users, '
+                    + formatNumber(m.t) + ' total searches'
+                    + '</span>'
+                    + '</a>';
+            } else {
+                html += '<div class="query-search-item query-search-nopage">'
+                    + '<span class="query-search-name">' + escapeHtml(m.q) + '</span>'
+                    + '<span class="query-search-meta">'
+                    + formatNumber(m.u) + ' users, '
+                    + formatNumber(m.t) + ' total searches'
+                    + ' &mdash; not enough data for a detail page yet'
+                    + '</span>'
+                    + '</div>';
+            }
         }
         results.innerHTML = html;
         results.style.display = 'block';

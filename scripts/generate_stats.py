@@ -1755,19 +1755,32 @@ query_display: "{display_escaped}"
     print(f"  Generated {count} query pages in docs/queries/")
 
     # Write search index JSON for client-side query search
+    # Include all queries from mv_top_queries (5+ users), not just those with pages
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT query_normalized, unique_users, total_searches
+        FROM mv_top_queries
+    """)
+    all_queries = cursor.fetchall()
+    cursor.close()
+
     search_index = []
-    for query_norm, slug in slug_map.items():
-        qs = query_stats.get(query_norm, {'unique_users': 0, 'total_searches': 0})
-        search_index.append({
+    for query_norm, unique_users, total_searches in all_queries:
+        if blacklist and is_blacklisted(query_norm, blacklist):
+            continue
+        entry = {
             'q': query_norm,
-            's': slug,
-            'u': qs['unique_users'],
-            't': qs['total_searches'],
-        })
+            'u': unique_users,
+            't': total_searches,
+        }
+        if query_norm in slug_map:
+            entry['s'] = slug_map[query_norm]
+        search_index.append(entry)
     search_index.sort(key=lambda x: x['u'], reverse=True)
     with open('docs/queries/index.json', 'w', encoding='utf-8') as f:
         json.dump(search_index, f, separators=(',', ':'), ensure_ascii=False)
-    print(f"  Wrote search index ({len(search_index)} queries)")
+    page_count = sum(1 for e in search_index if 's' in e)
+    print(f"  Wrote search index ({len(search_index)} queries, {page_count} with pages)")
 
     return slug_map
 
