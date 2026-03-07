@@ -124,6 +124,20 @@ ON query_daily_stats(query_normalized);
 # Create materialized views for fast stats generation
 echo "Creating materialized views..."
 docker exec $(docker-compose -f database.yml ps -q database) psql -U soulseek -d soulseek -c "
+-- Daily deduplicated search tuples for fast period stats computation
+-- Reduces ~95M rows to ~5-15M (date, username, query_normalized, search_count)
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_daily_search_tuples AS
+SELECT
+    DATE(timestamp) AS date,
+    username,
+    LOWER(TRIM(query)) AS query_normalized,
+    COUNT(*) AS search_count
+FROM searches
+GROUP BY DATE(timestamp), username, LOWER(TRIM(query));
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_daily_search_tuples_unique
+ON mv_daily_search_tuples (date, username, query_normalized);
+
 -- Daily stats by client (for time-series charts)
 CREATE MATERIALIZED VIEW IF NOT EXISTS mv_daily_stats AS
 SELECT
@@ -239,6 +253,7 @@ DB_CONTAINER=$(docker-compose -f database.yml ps -q database)
 
 # Refresh views concurrently (allows reads during refresh)
 docker exec $DB_CONTAINER psql -U soulseek -d soulseek -c "
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_daily_search_tuples;
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_daily_stats;
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_top_queries;
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_query_length_dist;

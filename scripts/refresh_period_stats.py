@@ -49,14 +49,20 @@ def get_db_connection():
 
 
 def get_date_range(conn) -> Tuple[datetime, datetime]:
-    """Get the min/max dates from searches table"""
+    """Get the min/max dates from mv_daily_search_tuples"""
     cursor = conn.cursor()
-    cursor.execute("SELECT MIN(timestamp), MAX(timestamp) FROM searches")
+    cursor.execute("SELECT MIN(date), MAX(date) FROM mv_daily_search_tuples")
     min_date, max_date = cursor.fetchone()
     cursor.close()
 
     if not min_date or not max_date:
-        raise ValueError("No data in searches table")
+        raise ValueError("No data in mv_daily_search_tuples")
+
+    # Convert date to datetime with timezone for period generation
+    if not isinstance(min_date, datetime):
+        min_date = datetime.combine(min_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+    if not isinstance(max_date, datetime):
+        max_date = datetime.combine(max_date, datetime.min.time()).replace(tzinfo=timezone.utc)
 
     return min_date, max_date
 
@@ -102,19 +108,20 @@ def compute_period_top_queries(conn, period_type: str, period_id: str,
 
     Returns number of queries inserted.
     """
-    # Step 1: Run the expensive aggregation as a read-only query
+    # Step 1: Run the aggregation against the pre-deduplicated view
     cursor = conn.cursor()
     cursor.execute("""
         SELECT
-            LOWER(TRIM(query)) as query_normalized,
+            query_normalized,
             COUNT(DISTINCT username) as unique_users,
-            COUNT(*) as total_searches
-        FROM searches
-        WHERE timestamp >= %s AND timestamp <= %s
-        GROUP BY LOWER(TRIM(query))
+            SUM(search_count) as total_searches
+        FROM mv_daily_search_tuples
+        WHERE date >= %s AND date <= %s
+        GROUP BY query_normalized
         HAVING COUNT(DISTINCT username) >= 5
-        ORDER BY COUNT(DISTINCT username) DESC, COUNT(*) DESC
-    """, (start_date, end_date))
+        ORDER BY COUNT(DISTINCT username) DESC, SUM(search_count) DESC
+    """, (start_date.date() if isinstance(start_date, datetime) else start_date,
+          end_date.date() if isinstance(end_date, datetime) else end_date))
 
     rows = cursor.fetchall()
     cursor.close()
@@ -164,18 +171,19 @@ def compute_period_query_length_dist(conn, period_type: str, period_id: str,
 
     Returns number of rows inserted.
     """
-    # Step 1: Run aggregation query
+    # Step 1: Run aggregation against pre-deduplicated view
     cursor = conn.cursor()
     cursor.execute("""
         SELECT
-            LENGTH(query) - LENGTH(REPLACE(query, ' ', '')) + 1 as query_length,
-            COUNT(DISTINCT LOWER(TRIM(query))) as unique_query_count
-        FROM searches
-        WHERE timestamp >= %s AND timestamp <= %s
-          AND LENGTH(query) - LENGTH(REPLACE(query, ' ', '')) + 1 <= 100
+            LENGTH(query_normalized) - LENGTH(REPLACE(query_normalized, ' ', '')) + 1 as query_length,
+            COUNT(DISTINCT query_normalized) as unique_query_count
+        FROM mv_daily_search_tuples
+        WHERE date >= %s AND date <= %s
+          AND LENGTH(query_normalized) - LENGTH(REPLACE(query_normalized, ' ', '')) + 1 <= 100
         GROUP BY query_length
         ORDER BY query_length
-    """, (start_date, end_date))
+    """, (start_date.date() if isinstance(start_date, datetime) else start_date,
+          end_date.date() if isinstance(end_date, datetime) else end_date))
 
     rows = cursor.fetchall()
     cursor.close()
@@ -241,20 +249,20 @@ def compute_all_period_summary_stats(conn, periods):
     all_rows = []
 
     for period_type, group_expr in [
-        ('week', "TO_CHAR(timestamp, 'IYYY') || '-W' || TO_CHAR(timestamp, 'IW')"),
-        ('month', "TO_CHAR(timestamp, 'YYYY-MM')"),
+        ('week', "TO_CHAR(date, 'IYYY') || '-W' || TO_CHAR(date, 'IW')"),
+        ('month', "TO_CHAR(date, 'YYYY-MM')"),
     ]:
         print(f"  Computing {period_type} summary stats...")
         start = datetime.now(timezone.utc)
         cursor = conn.cursor()
-        cursor.execute("SET statement_timeout = '7200000'")  # 2 hours for this query
+        cursor.execute("SET statement_timeout = '1800000'")  # 30 min
         cursor.execute(f"""
             SELECT
                 '{period_type}' as period_type,
                 {group_expr} as period_id,
-                COUNT(DISTINCT LOWER(TRIM(query))) as unique_queries,
-                COUNT(DISTINCT (username, LOWER(TRIM(query)))) as unique_pairs
-            FROM searches
+                COUNT(DISTINCT query_normalized) as unique_queries,
+                COUNT(DISTINCT (username, query_normalized)) as unique_pairs
+            FROM mv_daily_search_tuples
             GROUP BY period_id
         """)
         rows = cursor.fetchall()
@@ -319,13 +327,13 @@ def compute_query_daily_stats(conn):
         # Use ANY(%s) with array parameter for clean parameterized query
         cursor.execute("""
             SELECT
-                LOWER(TRIM(query)) as query_normalized,
-                DATE(timestamp) as date,
-                COUNT(*) as search_count,
-                COUNT(DISTINCT username) as unique_users
-            FROM searches
-            WHERE LOWER(TRIM(query)) = ANY(%s)
-            GROUP BY LOWER(TRIM(query)), DATE(timestamp)
+                query_normalized,
+                date,
+                SUM(search_count) as search_count,
+                COUNT(*) as unique_users
+            FROM mv_daily_search_tuples
+            WHERE query_normalized = ANY(%s)
+            GROUP BY query_normalized, date
             ORDER BY query_normalized, date
         """, (chunk,))
 
@@ -369,7 +377,7 @@ def compute_query_daily_stats(conn):
 def refresh_period_stats(conn):
     """Refresh all period statistics"""
     ensure_period_summary_stats_table(conn)
-    print("Getting date range from searches table...")
+    print("Getting date range from mv_daily_search_tuples...")
     min_date, max_date = get_date_range(conn)
     print(f"  Data range: {min_date.isoformat()} to {max_date.isoformat()}")
 

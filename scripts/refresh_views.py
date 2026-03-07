@@ -35,17 +35,18 @@ def get_db_connection():
         password=user_pass[1] if len(user_pass) > 1 else '',
         dbname=host_db[1],
         connect_timeout=30,
-        options='-c statement_timeout=1800000'  # 30 min timeout for refresh
+        options='-c statement_timeout=3600000'  # 60 min timeout for refresh
     )
 
 
 def refresh_views(conn):
     """Refresh all materialized views"""
     views = [
-        ('mv_daily_stats', True),        # CONCURRENTLY supported (has unique index)
-        ('mv_top_queries', True),        # CONCURRENTLY supported
-        ('mv_query_length_dist', True),  # CONCURRENTLY supported
-        ('mv_summary_stats', False),     # No unique index, regular refresh
+        ('mv_daily_search_tuples', True),  # CONCURRENTLY supported; period stats depend on it
+        ('mv_daily_stats', True),          # CONCURRENTLY supported (has unique index)
+        ('mv_top_queries', True),          # CONCURRENTLY supported
+        ('mv_query_length_dist', True),    # CONCURRENTLY supported
+        ('mv_summary_stats', False),       # No unique index, regular refresh
     ]
 
     cursor = conn.cursor()
