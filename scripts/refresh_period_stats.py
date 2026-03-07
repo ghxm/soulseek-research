@@ -233,39 +233,43 @@ def ensure_period_summary_stats_table(conn):
 
 
 def compute_all_period_summary_stats(conn, periods):
-    """Compute unique queries and user-query pairs for all periods in a single table scan.
+    """Compute unique queries and user-query pairs for all periods.
 
-    Groups by week (ISO year-week) and month (year-month) simultaneously,
-    then inserts/updates all results into period_summary_stats.
+    Runs separate queries for weeks and months (each a single full scan),
+    with extended statement timeout to handle large tables.
     """
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT
-            'week' as period_type,
-            TO_CHAR(timestamp, 'IYYY') || '-W' || TO_CHAR(timestamp, 'IW') as period_id,
-            COUNT(DISTINCT LOWER(TRIM(query))) as unique_queries,
-            COUNT(DISTINCT (username, LOWER(TRIM(query)))) as unique_pairs
-        FROM searches
-        GROUP BY period_type, period_id
-        UNION ALL
-        SELECT
-            'month' as period_type,
-            TO_CHAR(timestamp, 'YYYY-MM') as period_id,
-            COUNT(DISTINCT LOWER(TRIM(query))) as unique_queries,
-            COUNT(DISTINCT (username, LOWER(TRIM(query)))) as unique_pairs
-        FROM searches
-        GROUP BY period_type, period_id
-    """)
+    all_rows = []
 
-    rows = cursor.fetchall()
-    cursor.close()
+    for period_type, group_expr in [
+        ('week', "TO_CHAR(timestamp, 'IYYY') || '-W' || TO_CHAR(timestamp, 'IW')"),
+        ('month', "TO_CHAR(timestamp, 'YYYY-MM')"),
+    ]:
+        print(f"  Computing {period_type} summary stats...")
+        start = datetime.now(timezone.utc)
+        cursor = conn.cursor()
+        cursor.execute("SET statement_timeout = '7200000'")  # 2 hours for this query
+        cursor.execute(f"""
+            SELECT
+                '{period_type}' as period_type,
+                {group_expr} as period_id,
+                COUNT(DISTINCT LOWER(TRIM(query))) as unique_queries,
+                COUNT(DISTINCT (username, LOWER(TRIM(query)))) as unique_pairs
+            FROM searches
+            GROUP BY period_id
+        """)
+        rows = cursor.fetchall()
+        cursor.execute("RESET statement_timeout")
+        cursor.close()
+        elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+        print(f"    {len(rows)} {period_type}s in {elapsed:.1f}s")
+        all_rows.extend(rows)
 
-    if not rows:
+    if not all_rows:
         return {}
 
     # Bulk upsert all results
     cursor = conn.cursor()
-    values = [(row[0], row[1], int(row[2]), int(row[3])) for row in rows]
+    values = [(row[0], row[1], int(row[2]), int(row[3])) for row in all_rows]
     execute_values(
         cursor,
         """INSERT INTO period_summary_stats (period_type, period_id, unique_queries, unique_pairs)
@@ -278,7 +282,7 @@ def compute_all_period_summary_stats(conn, periods):
     cursor.close()
 
     # Return as lookup dict
-    return {(row[0], row[1]): (int(row[2]), int(row[3])) for row in rows}
+    return {(row[0], row[1]): (int(row[2]), int(row[3])) for row in all_rows}
 
 
 def compute_query_daily_stats(conn):
