@@ -232,38 +232,53 @@ def ensure_period_summary_stats_table(conn):
     cursor.close()
 
 
-def compute_period_summary_stats(conn, period_type: str, period_id: str,
-                                   start_date: datetime, end_date: datetime):
-    """Compute unique queries and user-query pairs for a period.
+def compute_all_period_summary_stats(conn, periods):
+    """Compute unique queries and user-query pairs for all periods in a single table scan.
 
-    Stores results in period_summary_stats for use by generate_stats.py.
+    Groups by week (ISO year-week) and month (year-month) simultaneously,
+    then inserts/updates all results into period_summary_stats.
     """
     cursor = conn.cursor()
     cursor.execute("""
         SELECT
+            'week' as period_type,
+            TO_CHAR(timestamp, 'IYYY') || '-W' || TO_CHAR(timestamp, 'IW') as period_id,
             COUNT(DISTINCT LOWER(TRIM(query))) as unique_queries,
             COUNT(DISTINCT (username, LOWER(TRIM(query)))) as unique_pairs
         FROM searches
-        WHERE timestamp >= %s AND timestamp <= %s
-    """, (start_date, end_date))
+        GROUP BY period_type, period_id
+        UNION ALL
+        SELECT
+            'month' as period_type,
+            TO_CHAR(timestamp, 'YYYY-MM') as period_id,
+            COUNT(DISTINCT LOWER(TRIM(query))) as unique_queries,
+            COUNT(DISTINCT (username, LOWER(TRIM(query)))) as unique_pairs
+        FROM searches
+        GROUP BY period_type, period_id
+    """)
 
-    result = cursor.fetchone()
+    rows = cursor.fetchall()
     cursor.close()
 
-    unique_queries = int(result[0]) if result and result[0] else 0
-    unique_pairs = int(result[1]) if result and result[1] else 0
+    if not rows:
+        return {}
 
+    # Bulk upsert all results
     cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO period_summary_stats (period_type, period_id, unique_queries, unique_pairs)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT (period_type, period_id)
-        DO UPDATE SET unique_queries = EXCLUDED.unique_queries, unique_pairs = EXCLUDED.unique_pairs
-    """, (period_type, period_id, unique_queries, unique_pairs))
+    values = [(row[0], row[1], int(row[2]), int(row[3])) for row in rows]
+    execute_values(
+        cursor,
+        """INSERT INTO period_summary_stats (period_type, period_id, unique_queries, unique_pairs)
+           VALUES %s
+           ON CONFLICT (period_type, period_id)
+           DO UPDATE SET unique_queries = EXCLUDED.unique_queries, unique_pairs = EXCLUDED.unique_pairs""",
+        values
+    )
     conn.commit()
     cursor.close()
 
-    return unique_queries, unique_pairs
+    # Return as lookup dict
+    return {(row[0], row[1]): (int(row[2]), int(row[3])) for row in rows}
 
 
 def compute_query_daily_stats(conn):
@@ -363,6 +378,13 @@ def refresh_period_stats(conn):
     print(f"    - {len(weeks)} weeks")
     print(f"    - {len(months)} months")
 
+    # Compute summary stats for all periods in a single table scan
+    print("\nComputing summary stats (unique queries + pairs) for all periods...")
+    start = datetime.now(timezone.utc)
+    summary_lookup = compute_all_period_summary_stats(conn, periods)
+    elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+    print(f"  Done: {len(summary_lookup)} period summaries in {elapsed:.1f}s")
+
     total_queries = 0
     total_dists = 0
 
@@ -370,11 +392,9 @@ def refresh_period_stats(conn):
         label = f"{period_type} {period_id}"
         print(f"\n[{i}/{len(periods)}] Processing {label}...")
 
-        # Compute summary stats (unique queries + pairs)
-        start = datetime.now(timezone.utc)
-        uq, up = compute_period_summary_stats(conn, period_type, period_id, start_date, end_date)
-        elapsed = (datetime.now(timezone.utc) - start).total_seconds()
-        print(f"  Summary stats: {uq} unique queries, {up} pairs in {elapsed:.1f}s")
+        summary = summary_lookup.get((period_type, period_id))
+        if summary:
+            print(f"  Summary stats: {summary[0]} unique queries, {summary[1]} pairs")
 
         # Compute top queries
         start = datetime.now(timezone.utc)
