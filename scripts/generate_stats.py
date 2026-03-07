@@ -328,7 +328,7 @@ def get_query_length_distribution(conn) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=['query_length', 'count'])
 
 
-def get_period_stats(conn, start_date, end_date) -> Dict[str, Any]:
+def get_period_stats(conn, start_date, end_date, period_type: str = None, period_id: str = None) -> Dict[str, Any]:
     """Get stats for a specific period using mv_daily_stats (fast, pre-aggregated)"""
     cursor = conn.cursor()
 
@@ -364,12 +364,27 @@ def get_period_stats(conn, start_date, end_date) -> Dict[str, Any]:
 
     cursor.close()
 
-    # Approximate unique queries as ~60% of unique users (typical ratio from global stats)
-    total_queries = int(total_users * 0.6) if total_users > 0 else 0
-    total_pairs = total_users  # Approximate
+    # Get precomputed unique queries and pairs from period_summary_stats
+    summary_row = None
+    if period_type and period_id:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT unique_queries, unique_pairs
+            FROM period_summary_stats
+            WHERE period_type = %s AND period_id = %s
+        """, (period_type, period_id))
+        summary_row = cursor.fetchone()
+        cursor.close()
+
+    if summary_row:
+        total_queries = int(summary_row[0])
+        total_pairs = int(summary_row[1])
+    else:
+        total_queries = int(total_users * 0.6) if total_users > 0 else 0
+        total_pairs = total_users
 
     avg_searches_per_user = total_searches / total_users if total_users > 0 else 0
-    avg_unique_queries_per_user = 1.0  # Approximation
+    avg_unique_queries_per_user = total_pairs / total_users if total_users > 0 else 0
 
     # Convert dates to timestamps for display
     first_search = datetime.combine(first_date, datetime.min.time()).replace(tzinfo=timezone.utc) if first_date else None
@@ -1216,7 +1231,7 @@ def generate_period_page(conn, period_type: str, period_info: Dict, cutoff_date=
         end_date = cutoff_date
 
     # Get stats for this period
-    stats = get_period_stats(conn, start_date, end_date)
+    stats = get_period_stats(conn, start_date, end_date, period_type, period_id)
     if stats is None:
         print(f"  No data for {period_label}, skipping")
         return None

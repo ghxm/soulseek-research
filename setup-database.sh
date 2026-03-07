@@ -99,6 +99,14 @@ CREATE TABLE IF NOT EXISTS period_query_length_dist (
 CREATE INDEX IF NOT EXISTS idx_period_ql_dist_lookup
 ON period_query_length_dist(period_type, period_id);
 
+CREATE TABLE IF NOT EXISTS period_summary_stats (
+    period_type VARCHAR(10) NOT NULL,  -- 'week' or 'month'
+    period_id VARCHAR(20) NOT NULL,     -- '2026-01' or '2026-W04'
+    unique_queries INTEGER NOT NULL,
+    unique_pairs INTEGER NOT NULL,
+    PRIMARY KEY (period_type, period_id)
+);
+
 -- Per-query daily statistics for query detail pages
 -- Stores daily search_count and unique_users for queries with 35+ all-time users
 CREATE TABLE IF NOT EXISTS query_daily_stats (

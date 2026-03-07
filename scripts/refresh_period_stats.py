@@ -216,6 +216,56 @@ def compute_period_query_length_dist(conn, period_type: str, period_id: str,
     return len(values)
 
 
+def ensure_period_summary_stats_table(conn):
+    """Create the period_summary_stats table if it doesn't exist."""
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS period_summary_stats (
+            period_type VARCHAR(10) NOT NULL,
+            period_id VARCHAR(20) NOT NULL,
+            unique_queries INTEGER NOT NULL,
+            unique_pairs INTEGER NOT NULL,
+            PRIMARY KEY (period_type, period_id)
+        )
+    """)
+    conn.commit()
+    cursor.close()
+
+
+def compute_period_summary_stats(conn, period_type: str, period_id: str,
+                                   start_date: datetime, end_date: datetime):
+    """Compute unique queries and user-query pairs for a period.
+
+    Stores results in period_summary_stats for use by generate_stats.py.
+    """
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT
+            COUNT(DISTINCT LOWER(TRIM(query))) as unique_queries,
+            COUNT(DISTINCT (username, LOWER(TRIM(query)))) as unique_pairs
+        FROM searches
+        WHERE timestamp >= %s AND timestamp <= %s
+    """, (start_date, end_date))
+
+    result = cursor.fetchone()
+    cursor.close()
+
+    unique_queries = int(result[0]) if result and result[0] else 0
+    unique_pairs = int(result[1]) if result and result[1] else 0
+
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO period_summary_stats (period_type, period_id, unique_queries, unique_pairs)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (period_type, period_id)
+        DO UPDATE SET unique_queries = EXCLUDED.unique_queries, unique_pairs = EXCLUDED.unique_pairs
+    """, (period_type, period_id, unique_queries, unique_pairs))
+    conn.commit()
+    cursor.close()
+
+    return unique_queries, unique_pairs
+
+
 def compute_query_daily_stats(conn):
     """Compute daily stats for queries with 35+ all-time unique users.
 
@@ -299,6 +349,7 @@ def compute_query_daily_stats(conn):
 
 def refresh_period_stats(conn):
     """Refresh all period statistics"""
+    ensure_period_summary_stats_table(conn)
     print("Getting date range from searches table...")
     min_date, max_date = get_date_range(conn)
     print(f"  Data range: {min_date.isoformat()} to {max_date.isoformat()}")
@@ -318,6 +369,12 @@ def refresh_period_stats(conn):
     for i, (period_type, period_id, start_date, end_date) in enumerate(periods, 1):
         label = f"{period_type} {period_id}"
         print(f"\n[{i}/{len(periods)}] Processing {label}...")
+
+        # Compute summary stats (unique queries + pairs)
+        start = datetime.now(timezone.utc)
+        uq, up = compute_period_summary_stats(conn, period_type, period_id, start_date, end_date)
+        elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+        print(f"  Summary stats: {uq} unique queries, {up} pairs in {elapsed:.1f}s")
 
         # Compute top queries
         start = datetime.now(timezone.utc)
