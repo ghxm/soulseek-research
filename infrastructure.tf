@@ -93,6 +93,10 @@ resource "hcloud_server" "database" {
   labels = {
     type = "database"
   }
+
+  lifecycle {
+    ignore_changes = [user_data]
+  }
 }
 
 # Client Servers with specific locations
@@ -123,9 +127,22 @@ resource "hcloud_server" "client" {
   }
 }
 
+# Archive Volume (50 GB, for Parquet archives)
+resource "hcloud_volume" "archive" {
+  name      = "soulseek-archive"
+  size      = 50
+  server_id = hcloud_server.database.id
+  automount = true
+  format    = "ext4"
+}
+
 # Outputs
 output "database_ip" {
   value = hcloud_server.database.ipv4_address
+}
+
+output "archive_volume_id" {
+  value = hcloud_volume.archive.id
 }
 
 output "client_ips" {

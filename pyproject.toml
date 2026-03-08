@@ -33,6 +33,7 @@ dashboard = [
 scripts = [
     "psycopg2-binary>=2.9.9",
     "pandas>=2.1.4",
+    "polars>=1.0.0",
 ]
 dev = [
     "pytest>=7.0.0",

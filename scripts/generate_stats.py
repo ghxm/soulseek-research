@@ -94,105 +94,18 @@ def get_db_connection():
 
 
 def get_cumulative_stats(conn) -> Dict[str, Any]:
-    """Get cumulative stats (archived + live data combined)"""
-    cursor = conn.cursor()
-
-    # Get cumulative stats from archived data
-    cursor.execute("""
-        SELECT total_searches, total_users, total_queries, total_search_pairs,
-               first_search, last_search, client_totals
-        FROM stats_cumulative
-        WHERE id = 1
-    """)
-    cumulative = cursor.fetchone()
-
-    if cumulative is None:
-        # No cumulative stats yet, return zeros
-        cumulative = (0, 0, 0, 0, None, None, {})
-
-    (cum_searches, cum_users, cum_queries, cum_pairs,
-     cum_first, cum_last, cum_clients) = cumulative
-
-    # Parse client_totals if it's a string
-    if isinstance(cum_clients, str):
-        cum_clients = json.loads(cum_clients) if cum_clients else {}
-
-    # Get live data stats from materialized view
-    cursor.execute("""
-        SELECT total_searches, total_users, total_queries, total_search_pairs,
-               first_search, last_search, client_totals
-        FROM mv_summary_stats
-    """)
-    live = cursor.fetchone()
-
-    if live is None or live[0] is None:
-        # No live data
-        live = (0, 0, 0, 0, None, None, {})
-
-    (live_searches, live_users, live_queries, live_pairs,
-     live_first, live_last, live_clients) = live
-
-    # Parse client_totals if it's a string
-    if isinstance(live_clients, str):
-        live_clients = json.loads(live_clients) if live_clients else {}
-
-    # Combine cumulative + live
-    total_searches = cum_searches + live_searches
-    total_users = cum_users + live_users  # Approximate
-    total_queries = cum_queries + live_queries  # Approximate
-    total_pairs = cum_pairs + live_pairs  # Approximate
-
-    # Earliest/latest timestamps
-    first_search = None
-    if cum_first and live_first:
-        first_search = min(cum_first, live_first)
-    else:
-        first_search = cum_first or live_first
-
-    last_search = None
-    if cum_last and live_last:
-        last_search = max(cum_last, live_last)
-    else:
-        last_search = cum_last or live_last
-
-    # Merge client totals
-    client_totals = {}
-    for client, count in (cum_clients or {}).items():
-        client_totals[client] = client_totals.get(client, 0) + count
-    for client, count in (live_clients or {}).items():
-        client_totals[client] = client_totals.get(client, 0) + count
-
-    cursor.close()
-
-    avg_searches_per_user = total_searches / total_users if total_users > 0 else 0
-    avg_unique_queries_per_user = total_pairs / total_users if total_users > 0 else 0
-
-    return {
-        'total_searches': total_searches,
-        'total_users': total_users,
-        'total_queries': total_queries,
-        'total_search_pairs': total_pairs,
-        'avg_searches_per_user': avg_searches_per_user,
-        'avg_unique_queries_per_user': avg_unique_queries_per_user,
-        'first_search': first_search.isoformat() if first_search else None,
-        'last_search': last_search.isoformat() if last_search else None,
-        'client_totals': client_totals
-    }
-
-
-def get_live_summary_stats(conn) -> Dict[str, Any]:
-    """Get summary stats from live data only (from materialized view)"""
+    """Get all-time stats from precomputed period_summary_stats."""
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT total_searches, total_users, total_queries, total_search_pairs,
-               first_search, last_search, client_totals
-        FROM mv_summary_stats
+        SELECT total_searches, total_users, unique_queries, unique_pairs, first_date, last_date
+        FROM period_summary_stats
+        WHERE period_type = 'all_time' AND period_id = 'all_time'
     """)
-    result = cursor.fetchone()
-    cursor.close()
+    row = cursor.fetchone()
 
-    if result is None or result[0] is None:
+    if row is None:
+        cursor.close()
         return {
             'total_searches': 0,
             'total_users': 0,
@@ -205,50 +118,71 @@ def get_live_summary_stats(conn) -> Dict[str, Any]:
             'client_totals': {}
         }
 
-    (total_searches, total_users, total_queries, total_pairs,
-     first_search, last_search, client_totals) = result
+    total_searches, total_users, total_queries, total_pairs, first_date, last_date = row
 
-    if isinstance(client_totals, str):
-        client_totals = json.loads(client_totals) if client_totals else {}
+    # Client totals: union archived + live daily client stats
+    cursor.execute("""
+        SELECT client_id, SUM(search_count)::bigint
+        FROM (
+            SELECT client_id, search_count FROM daily_client_stats
+            UNION ALL
+            SELECT client_id, search_count FROM mv_daily_stats
+        ) combined
+        GROUP BY client_id
+    """)
+    client_totals = {r[0]: int(r[1]) for r in cursor.fetchall()}
+    cursor.close()
 
-    avg_searches_per_user = total_searches / total_users if total_users > 0 else 0
-    avg_unique_queries_per_user = total_pairs / total_users if total_users > 0 else 0
+    total_searches = int(total_searches) if total_searches else 0
+    total_users = int(total_users) if total_users else 0
+    total_queries = int(total_queries) if total_queries else 0
+    total_pairs = int(total_pairs) if total_pairs else 0
+
+    avg_searches = total_searches / total_users if total_users > 0 else 0
+    avg_queries = total_pairs / total_users if total_users > 0 else 0
 
     return {
         'total_searches': total_searches,
         'total_users': total_users,
         'total_queries': total_queries,
         'total_search_pairs': total_pairs,
-        'avg_searches_per_user': avg_searches_per_user,
-        'avg_unique_queries_per_user': avg_unique_queries_per_user,
-        'first_search': first_search.isoformat() if first_search else None,
-        'last_search': last_search.isoformat() if last_search else None,
-        'client_totals': client_totals or {}
+        'avg_searches_per_user': avg_searches,
+        'avg_unique_queries_per_user': avg_queries,
+        'first_search': datetime.combine(first_date, datetime.min.time()).replace(tzinfo=timezone.utc).isoformat() if first_date else None,
+        'last_search': datetime.combine(last_date, datetime.max.time()).replace(tzinfo=timezone.utc).isoformat() if last_date else None,
+        'client_totals': client_totals,
     }
 
 
+
 def get_daily_stats(conn, start_date=None, end_date=None) -> pd.DataFrame:
-    """Get daily stats from materialized view, optionally filtered by date range"""
+    """Get daily stats from archived + live data, optionally filtered by date range"""
     cursor = conn.cursor()
 
+    base_query = """
+        SELECT client_id, date, search_count, unique_users FROM daily_client_stats
+        UNION ALL
+        SELECT client_id, date, search_count, unique_users FROM mv_daily_stats
+    """
+
     if start_date and end_date:
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT client_id, date, search_count, unique_users
-            FROM mv_daily_stats
+            FROM ({base_query}) combined
             WHERE date >= %s AND date <= %s
             ORDER BY date, client_id
         """, (start_date.date(), end_date.date()))
     elif end_date:
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT client_id, date, search_count, unique_users
-            FROM mv_daily_stats
+            FROM ({base_query}) combined
             WHERE date <= %s
             ORDER BY date, client_id
         """, (end_date.date(),))
     else:
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT client_id, date, search_count, unique_users
-            FROM mv_daily_stats
+            FROM ({base_query}) combined
             ORDER BY date, client_id
         """)
 
@@ -262,29 +196,35 @@ def get_daily_stats(conn, start_date=None, end_date=None) -> pd.DataFrame:
 
 
 def get_daily_unique_users(conn, start_date=None, end_date=None) -> pd.DataFrame:
-    """Get daily unique users from mv_daily_stats (approximation - max across clients per day)"""
+    """Get daily unique users from archived + live data (approximation - max across clients per day)"""
     cursor = conn.cursor()
 
+    base_query = """
+        SELECT client_id, date, search_count, unique_users FROM daily_client_stats
+        UNION ALL
+        SELECT client_id, date, search_count, unique_users FROM mv_daily_stats
+    """
+
     if start_date and end_date:
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT date, MAX(unique_users) as unique_users
-            FROM mv_daily_stats
+            FROM ({base_query}) combined
             WHERE date >= %s AND date <= %s
             GROUP BY date
             ORDER BY date
         """, (start_date.date(), end_date.date()))
     elif end_date:
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT date, MAX(unique_users) as unique_users
-            FROM mv_daily_stats
+            FROM ({base_query}) combined
             WHERE date <= %s
             GROUP BY date
             ORDER BY date
         """, (end_date.date(),))
     else:
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT date, MAX(unique_users) as unique_users
-            FROM mv_daily_stats
+            FROM ({base_query}) combined
             GROUP BY date
             ORDER BY date
         """)
@@ -299,12 +239,13 @@ def get_daily_unique_users(conn, start_date=None, end_date=None) -> pd.DataFrame
 
 
 def get_top_queries(conn) -> List[tuple]:
-    """Get all queries with 5+ unique users from materialized view"""
+    """Get all-time top queries from precomputed period_top_queries."""
     cursor = conn.cursor()
     cursor.execute("""
         SELECT query_normalized, unique_users, total_searches
-        FROM mv_top_queries
-        ORDER BY unique_users DESC, total_searches DESC
+        FROM period_top_queries
+        WHERE period_type = 'all_time' AND period_id = 'all_time'
+        ORDER BY rank
     """)
     rows = cursor.fetchall()
     cursor.close()
@@ -312,12 +253,13 @@ def get_top_queries(conn) -> List[tuple]:
 
 
 def get_query_length_distribution(conn) -> pd.DataFrame:
-    """Get query length distribution from materialized view"""
+    """Get all-time query length distribution from precomputed period table."""
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT word_count as query_length, unique_query_count as count
-        FROM mv_query_length_dist
-        ORDER BY word_count
+        SELECT query_length, unique_query_count
+        FROM period_query_length_dist
+        WHERE period_type = 'all_time' AND period_id = 'all_time'
+        ORDER BY query_length
     """)
     rows = cursor.fetchall()
     cursor.close()
@@ -329,17 +271,23 @@ def get_query_length_distribution(conn) -> pd.DataFrame:
 
 
 def get_period_stats(conn, start_date, end_date, period_type: str = None, period_id: str = None) -> Dict[str, Any]:
-    """Get stats for a specific period using mv_daily_stats (fast, pre-aggregated)"""
+    """Get stats for a specific period using archived + live daily stats"""
     cursor = conn.cursor()
 
-    # Use mv_daily_stats for fast aggregation (pre-computed daily counts)
-    cursor.execute("""
+    base_query = """
+        SELECT client_id, date, search_count, unique_users FROM daily_client_stats
+        UNION ALL
+        SELECT client_id, date, search_count, unique_users FROM mv_daily_stats
+    """
+
+    # Use archived + live daily stats for fast aggregation
+    cursor.execute(f"""
         SELECT
             COALESCE(SUM(search_count), 0) as total_searches,
             COALESCE(SUM(unique_users), 0) as total_users,
             MIN(date) as first_date,
             MAX(date) as last_date
-        FROM mv_daily_stats
+        FROM ({base_query}) combined
         WHERE date >= %s AND date <= %s
     """, (start_date.date(), end_date.date()))
 
@@ -353,10 +301,10 @@ def get_period_stats(conn, start_date, end_date, period_type: str = None, period
     total_searches = int(total_searches) if total_searches else 0
     total_users = int(total_users) if total_users else 0
 
-    # Get per-client totals from mv_daily_stats
-    cursor.execute("""
+    # Get per-client totals from archived + live daily stats
+    cursor.execute(f"""
         SELECT client_id, SUM(search_count) as count
-        FROM mv_daily_stats
+        FROM ({base_query}) combined
         WHERE date >= %s AND date <= %s
         GROUP BY client_id
     """, (start_date.date(), end_date.date()))
@@ -1644,12 +1592,13 @@ def generate_query_pages(conn, cutoff_date=None, query_similarities=None,
 
     print(f"  Found daily data for {len(query_daily)} queries")
 
-    # Fetch all-time stats per query from mv_top_queries
+    # Fetch all-time stats per query from period_top_queries
     cursor = conn.cursor()
     cursor.execute("""
         SELECT query_normalized, unique_users, total_searches
-        FROM mv_top_queries
-        WHERE unique_users >= 35
+        FROM period_top_queries
+        WHERE period_type = 'all_time' AND period_id = 'all_time'
+          AND unique_users >= 35
     """)
     query_stats = {row[0]: {'unique_users': row[1], 'total_searches': row[2]} for row in cursor.fetchall()}
     cursor.close()
@@ -1747,11 +1696,12 @@ query_display: "{display_escaped}"
     print(f"  Generated {count} query pages in docs/queries/")
 
     # Write search index JSON for client-side query search
-    # Include all queries from mv_top_queries (5+ users), not just those with pages
+    # Include all queries from period_top_queries (5+ users), not just those with pages
     cursor = conn.cursor()
     cursor.execute("""
         SELECT query_normalized, unique_users, total_searches
-        FROM mv_top_queries
+        FROM period_top_queries
+        WHERE period_type = 'all_time' AND period_id = 'all_time'
     """)
     all_queries = cursor.fetchall()
     cursor.close()

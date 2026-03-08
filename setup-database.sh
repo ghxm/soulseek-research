@@ -100,11 +100,25 @@ CREATE INDEX IF NOT EXISTS idx_period_ql_dist_lookup
 ON period_query_length_dist(period_type, period_id);
 
 CREATE TABLE IF NOT EXISTS period_summary_stats (
-    period_type VARCHAR(10) NOT NULL,  -- 'week' or 'month'
-    period_id VARCHAR(20) NOT NULL,     -- '2026-01' or '2026-W04'
+    period_type VARCHAR(10) NOT NULL,  -- 'week', 'month', or 'all_time'
+    period_id VARCHAR(20) NOT NULL,     -- '2026-01', '2026-W04', or 'all_time'
     unique_queries INTEGER NOT NULL,
     unique_pairs INTEGER NOT NULL,
+    total_searches BIGINT DEFAULT 0,
+    total_users INTEGER DEFAULT 0,
+    first_date DATE,
+    last_date DATE,
     PRIMARY KEY (period_type, period_id)
+);
+
+-- Permanent table for archived daily client stats (tiny, ~4 rows/day)
+-- Preserves mv_daily_stats data after searches are deleted
+CREATE TABLE IF NOT EXISTS daily_client_stats (
+    client_id VARCHAR(255) NOT NULL,
+    date DATE NOT NULL,
+    search_count INTEGER NOT NULL,
+    unique_users INTEGER NOT NULL,
+    PRIMARY KEY (client_id, date)
 );
 
 -- Per-query daily statistics for query detail pages
@@ -152,46 +166,10 @@ ORDER BY date, client_id;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_daily_stats_unique
 ON mv_daily_stats (date, client_id);
 
--- Top queries by unique users (global, not per-period)
--- Changed to include all queries with 5+ unique users (no LIMIT)
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_top_queries AS
-SELECT
-    LOWER(TRIM(query)) as query_normalized,
-    COUNT(DISTINCT username) as unique_users,
-    COUNT(*) as total_searches
-FROM searches
-GROUP BY LOWER(TRIM(query))
-HAVING COUNT(DISTINCT username) >= 5
-ORDER BY unique_users DESC, total_searches DESC;
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_top_queries_unique
-ON mv_top_queries (query_normalized);
-
--- Query length distribution (word count)
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_query_length_dist AS
-SELECT
-    LENGTH(query) - LENGTH(REPLACE(query, ' ', '')) + 1 as word_count,
-    COUNT(DISTINCT LOWER(TRIM(query))) as unique_query_count
-FROM searches
-WHERE LENGTH(query) - LENGTH(REPLACE(query, ' ', '')) + 1 <= 100
-GROUP BY word_count
-ORDER BY word_count;
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_query_length_unique
-ON mv_query_length_dist (word_count);
-
--- Summary stats for live data (single row)
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_summary_stats AS
-SELECT
-    (SELECT COUNT(*) FROM searches) as total_searches,
-    (SELECT COUNT(DISTINCT username) FROM searches) as total_users,
-    (SELECT COUNT(DISTINCT LOWER(TRIM(query))) FROM searches) as total_queries,
-    (SELECT COUNT(DISTINCT (username || '|' || LOWER(TRIM(query)))) FROM searches) as total_search_pairs,
-    (SELECT MIN(timestamp) FROM searches) as first_search,
-    (SELECT MAX(timestamp) FROM searches) as last_search,
-    (SELECT COALESCE(jsonb_object_agg(client_id, client_count), '{}'::jsonb)
-     FROM (SELECT client_id, COUNT(*) as client_count FROM searches GROUP BY client_id) c
-    ) as client_totals;
+-- NOTE: mv_top_queries, mv_query_length_dist, mv_summary_stats have been removed.
+-- Their data is now computed by refresh_period_stats.py (using polars over archived
+-- Parquet + live MV data) and stored in period_top_queries, period_query_length_dist,
+-- and period_summary_stats with period_type='all_time'.
 "
 
 # Build image for local / Germany client (repo already cloned above)
@@ -255,9 +233,6 @@ DB_CONTAINER=$(docker-compose -f database.yml ps -q database)
 docker exec $DB_CONTAINER psql -U soulseek -d soulseek -c "
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_daily_search_tuples;
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_daily_stats;
-REFRESH MATERIALIZED VIEW CONCURRENTLY mv_top_queries;
-REFRESH MATERIALIZED VIEW CONCURRENTLY mv_query_length_dist;
-REFRESH MATERIALIZED VIEW mv_summary_stats;
 "
 
 echo "$(date): Materialized views refreshed" >> /var/log/soulseek-views.log
@@ -278,7 +253,9 @@ DB_URL="postgresql://soulseek:${db_password}@localhost:5432/soulseek"
 # Run period stats refresh using Docker
 docker run --rm \
   --network=host \
+  -v /opt/archives:/archives \
   -e DATABASE_URL="$DB_URL" \
+  -e ARCHIVE_PATH=/archives \
   soulseek-research:latest \
   uv run python /app/scripts/refresh_period_stats.py
 

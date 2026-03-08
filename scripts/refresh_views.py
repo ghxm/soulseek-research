@@ -44,9 +44,6 @@ def refresh_views(conn):
     views = [
         ('mv_daily_search_tuples', True),  # CONCURRENTLY supported; period stats depend on it
         ('mv_daily_stats', True),          # CONCURRENTLY supported (has unique index)
-        ('mv_top_queries', True),          # CONCURRENTLY supported
-        ('mv_query_length_dist', True),    # CONCURRENTLY supported
-        ('mv_summary_stats', False),       # No unique index, regular refresh
     ]
 
     cursor = conn.cursor()

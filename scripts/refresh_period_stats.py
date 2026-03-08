@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-Refresh period-specific statistics tables (weeks and months).
-Called by cron at 4:30 AM UTC daily, after materialized view refresh.
+Refresh period-specific statistics tables (weeks, months, all_time).
+Called by cron at 1:00 AM UTC daily, after materialized view refresh.
 
-Precomputes top queries and query length distribution for each period,
-storing results in dedicated tables for fast dashboard generation.
+Loads data from archived Parquet files + live mv_daily_search_tuples,
+then computes top queries, query length distribution, and summary stats
+for each period using polars.
 """
 
+import glob
 import os
 import sys
-from datetime import datetime, timedelta, timezone
-from typing import List, Tuple
+from datetime import date, datetime, timedelta, timezone
+from typing import Dict, List, Optional, Set, Tuple
 
+import polars as pl
 import psycopg2
 from psycopg2.extras import execute_values
 
@@ -48,27 +51,101 @@ def get_db_connection():
     )
 
 
-def get_date_range(conn) -> Tuple[datetime, datetime]:
-    """Get the min/max dates from mv_daily_search_tuples"""
-    cursor = conn.cursor()
-    cursor.execute("SELECT MIN(date), MAX(date) FROM mv_daily_search_tuples")
-    min_date, max_date = cursor.fetchone()
+def load_all_tuples(conn, archive_path: str) -> pl.LazyFrame:
+    """Load all daily tuples from archived Parquet files and live MV data.
+
+    Scans all daily_tuples_*.parquet files from archive_path, then queries
+    mv_daily_search_tuples for live data via a server-side cursor. Returns
+    a single concatenated LazyFrame.
+
+    Schema: {date: pl.Date, username: pl.Utf8, query_normalized: pl.Utf8, search_count: pl.Int64}
+    """
+    schema = {
+        "date": pl.Date,
+        "username": pl.Utf8,
+        "query_normalized": pl.Utf8,
+        "search_count": pl.Int64,
+    }
+    frames = []
+
+    # Load archived Parquet files
+    parquet_pattern = os.path.join(archive_path, "daily_tuples_*.parquet")
+    parquet_files = sorted(glob.glob(parquet_pattern))
+    if parquet_files:
+        print(f"  Found {len(parquet_files)} archived Parquet files")
+        archive_lf = pl.scan_parquet(parquet_files)
+        # Ensure consistent schema
+        archive_lf = archive_lf.cast({
+            "date": pl.Date,
+            "username": pl.Utf8,
+            "query_normalized": pl.Utf8,
+            "search_count": pl.Int64,
+        })
+        frames.append(archive_lf)
+    else:
+        print("  No archived Parquet files found")
+
+    # Load live data from mv_daily_search_tuples via server-side cursor
+    print("  Loading live data from mv_daily_search_tuples...")
+    cursor = conn.cursor(name="load_tuples_cursor")
+    cursor.itersize = 100_000
+    cursor.execute("SELECT date, username, query_normalized, search_count FROM mv_daily_search_tuples")
+
+    batches = []
+    row_count = 0
+    while True:
+        rows = cursor.fetchmany(cursor.itersize)
+        if not rows:
+            break
+        batches.extend(rows)
+        row_count += len(rows)
+
     cursor.close()
+    print(f"  Loaded {row_count} live rows")
 
-    if not min_date or not max_date:
-        raise ValueError("No data in mv_daily_search_tuples")
+    if batches:
+        live_df = pl.DataFrame(
+            {
+                "date": [r[0] for r in batches],
+                "username": [r[1] for r in batches],
+                "query_normalized": [r[2] for r in batches],
+                "search_count": [r[3] for r in batches],
+            },
+            schema=schema,
+        )
+        frames.append(live_df.lazy())
 
-    # Convert date to datetime with timezone for period generation
-    if not isinstance(min_date, datetime):
-        min_date = datetime.combine(min_date, datetime.min.time()).replace(tzinfo=timezone.utc)
-    if not isinstance(max_date, datetime):
-        max_date = datetime.combine(max_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+    if not frames:
+        return pl.LazyFrame(schema=schema)
 
-    return min_date, max_date
+    return pl.concat(frames)
 
 
-def generate_periods(min_date: datetime, max_date: datetime) -> List[Tuple[str, str, datetime, datetime]]:
-    """Generate all week and month periods between min and max dates.
+def get_min_live_date(conn) -> Optional[date]:
+    """Get the minimum date from mv_daily_search_tuples."""
+    cursor = conn.cursor()
+    cursor.execute("SELECT MIN(date) FROM mv_daily_search_tuples")
+    result = cursor.fetchone()
+    cursor.close()
+    if result and result[0]:
+        d = result[0]
+        if isinstance(d, datetime):
+            return d.date()
+        return d
+    return None
+
+
+def get_existing_period_stats(conn) -> Set[Tuple[str, str]]:
+    """Get all (period_type, period_id) pairs that already have summary stats."""
+    cursor = conn.cursor()
+    cursor.execute("SELECT period_type, period_id FROM period_summary_stats")
+    result = {(row[0], row[1]) for row in cursor.fetchall()}
+    cursor.close()
+    return result
+
+
+def generate_periods(min_date: date, max_date: date) -> List[Tuple[str, str, date, date]]:
+    """Generate all week, month, and all_time periods between min and max dates.
 
     Returns list of (period_type, period_id, start_date, end_date) tuples.
     """
@@ -79,75 +156,186 @@ def generate_periods(min_date: datetime, max_date: datetime) -> List[Tuple[str, 
     while current <= max_date:
         iso_year, iso_week, _ = current.isocalendar()
         week_id = f"{iso_year}-W{iso_week:02d}"
-        week_start = datetime.fromisocalendar(iso_year, iso_week, 1).replace(tzinfo=timezone.utc)
-        week_end = week_start + timedelta(days=6, hours=23, minutes=59, seconds=59)
+        week_start = date.fromisocalendar(iso_year, iso_week, 1)
+        week_end = week_start + timedelta(days=6)
         periods.append(('week', week_id, week_start, week_end))
-        current = week_end + timedelta(seconds=1)
+        current = week_end + timedelta(days=1)
 
     # Generate months
-    current = min_date.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    current = min_date.replace(day=1)
     while current <= max_date:
         month_id = current.strftime('%Y-%m')
         if current.month == 12:
             next_month = current.replace(year=current.year + 1, month=1)
         else:
             next_month = current.replace(month=current.month + 1)
-        month_end = next_month - timedelta(seconds=1)
+        month_end = next_month - timedelta(days=1)
         periods.append(('month', month_id, current, month_end))
         current = next_month
+
+    # All-time period
+    periods.append(('all_time', 'all_time', min_date, max_date))
 
     return periods
 
 
-def compute_period_top_queries(conn, period_type: str, period_id: str,
-                                start_date: datetime, end_date: datetime) -> int:
-    """Compute top queries for a period and store in period_top_queries table.
+def ensure_period_summary_stats_table(conn):
+    """Create the period_summary_stats table if it doesn't exist, and add new columns."""
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS period_summary_stats (
+            period_type VARCHAR(10) NOT NULL,
+            period_id VARCHAR(20) NOT NULL,
+            unique_queries INTEGER NOT NULL,
+            unique_pairs INTEGER NOT NULL,
+            total_searches BIGINT,
+            total_users INTEGER,
+            first_date DATE,
+            last_date DATE,
+            PRIMARY KEY (period_type, period_id)
+        )
+    """)
+    conn.commit()
 
-    Uses a two-step approach: SELECT aggregation first, then batch INSERT.
-    This avoids holding a long write transaction during the expensive aggregation.
+    # Add columns if they don't exist (for existing tables)
+    for col, col_type in [
+        ('total_searches', 'BIGINT'),
+        ('total_users', 'INTEGER'),
+        ('first_date', 'DATE'),
+        ('last_date', 'DATE'),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE period_summary_stats ADD COLUMN {col} {col_type}")
+            conn.commit()
+        except psycopg2.errors.DuplicateColumn:
+            conn.rollback()
+
+    cursor.close()
+
+
+def compute_all_period_summary_stats(
+    conn, tuples_lf: pl.LazyFrame, periods: List[Tuple[str, str, date, date]]
+) -> Dict[Tuple[str, str], Tuple[int, int, int, int, date, date]]:
+    """Compute summary stats for all non-skipped periods using polars.
+
+    Returns lookup dict of (period_type, period_id) -> (unique_queries, unique_pairs,
+    total_searches, total_users, first_date, last_date).
+    """
+    results = {}
+
+    for period_type, period_id, start_date, end_date in periods:
+        print(f"  Computing summary for {period_type} {period_id}...")
+        start = datetime.now(timezone.utc)
+
+        if period_type == 'all_time':
+            filtered = tuples_lf
+        else:
+            filtered = tuples_lf.filter(
+                (pl.col("date") >= start_date) & (pl.col("date") <= end_date)
+            )
+
+        stats = filtered.select(
+            pl.col("search_count").sum().alias("total_searches"),
+            pl.col("username").n_unique().alias("total_users"),
+            pl.col("query_normalized").n_unique().alias("unique_queries"),
+            pl.struct(["username", "query_normalized"]).n_unique().alias("unique_pairs"),
+            pl.col("date").min().alias("first_date"),
+            pl.col("date").max().alias("last_date"),
+        ).collect()
+
+        if stats.height == 0 or stats["total_searches"][0] is None:
+            elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+            print(f"    No data for this period ({elapsed:.1f}s)")
+            continue
+
+        row = stats.row(0)
+        total_searches = int(row[0])
+        total_users = int(row[1])
+        unique_queries = int(row[2])
+        unique_pairs = int(row[3])
+        first_dt = row[4]
+        last_dt = row[5]
+
+        results[(period_type, period_id)] = (
+            unique_queries, unique_pairs, total_searches, total_users, first_dt, last_dt
+        )
+
+        elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+        print(f"    {unique_queries} queries, {unique_pairs} pairs, "
+              f"{total_searches} searches, {total_users} users ({elapsed:.1f}s)")
+
+    # Bulk upsert all results
+    if results:
+        cursor = conn.cursor()
+        values = [
+            (pt, pid, uq, up, ts, tu, fd, ld)
+            for (pt, pid), (uq, up, ts, tu, fd, ld) in results.items()
+        ]
+        execute_values(
+            cursor,
+            """INSERT INTO period_summary_stats
+               (period_type, period_id, unique_queries, unique_pairs,
+                total_searches, total_users, first_date, last_date)
+               VALUES %s
+               ON CONFLICT (period_type, period_id)
+               DO UPDATE SET
+                   unique_queries = EXCLUDED.unique_queries,
+                   unique_pairs = EXCLUDED.unique_pairs,
+                   total_searches = EXCLUDED.total_searches,
+                   total_users = EXCLUDED.total_users,
+                   first_date = EXCLUDED.first_date,
+                   last_date = EXCLUDED.last_date""",
+            values,
+        )
+        conn.commit()
+        cursor.close()
+
+    return results
+
+
+def compute_period_top_queries(
+    conn, tuples_lf: pl.LazyFrame, period_type: str, period_id: str,
+    start_date: date, end_date: date
+) -> int:
+    """Compute top queries for a period using polars and store in period_top_queries table.
 
     Returns number of queries inserted.
     """
-    # Step 1: Run the aggregation against the pre-deduplicated view
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT
-            query_normalized,
-            COUNT(DISTINCT username) as unique_users,
-            SUM(search_count) as total_searches
-        FROM mv_daily_search_tuples
-        WHERE date >= %s AND date <= %s
-        GROUP BY query_normalized
-        HAVING COUNT(DISTINCT username) >= 5
-        ORDER BY COUNT(DISTINCT username) DESC, SUM(search_count) DESC
-    """, (start_date.date() if isinstance(start_date, datetime) else start_date,
-          end_date.date() if isinstance(end_date, datetime) else end_date))
+    if period_type == 'all_time':
+        filtered = tuples_lf
+    else:
+        filtered = tuples_lf.filter(
+            (pl.col("date") >= start_date) & (pl.col("date") <= end_date)
+        )
 
-    rows = cursor.fetchall()
-    cursor.close()
+    result_df = (
+        filtered
+        .group_by("query_normalized")
+        .agg(
+            pl.col("username").n_unique().alias("unique_users"),
+            pl.col("search_count").sum().alias("total_searches"),
+        )
+        .filter(pl.col("unique_users") >= 5)
+        .sort(["unique_users", "total_searches"], descending=True)
+        .with_row_index("rank", offset=1)
+        .collect()
+    )
 
-    if not rows:
-        # Still delete old data even if no new results
-        cursor = conn.cursor()
-        cursor.execute("""
-            DELETE FROM period_top_queries
-            WHERE period_type = %s AND period_id = %s
-        """, (period_type, period_id))
-        conn.commit()
-        cursor.close()
-        return 0
-
-    # Step 2: Delete old data and batch insert new results
+    # Delete old data
     cursor = conn.cursor()
     cursor.execute("""
         DELETE FROM period_top_queries
         WHERE period_type = %s AND period_id = %s
     """, (period_type, period_id))
 
-    # Add rank and period info to each row
+    if result_df.height == 0:
+        conn.commit()
+        cursor.close()
+        return 0
+
     values = [
-        (period_type, period_id, row[0], int(row[1]), int(row[2]), rank)
-        for rank, row in enumerate(rows, 1)
+        (period_type, period_id, row[1], int(row[2]), int(row[3]), int(row[0]))
+        for row in result_df.iter_rows()
     ]
 
     execute_values(
@@ -156,7 +344,7 @@ def compute_period_top_queries(conn, period_type: str, period_id: str,
            (period_type, period_id, query_normalized, unique_users, total_searches, rank)
            VALUES %s""",
         values,
-        page_size=5000
+        page_size=5000,
     )
 
     conn.commit()
@@ -165,49 +353,48 @@ def compute_period_top_queries(conn, period_type: str, period_id: str,
     return len(values)
 
 
-def compute_period_query_length_dist(conn, period_type: str, period_id: str,
-                                      start_date: datetime, end_date: datetime) -> int:
-    """Compute query length distribution for a period and store in period_query_length_dist table.
+def compute_period_query_length_dist(
+    conn, tuples_lf: pl.LazyFrame, period_type: str, period_id: str,
+    start_date: date, end_date: date
+) -> int:
+    """Compute query length distribution for a period using polars.
 
     Returns number of rows inserted.
     """
-    # Step 1: Run aggregation against pre-deduplicated view
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT
-            LENGTH(query_normalized) - LENGTH(REPLACE(query_normalized, ' ', '')) + 1 as query_length,
-            COUNT(DISTINCT query_normalized) as unique_query_count
-        FROM mv_daily_search_tuples
-        WHERE date >= %s AND date <= %s
-          AND LENGTH(query_normalized) - LENGTH(REPLACE(query_normalized, ' ', '')) + 1 <= 100
-        GROUP BY query_length
-        ORDER BY query_length
-    """, (start_date.date() if isinstance(start_date, datetime) else start_date,
-          end_date.date() if isinstance(end_date, datetime) else end_date))
+    if period_type == 'all_time':
+        filtered = tuples_lf
+    else:
+        filtered = tuples_lf.filter(
+            (pl.col("date") >= start_date) & (pl.col("date") <= end_date)
+        )
 
-    rows = cursor.fetchall()
-    cursor.close()
+    result_df = (
+        filtered
+        .with_columns(
+            (pl.col("query_normalized").str.count_matches(" ") + 1).alias("query_length")
+        )
+        .filter(pl.col("query_length") <= 100)
+        .group_by("query_length")
+        .agg(pl.col("query_normalized").n_unique().alias("unique_query_count"))
+        .sort("query_length")
+        .collect()
+    )
 
-    if not rows:
-        cursor = conn.cursor()
-        cursor.execute("""
-            DELETE FROM period_query_length_dist
-            WHERE period_type = %s AND period_id = %s
-        """, (period_type, period_id))
-        conn.commit()
-        cursor.close()
-        return 0
-
-    # Step 2: Delete old data and batch insert
+    # Delete old data
     cursor = conn.cursor()
     cursor.execute("""
         DELETE FROM period_query_length_dist
         WHERE period_type = %s AND period_id = %s
     """, (period_type, period_id))
 
+    if result_df.height == 0:
+        conn.commit()
+        cursor.close()
+        return 0
+
     values = [
         (period_type, period_id, int(row[0]), int(row[1]))
-        for row in rows
+        for row in result_df.iter_rows()
     ]
 
     execute_values(
@@ -215,7 +402,7 @@ def compute_period_query_length_dist(conn, period_type: str, period_id: str,
         """INSERT INTO period_query_length_dist
            (period_type, period_id, query_length, unique_query_count)
            VALUES %s""",
-        values
+        values,
     )
 
     conn.commit()
@@ -224,87 +411,19 @@ def compute_period_query_length_dist(conn, period_type: str, period_id: str,
     return len(values)
 
 
-def ensure_period_summary_stats_table(conn):
-    """Create the period_summary_stats table if it doesn't exist."""
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS period_summary_stats (
-            period_type VARCHAR(10) NOT NULL,
-            period_id VARCHAR(20) NOT NULL,
-            unique_queries INTEGER NOT NULL,
-            unique_pairs INTEGER NOT NULL,
-            PRIMARY KEY (period_type, period_id)
-        )
-    """)
-    conn.commit()
-    cursor.close()
-
-
-def compute_all_period_summary_stats(conn, periods):
-    """Compute unique queries and user-query pairs for all periods.
-
-    Runs separate queries for weeks and months (each a single full scan),
-    with extended statement timeout to handle large tables.
-    """
-    all_rows = []
-
-    for period_type, group_expr in [
-        ('week', "TO_CHAR(date, 'IYYY') || '-W' || TO_CHAR(date, 'IW')"),
-        ('month', "TO_CHAR(date, 'YYYY-MM')"),
-    ]:
-        print(f"  Computing {period_type} summary stats...")
-        start = datetime.now(timezone.utc)
-        cursor = conn.cursor()
-        cursor.execute("SET statement_timeout = '1800000'")  # 30 min
-        cursor.execute(f"""
-            SELECT
-                '{period_type}' as period_type,
-                {group_expr} as period_id,
-                COUNT(DISTINCT query_normalized) as unique_queries,
-                COUNT(DISTINCT (username, query_normalized)) as unique_pairs
-            FROM mv_daily_search_tuples
-            GROUP BY period_id
-        """)
-        rows = cursor.fetchall()
-        cursor.execute("RESET statement_timeout")
-        cursor.close()
-        elapsed = (datetime.now(timezone.utc) - start).total_seconds()
-        print(f"    {len(rows)} {period_type}s in {elapsed:.1f}s")
-        all_rows.extend(rows)
-
-    if not all_rows:
-        return {}
-
-    # Bulk upsert all results
-    cursor = conn.cursor()
-    values = [(row[0], row[1], int(row[2]), int(row[3])) for row in all_rows]
-    execute_values(
-        cursor,
-        """INSERT INTO period_summary_stats (period_type, period_id, unique_queries, unique_pairs)
-           VALUES %s
-           ON CONFLICT (period_type, period_id)
-           DO UPDATE SET unique_queries = EXCLUDED.unique_queries, unique_pairs = EXCLUDED.unique_pairs""",
-        values
-    )
-    conn.commit()
-    cursor.close()
-
-    # Return as lookup dict
-    return {(row[0], row[1]): (int(row[2]), int(row[3])) for row in all_rows}
-
-
-def compute_query_daily_stats(conn):
+def compute_query_daily_stats(conn, tuples_lf: pl.LazyFrame, min_live_date: Optional[date]):
     """Compute daily stats for queries with 35+ all-time unique users.
 
-    Uses mv_top_queries (already refreshed) to identify eligible queries,
-    then aggregates daily counts from the searches table.
+    Uses period_top_queries (all_time) to identify eligible queries.
+    Only deletes and reinserts rows for date >= min_live_date, preserving
+    archived rows.
     """
     cursor = conn.cursor()
 
-    # Get eligible queries (50+ unique users) from materialized view
+    # Get eligible queries from the all_time top queries
     cursor.execute("""
-        SELECT query_normalized FROM mv_top_queries
-        WHERE unique_users >= 35
+        SELECT query_normalized FROM period_top_queries
+        WHERE period_type = 'all_time' AND unique_users >= 35
     """)
     eligible = [row[0] for row in cursor.fetchall()]
     cursor.close()
@@ -315,7 +434,13 @@ def compute_query_daily_stats(conn):
 
     print(f"  Found {len(eligible)} eligible queries (35+ users)")
 
-    # Process in chunks to avoid query size limits
+    # Filter tuples_lf to only live date range if we have archived data
+    if min_live_date is not None:
+        live_lf = tuples_lf.filter(pl.col("date") >= min_live_date)
+    else:
+        live_lf = tuples_lf
+
+    # Process in chunks to avoid memory issues
     chunk_size = 500
     total_inserted = 0
 
@@ -323,37 +448,39 @@ def compute_query_daily_stats(conn):
         chunk = eligible[chunk_start:chunk_start + chunk_size]
         chunk_label = f"[{chunk_start + 1}-{min(chunk_start + chunk_size, len(eligible))}/{len(eligible)}]"
 
-        cursor = conn.cursor()
-        # Use ANY(%s) with array parameter for clean parameterized query
-        cursor.execute("""
-            SELECT
-                query_normalized,
-                date,
-                SUM(search_count) as search_count,
-                COUNT(*) as unique_users
-            FROM mv_daily_search_tuples
-            WHERE query_normalized = ANY(%s)
-            GROUP BY query_normalized, date
-            ORDER BY query_normalized, date
-        """, (chunk,))
+        # Compute daily stats from polars
+        chunk_df = (
+            live_lf
+            .filter(pl.col("query_normalized").is_in(chunk))
+            .group_by(["query_normalized", "date"])
+            .agg(
+                pl.col("search_count").sum().alias("search_count"),
+                pl.col("username").n_unique().alias("unique_users"),
+            )
+            .sort(["query_normalized", "date"])
+            .collect()
+        )
 
-        rows = cursor.fetchall()
-        cursor.close()
-
-        if not rows:
+        if chunk_df.height == 0:
             print(f"  {chunk_label} No daily data found")
             continue
 
-        # Delete old data for this chunk and insert new
+        # Delete old data only for live date range
         cursor = conn.cursor()
-        cursor.execute("""
-            DELETE FROM query_daily_stats
-            WHERE query_normalized = ANY(%s)
-        """, (chunk,))
+        if min_live_date is not None:
+            cursor.execute("""
+                DELETE FROM query_daily_stats
+                WHERE query_normalized = ANY(%s) AND date >= %s
+            """, (chunk, min_live_date))
+        else:
+            cursor.execute("""
+                DELETE FROM query_daily_stats
+                WHERE query_normalized = ANY(%s)
+            """, (chunk,))
 
         values = [
             (row[0], row[1], int(row[2]), int(row[3]))
-            for row in rows
+            for row in chunk_df.iter_rows()
         ]
 
         execute_values(
@@ -362,7 +489,7 @@ def compute_query_daily_stats(conn):
                (query_normalized, date, search_count, unique_users)
                VALUES %s""",
             values,
-            page_size=5000
+            page_size=5000,
         )
 
         conn.commit()
@@ -376,33 +503,76 @@ def compute_query_daily_stats(conn):
 
 def refresh_period_stats(conn):
     """Refresh all period statistics"""
+    archive_path = os.environ.get('ARCHIVE_PATH', '/archives')
+
     ensure_period_summary_stats_table(conn)
-    print("Getting date range from mv_daily_search_tuples...")
-    min_date, max_date = get_date_range(conn)
+
+    print("Loading all daily tuples (archived + live)...")
+    tuples_lf = load_all_tuples(conn, archive_path)
+
+    # Get date range from the LazyFrame
+    print("Getting date range...")
+    date_range = tuples_lf.select(
+        pl.col("date").min().alias("min_date"),
+        pl.col("date").max().alias("max_date"),
+    ).collect()
+
+    if date_range.height == 0 or date_range["min_date"][0] is None:
+        raise ValueError("No data found in archives or mv_daily_search_tuples")
+
+    min_date = date_range["min_date"][0]
+    max_date = date_range["max_date"][0]
     print(f"  Data range: {min_date.isoformat()} to {max_date.isoformat()}")
 
     print("Generating period definitions...")
     periods = generate_periods(min_date, max_date)
-    print(f"  Found {len(periods)} periods to process")
-
     weeks = [p for p in periods if p[0] == 'week']
     months = [p for p in periods if p[0] == 'month']
+    print(f"  Found {len(periods)} periods to process")
     print(f"    - {len(weeks)} weeks")
     print(f"    - {len(months)} months")
+    print(f"    - 1 all_time")
 
-    # Compute summary stats for all periods in a single table scan
-    print("\nComputing summary stats (unique queries + pairs) for all periods...")
+    # Determine which periods can be skipped
+    min_live_date = get_min_live_date(conn)
+    existing_stats = get_existing_period_stats(conn)
+    print(f"  Min live date: {min_live_date}")
+    print(f"  Existing period stats: {len(existing_stats)} periods")
+
+    periods_to_process = []
+    for period_type, period_id, start_date, end_date in periods:
+        if period_type == 'all_time':
+            # Always recompute all_time
+            periods_to_process.append((period_type, period_id, start_date, end_date))
+            continue
+
+        # Skip if period is fully archived (end_date < min_live_date) and already computed
+        if (
+            min_live_date is not None
+            and end_date < min_live_date
+            and (period_type, period_id) in existing_stats
+        ):
+            continue
+
+        periods_to_process.append((period_type, period_id, start_date, end_date))
+
+    skipped = len(periods) - len(periods_to_process)
+    print(f"  Skipping {skipped} fully-archived periods with existing stats")
+    print(f"  Processing {len(periods_to_process)} periods")
+
+    # Compute summary stats for all non-skipped periods
+    print("\nComputing summary stats for all non-skipped periods...")
     start = datetime.now(timezone.utc)
-    summary_lookup = compute_all_period_summary_stats(conn, periods)
+    summary_lookup = compute_all_period_summary_stats(conn, tuples_lf, periods_to_process)
     elapsed = (datetime.now(timezone.utc) - start).total_seconds()
     print(f"  Done: {len(summary_lookup)} period summaries in {elapsed:.1f}s")
 
     total_queries = 0
     total_dists = 0
 
-    for i, (period_type, period_id, start_date, end_date) in enumerate(periods, 1):
+    for i, (period_type, period_id, start_date, end_date) in enumerate(periods_to_process, 1):
         label = f"{period_type} {period_id}"
-        print(f"\n[{i}/{len(periods)}] Processing {label}...")
+        print(f"\n[{i}/{len(periods_to_process)}] Processing {label}...")
 
         summary = summary_lookup.get((period_type, period_id))
         if summary:
@@ -410,21 +580,27 @@ def refresh_period_stats(conn):
 
         # Compute top queries
         start = datetime.now(timezone.utc)
-        queries_inserted = compute_period_top_queries(conn, period_type, period_id, start_date, end_date)
+        queries_inserted = compute_period_top_queries(
+            conn, tuples_lf, period_type, period_id, start_date, end_date
+        )
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
         print(f"  Top queries: {queries_inserted} inserted in {elapsed:.1f}s")
         total_queries += queries_inserted
 
         # Compute query length distribution
         start = datetime.now(timezone.utc)
-        dists_inserted = compute_period_query_length_dist(conn, period_type, period_id, start_date, end_date)
+        dists_inserted = compute_period_query_length_dist(
+            conn, tuples_lf, period_type, period_id, start_date, end_date
+        )
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
         print(f"  Query length dist: {dists_inserted} rows in {elapsed:.1f}s")
         total_dists += dists_inserted
 
-    print(f"\nProcessed {len(periods)} periods successfully")
+    print(f"\nProcessed {len(periods_to_process)} periods successfully")
     print(f"  - {total_queries} top query entries")
     print(f"  - {total_dists} query length distribution rows")
+
+    return tuples_lf, min_live_date
 
 
 def main():
@@ -434,13 +610,13 @@ def main():
 
     try:
         conn = get_db_connection()
-        refresh_period_stats(conn)
+        tuples_lf, min_live_date = refresh_period_stats(conn)
 
         print("\n" + "=" * 60)
         print("COMPUTING QUERY DAILY STATS")
         print("=" * 60)
         start = datetime.now(timezone.utc)
-        total_daily = compute_query_daily_stats(conn)
+        total_daily = compute_query_daily_stats(conn, tuples_lf, min_live_date)
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
         print(f"  Query daily stats: {total_daily} rows in {elapsed:.1f}s")
 
