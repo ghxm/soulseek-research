@@ -6,7 +6,7 @@ Exports old months to Parquet files and deletes from database.
 
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List, Tuple
 
 import psycopg2
@@ -90,30 +90,29 @@ def populate_user_query_pairs(conn, month: str = None):
     return inserted
 
 
-def get_months_to_archive(conn, min_age_days: int = 7) -> List[str]:
+def get_months_to_archive(conn) -> List[str]:
     """
-    Find months that are complete and old enough to archive.
+    Find months that are complete and ready to archive.
     Returns list of 'YYYY-MM' strings.
 
     A month is ready to archive if:
-    - All its data is older than min_age_days
+    - The month has ended (it's before the current month)
     - It's not already archived
     """
     cursor = conn.cursor()
-    cutoff = datetime.now() - timedelta(days=min_age_days)
+    current_month = datetime.now().strftime('%Y-%m')
 
     cursor.execute("""
         WITH archived_months AS (
             SELECT month FROM archives WHERE deleted = TRUE
         )
-        SELECT DISTINCT TO_CHAR(timestamp, 'YYYY-MM') as month
+        SELECT TO_CHAR(timestamp, 'YYYY-MM') as month
         FROM searches
-        WHERE timestamp < %s
-          AND TO_CHAR(timestamp, 'YYYY-MM') NOT IN (SELECT month FROM archived_months)
+        WHERE TO_CHAR(timestamp, 'YYYY-MM') NOT IN (SELECT month FROM archived_months)
         GROUP BY TO_CHAR(timestamp, 'YYYY-MM')
-        HAVING MAX(timestamp) < %s
+        HAVING TO_CHAR(timestamp, 'YYYY-MM') < %s
         ORDER BY month
-    """, (cutoff, cutoff))
+    """, (current_month,))
 
     return [row[0] for row in cursor.fetchall()]
 
@@ -389,7 +388,7 @@ def main():
         ensure_user_query_pairs_table(conn)
         # Per-month seeding happens in archive_month() before each deletion
 
-        # Find months to archive (complete and 7+ days old)
+        # Find completed months to archive
         months = get_months_to_archive(conn)
 
         if not months:
