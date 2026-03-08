@@ -51,12 +51,64 @@ def get_db_connection():
     )
 
 
+def _dump_live_mv_to_parquet(conn, parquet_path: str) -> int:
+    """Dump mv_daily_search_tuples to a temporary Parquet file on disk.
+
+    Uses PostgreSQL COPY TO STDOUT with a server-side cursor to stream data
+    in chunks, writing each chunk to Parquet via pyarrow. This avoids holding
+    the full 61M+ row dataset in Python memory (which OOM-kills on 8 GB).
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    schema = pa.schema([
+        ("date", pa.date32()),
+        ("username", pa.string()),
+        ("query_normalized", pa.string()),
+        ("search_count", pa.int64()),
+    ])
+
+    cursor = conn.cursor(name="dump_live_cursor")
+    cursor.itersize = 500_000
+    cursor.execute("SELECT date, username, query_normalized, search_count FROM mv_daily_search_tuples")
+
+    writer = None
+    row_count = 0
+    try:
+        while True:
+            rows = cursor.fetchmany(cursor.itersize)
+            if not rows:
+                break
+            table = pa.table(
+                {
+                    "date": [r[0] for r in rows],
+                    "username": [r[1] for r in rows],
+                    "query_normalized": [r[2] for r in rows],
+                    "search_count": [r[3] for r in rows],
+                },
+                schema=schema,
+            )
+            if writer is None:
+                writer = pq.ParquetWriter(parquet_path, schema, compression="snappy")
+            writer.write_table(table)
+            row_count += len(rows)
+            del rows, table
+            print(f"    Dumped {row_count:,} rows...")
+    finally:
+        if writer is not None:
+            writer.close()
+        cursor.close()
+
+    return row_count
+
+
 def load_all_tuples(conn, archive_path: str) -> pl.LazyFrame:
     """Load all daily tuples from archived Parquet files and live MV data.
 
-    Scans all daily_tuples_*.parquet files from archive_path, then queries
-    mv_daily_search_tuples for live data via a server-side cursor. Returns
-    a single concatenated LazyFrame.
+    Dumps live MV data to a temporary Parquet file, then uses polars
+    scan_parquet over all files (archived + live). This keeps memory usage
+    low because polars streams from disk rather than holding everything
+    in Python memory.
 
     Schema: {date: pl.Date, username: pl.Utf8, query_normalized: pl.Utf8, search_count: pl.Int64}
     """
@@ -66,63 +118,32 @@ def load_all_tuples(conn, archive_path: str) -> pl.LazyFrame:
         "query_normalized": pl.Utf8,
         "search_count": pl.Int64,
     }
-    frames = []
 
-    # Load archived Parquet files
+    all_parquet_files = []
+
+    # Collect archived Parquet files
     parquet_pattern = os.path.join(archive_path, "daily_tuples_*.parquet")
-    parquet_files = sorted(glob.glob(parquet_pattern))
-    if parquet_files:
-        print(f"  Found {len(parquet_files)} archived Parquet files")
-        archive_lf = pl.scan_parquet(parquet_files)
-        # Ensure consistent schema
-        archive_lf = archive_lf.cast({
-            "date": pl.Date,
-            "username": pl.Utf8,
-            "query_normalized": pl.Utf8,
-            "search_count": pl.Int64,
-        })
-        frames.append(archive_lf)
+    archived_files = sorted(glob.glob(parquet_pattern))
+    if archived_files:
+        print(f"  Found {len(archived_files)} archived Parquet files")
+        all_parquet_files.extend(archived_files)
     else:
         print("  No archived Parquet files found")
 
-    # Load live data from mv_daily_search_tuples via server-side cursor.
-    # Build polars DataFrames in chunks to avoid holding all rows in a Python
-    # list (61M+ rows would exceed 8 GB RAM if accumulated then column-split).
-    print("  Loading live data from mv_daily_search_tuples...")
-    cursor = conn.cursor(name="load_tuples_cursor")
-    cursor.itersize = 500_000
-    cursor.execute("SELECT date, username, query_normalized, search_count FROM mv_daily_search_tuples")
+    # Dump live MV data to a temporary Parquet file
+    live_parquet = os.path.join(archive_path, "_live_tuples.parquet")
+    print("  Dumping live MV data to temporary Parquet file...")
+    row_count = _dump_live_mv_to_parquet(conn, live_parquet)
+    print(f"  Dumped {row_count:,} live rows to {live_parquet}")
+    if row_count > 0:
+        all_parquet_files.append(live_parquet)
 
-    live_frames = []
-    row_count = 0
-    while True:
-        rows = cursor.fetchmany(cursor.itersize)
-        if not rows:
-            break
-        chunk_df = pl.DataFrame(
-            {
-                "date": [r[0] for r in rows],
-                "username": [r[1] for r in rows],
-                "query_normalized": [r[2] for r in rows],
-                "search_count": [r[3] for r in rows],
-            },
-            schema=schema,
-        )
-        live_frames.append(chunk_df.lazy())
-        row_count += len(rows)
-        # Free the Python list immediately
-        del rows
-        print(f"    Loaded {row_count:,} rows so far...")
-
-    cursor.close()
-    print(f"  Loaded {row_count:,} live rows total")
-
-    frames.extend(live_frames)
-
-    if not frames:
+    if not all_parquet_files:
         return pl.LazyFrame(schema=schema)
 
-    return pl.concat(frames)
+    lf = pl.scan_parquet(all_parquet_files)
+    lf = lf.cast(schema)
+    return lf
 
 
 def get_min_live_date(conn) -> Optional[date]:
@@ -626,6 +647,13 @@ def main():
 
         conn.close()
 
+        # Clean up temporary live Parquet file
+        archive_path = os.environ.get('ARCHIVE_PATH', '/archives')
+        live_parquet = os.path.join(archive_path, "_live_tuples.parquet")
+        if os.path.exists(live_parquet):
+            os.remove(live_parquet)
+            print("Cleaned up temporary live Parquet file")
+
         print("=" * 60)
         print("Period stats refresh completed successfully")
         return 0
@@ -634,6 +662,11 @@ def main():
         print(f"\nERROR: Period stats refresh failed: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc()
+        # Clean up temp file on error too
+        archive_path = os.environ.get('ARCHIVE_PATH', '/archives')
+        live_parquet = os.path.join(archive_path, "_live_tuples.parquet")
+        if os.path.exists(live_parquet):
+            os.remove(live_parquet)
         return 1
 
 
