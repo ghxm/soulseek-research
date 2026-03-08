@@ -3,9 +3,11 @@
 Refresh period-specific statistics tables (weeks, months, all_time).
 Called by cron at 1:00 AM UTC daily, after materialized view refresh.
 
-Loads data from archived Parquet files + live mv_daily_search_tuples,
-then computes top queries, query length distribution, and summary stats
-for each period using polars.
+Two modes:
+- SQL mode (no archived Parquet files): computes everything via SQL against
+  mv_daily_search_tuples. Used before any archival has happened.
+- Polars mode (archived Parquet files exist): loads archived Parquet + live MV
+  data into polars for unified aggregation across both sources.
 """
 
 import glob
@@ -14,7 +16,6 @@ import sys
 from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
-import polars as pl
 import psycopg2
 from psycopg2.extras import execute_values
 
@@ -51,95 +52,9 @@ def get_db_connection():
     )
 
 
-def _dump_live_mv_to_parquet_chunks(conn, archive_path: str) -> Tuple[List[str], int]:
-    """Dump mv_daily_search_tuples to temporary Parquet chunk files on disk.
-
-    Uses a server-side cursor to stream data in 500k-row chunks, writing each
-    chunk as a separate Parquet file via polars. This avoids holding the full
-    61M+ row dataset in Python memory (which OOM-kills on 8 GB).
-
-    Returns (list of chunk file paths, total row count).
-    """
-    schema = {
-        "date": pl.Date,
-        "username": pl.Utf8,
-        "query_normalized": pl.Utf8,
-        "search_count": pl.Int64,
-    }
-
-    cursor = conn.cursor(name="dump_live_cursor")
-    cursor.itersize = 500_000
-    cursor.execute("SELECT date, username, query_normalized, search_count FROM mv_daily_search_tuples")
-
-    chunk_files = []
-    row_count = 0
-    chunk_idx = 0
-
-    while True:
-        rows = cursor.fetchmany(cursor.itersize)
-        if not rows:
-            break
-        chunk_df = pl.DataFrame(
-            {
-                "date": [r[0] for r in rows],
-                "username": [r[1] for r in rows],
-                "query_normalized": [r[2] for r in rows],
-                "search_count": [r[3] for r in rows],
-            },
-            schema=schema,
-        )
-        chunk_path = os.path.join(archive_path, f"_live_chunk_{chunk_idx:04d}.parquet")
-        chunk_df.write_parquet(chunk_path, compression="snappy")
-        chunk_files.append(chunk_path)
-        row_count += len(rows)
-        chunk_idx += 1
-        del rows, chunk_df
-        print(f"    Dumped {row_count:,} rows ({chunk_idx} chunks)...")
-
-    cursor.close()
-    return chunk_files, row_count
-
-
-def load_all_tuples(conn, archive_path: str) -> pl.LazyFrame:
-    """Load all daily tuples from archived Parquet files and live MV data.
-
-    Dumps live MV data to temporary Parquet chunk files, then uses polars
-    scan_parquet over all files (archived + live chunks). This keeps memory
-    usage low because polars streams from disk.
-
-    Schema: {date: pl.Date, username: pl.Utf8, query_normalized: pl.Utf8, search_count: pl.Int64}
-    """
-    schema = {
-        "date": pl.Date,
-        "username": pl.Utf8,
-        "query_normalized": pl.Utf8,
-        "search_count": pl.Int64,
-    }
-
-    all_parquet_files = []
-
-    # Collect archived Parquet files
-    parquet_pattern = os.path.join(archive_path, "daily_tuples_*.parquet")
-    archived_files = sorted(glob.glob(parquet_pattern))
-    if archived_files:
-        print(f"  Found {len(archived_files)} archived Parquet files")
-        all_parquet_files.extend(archived_files)
-    else:
-        print("  No archived Parquet files found")
-
-    # Dump live MV data to temporary Parquet chunk files
-    print("  Dumping live MV data to temporary Parquet chunks...")
-    chunk_files, row_count = _dump_live_mv_to_parquet_chunks(conn, archive_path)
-    print(f"  Dumped {row_count:,} live rows across {len(chunk_files)} chunks")
-    all_parquet_files.extend(chunk_files)
-
-    if not all_parquet_files:
-        return pl.LazyFrame(schema=schema)
-
-    lf = pl.scan_parquet(all_parquet_files)
-    lf = lf.cast(schema)
-    return lf
-
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
 
 def get_min_live_date(conn) -> Optional[date]:
     """Get the minimum date from mv_daily_search_tuples."""
@@ -165,10 +80,7 @@ def get_existing_period_stats(conn) -> Set[Tuple[str, str]]:
 
 
 def generate_periods(min_date: date, max_date: date) -> List[Tuple[str, str, date, date]]:
-    """Generate all week, month, and all_time periods between min and max dates.
-
-    Returns list of (period_type, period_id, start_date, end_date) tuples.
-    """
+    """Generate all week, month, and all_time periods between min and max dates."""
     periods = []
 
     # Generate weeks
@@ -217,7 +129,6 @@ def ensure_period_summary_stats_table(conn):
     """)
     conn.commit()
 
-    # Add columns if they don't exist (for existing tables)
     for col, col_type in [
         ('total_searches', 'BIGINT'),
         ('total_users', 'INTEGER'),
@@ -233,14 +144,332 @@ def ensure_period_summary_stats_table(conn):
     cursor.close()
 
 
-def compute_all_period_summary_stats(
-    conn, tuples_lf: pl.LazyFrame, periods: List[Tuple[str, str, date, date]]
-) -> Dict[Tuple[str, str], Tuple[int, int, int, int, date, date]]:
-    """Compute summary stats for all non-skipped periods using polars.
+def has_archived_parquet(archive_path: str) -> bool:
+    """Check if there are any archived daily_tuples Parquet files."""
+    return bool(glob.glob(os.path.join(archive_path, "daily_tuples_*.parquet")))
 
-    Returns lookup dict of (period_type, period_id) -> (unique_queries, unique_pairs,
-    total_searches, total_users, first_date, last_date).
+
+# ---------------------------------------------------------------------------
+# SQL mode: all computations run against mv_daily_search_tuples via SQL.
+# Used when no archived Parquet files exist (before first archival).
+# ---------------------------------------------------------------------------
+
+def _sql_date_range(conn) -> Tuple[date, date]:
+    """Get date range from mv_daily_search_tuples."""
+    cursor = conn.cursor()
+    cursor.execute("SELECT MIN(date), MAX(date) FROM mv_daily_search_tuples")
+    row = cursor.fetchone()
+    cursor.close()
+    if not row or row[0] is None:
+        raise ValueError("No data in mv_daily_search_tuples")
+    return row[0], row[1]
+
+
+def _sql_date_filter(period_type: str, start_date: date, end_date: date) -> Tuple[str, list]:
+    """Return a WHERE clause fragment and params for date filtering."""
+    if period_type == 'all_time':
+        return "", []
+    return "WHERE date >= %s AND date <= %s", [start_date, end_date]
+
+
+def sql_compute_all_summary_stats(
+    conn, periods: List[Tuple[str, str, date, date]]
+) -> Dict[Tuple[str, str], Tuple[int, int, int, int, date, date]]:
+    """Compute summary stats for all periods using SQL."""
+    results = {}
+    cursor = conn.cursor()
+
+    for period_type, period_id, start_date, end_date in periods:
+        print(f"  Computing summary for {period_type} {period_id}...")
+        start = datetime.now(timezone.utc)
+
+        where, params = _sql_date_filter(period_type, start_date, end_date)
+        cursor.execute(f"""
+            SELECT
+                SUM(search_count) AS total_searches,
+                COUNT(DISTINCT username) AS total_users,
+                COUNT(DISTINCT query_normalized) AS unique_queries,
+                COUNT(DISTINCT (username, query_normalized)) AS unique_pairs,
+                MIN(date) AS first_date,
+                MAX(date) AS last_date
+            FROM mv_daily_search_tuples
+            {where}
+        """, params)
+        row = cursor.fetchone()
+
+        if not row or row[0] is None:
+            elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+            print(f"    No data for this period ({elapsed:.1f}s)")
+            continue
+
+        total_searches, total_users, unique_queries, unique_pairs, first_dt, last_dt = row
+        results[(period_type, period_id)] = (
+            unique_queries, unique_pairs, int(total_searches), total_users, first_dt, last_dt
+        )
+
+        elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+        print(f"    {unique_queries} queries, {unique_pairs} pairs, "
+              f"{total_searches} searches, {total_users} users ({elapsed:.1f}s)")
+
+    # Bulk upsert
+    if results:
+        values = [
+            (pt, pid, uq, up, ts, tu, fd, ld)
+            for (pt, pid), (uq, up, ts, tu, fd, ld) in results.items()
+        ]
+        execute_values(
+            cursor,
+            """INSERT INTO period_summary_stats
+               (period_type, period_id, unique_queries, unique_pairs,
+                total_searches, total_users, first_date, last_date)
+               VALUES %s
+               ON CONFLICT (period_type, period_id)
+               DO UPDATE SET
+                   unique_queries = EXCLUDED.unique_queries,
+                   unique_pairs = EXCLUDED.unique_pairs,
+                   total_searches = EXCLUDED.total_searches,
+                   total_users = EXCLUDED.total_users,
+                   first_date = EXCLUDED.first_date,
+                   last_date = EXCLUDED.last_date""",
+            values,
+        )
+        conn.commit()
+
+    cursor.close()
+    return results
+
+
+def sql_compute_top_queries(
+    conn, period_type: str, period_id: str,
+    start_date: date, end_date: date
+) -> int:
+    """Compute top queries for a period using SQL."""
+    where, params = _sql_date_filter(period_type, start_date, end_date)
+
+    cursor = conn.cursor()
+    cursor.execute(f"""
+        SELECT query_normalized,
+               COUNT(DISTINCT username) AS unique_users,
+               SUM(search_count) AS total_searches
+        FROM mv_daily_search_tuples
+        {where}
+        GROUP BY query_normalized
+        HAVING COUNT(DISTINCT username) >= 5
+        ORDER BY unique_users DESC, total_searches DESC
+    """, params)
+    rows = cursor.fetchall()
+
+    # Delete old data
+    cursor.execute("""
+        DELETE FROM period_top_queries
+        WHERE period_type = %s AND period_id = %s
+    """, (period_type, period_id))
+
+    if not rows:
+        conn.commit()
+        cursor.close()
+        return 0
+
+    values = [
+        (period_type, period_id, row[0], row[1], int(row[2]), rank)
+        for rank, row in enumerate(rows, 1)
+    ]
+
+    execute_values(
+        cursor,
+        """INSERT INTO period_top_queries
+           (period_type, period_id, query_normalized, unique_users, total_searches, rank)
+           VALUES %s""",
+        values,
+        page_size=5000,
+    )
+
+    conn.commit()
+    cursor.close()
+    return len(values)
+
+
+def sql_compute_query_length_dist(
+    conn, period_type: str, period_id: str,
+    start_date: date, end_date: date
+) -> int:
+    """Compute query length distribution for a period using SQL."""
+    where, params = _sql_date_filter(period_type, start_date, end_date)
+
+    cursor = conn.cursor()
+    cursor.execute(f"""
+        SELECT query_length, COUNT(DISTINCT query_normalized) AS unique_query_count
+        FROM (
+            SELECT query_normalized,
+                   array_length(string_to_array(query_normalized, ' '), 1) AS query_length
+            FROM mv_daily_search_tuples
+            {where}
+            GROUP BY query_normalized
+        ) sub
+        WHERE query_length <= 100
+        GROUP BY query_length
+        ORDER BY query_length
+    """, params)
+    rows = cursor.fetchall()
+
+    # Delete old data
+    cursor.execute("""
+        DELETE FROM period_query_length_dist
+        WHERE period_type = %s AND period_id = %s
+    """, (period_type, period_id))
+
+    if not rows:
+        conn.commit()
+        cursor.close()
+        return 0
+
+    values = [
+        (period_type, period_id, row[0], row[1])
+        for row in rows
+    ]
+
+    execute_values(
+        cursor,
+        """INSERT INTO period_query_length_dist
+           (period_type, period_id, query_length, unique_query_count)
+           VALUES %s""",
+        values,
+    )
+
+    conn.commit()
+    cursor.close()
+    return len(values)
+
+
+def sql_compute_query_daily_stats(conn, min_live_date: Optional[date]):
+    """Compute daily stats for queries with 35+ unique users, using SQL."""
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT query_normalized FROM period_top_queries
+        WHERE period_type = 'all_time' AND unique_users >= 35
+    """)
+    eligible = [row[0] for row in cursor.fetchall()]
+    cursor.close()
+
+    if not eligible:
+        print("  No queries with 35+ users found")
+        return 0
+
+    print(f"  Found {len(eligible)} eligible queries (35+ users)")
+
+    chunk_size = 500
+    total_inserted = 0
+
+    for chunk_start in range(0, len(eligible), chunk_size):
+        chunk = eligible[chunk_start:chunk_start + chunk_size]
+        chunk_label = f"[{chunk_start + 1}-{min(chunk_start + chunk_size, len(eligible))}/{len(eligible)}]"
+
+        cursor = conn.cursor()
+
+        # Delete old data for live date range
+        if min_live_date is not None:
+            cursor.execute("""
+                DELETE FROM query_daily_stats
+                WHERE query_normalized = ANY(%s) AND date >= %s
+            """, (chunk, min_live_date))
+        else:
+            cursor.execute("""
+                DELETE FROM query_daily_stats
+                WHERE query_normalized = ANY(%s)
+            """, (chunk,))
+
+        # Insert from MV
+        cursor.execute("""
+            INSERT INTO query_daily_stats (query_normalized, date, search_count, unique_users)
+            SELECT query_normalized, date,
+                   SUM(search_count) AS search_count,
+                   COUNT(DISTINCT username) AS unique_users
+            FROM mv_daily_search_tuples
+            WHERE query_normalized = ANY(%s)
+            GROUP BY query_normalized, date
+            ORDER BY query_normalized, date
+        """, (chunk,))
+
+        inserted = cursor.rowcount
+        conn.commit()
+        cursor.close()
+
+        total_inserted += inserted
+        print(f"  {chunk_label} Inserted {inserted} daily rows")
+
+    return total_inserted
+
+
+# ---------------------------------------------------------------------------
+# Polars mode: loads archived Parquet + live MV for unified aggregation.
+# Used after archival when some data only exists in Parquet files.
+# ---------------------------------------------------------------------------
+
+def _load_all_tuples_polars(conn, archive_path: str):
+    """Load archived Parquet + live MV data into a polars LazyFrame.
+
+    After archival, the live MV is small (~1 month, ~20M rows) so it fits
+    in memory. Archived Parquet is streamed from disk via scan_parquet.
     """
+    import polars as pl
+
+    schema = {
+        "date": pl.Date,
+        "username": pl.Utf8,
+        "query_normalized": pl.Utf8,
+        "search_count": pl.Int64,
+    }
+    frames = []
+
+    # Scan archived Parquet files (streaming, memory-efficient)
+    parquet_files = sorted(glob.glob(os.path.join(archive_path, "daily_tuples_*.parquet")))
+    print(f"  Found {len(parquet_files)} archived Parquet files")
+    if parquet_files:
+        archive_lf = pl.scan_parquet(parquet_files)
+        archive_lf = archive_lf.cast(schema)
+        frames.append(archive_lf)
+
+    # Load live MV data (should be small after archival)
+    print("  Loading live data from mv_daily_search_tuples...")
+    cursor = conn.cursor(name="load_tuples_cursor")
+    cursor.itersize = 500_000
+    cursor.execute("SELECT date, username, query_normalized, search_count FROM mv_daily_search_tuples")
+
+    rows_all = []
+    while True:
+        rows = cursor.fetchmany(cursor.itersize)
+        if not rows:
+            break
+        rows_all.extend(rows)
+    cursor.close()
+    print(f"  Loaded {len(rows_all):,} live rows")
+
+    if rows_all:
+        live_df = pl.DataFrame(
+            {
+                "date": [r[0] for r in rows_all],
+                "username": [r[1] for r in rows_all],
+                "query_normalized": [r[2] for r in rows_all],
+                "search_count": [r[3] for r in rows_all],
+            },
+            schema=schema,
+        )
+        frames.append(live_df.lazy())
+        del rows_all
+
+    if not frames:
+        return pl.LazyFrame(schema=schema)
+
+    return pl.concat(frames)
+
+
+def polars_compute_all_summary_stats(
+    conn, tuples_lf, periods: List[Tuple[str, str, date, date]]
+) -> Dict[Tuple[str, str], Tuple[int, int, int, int, date, date]]:
+    """Compute summary stats for all periods using polars."""
+    import polars as pl
+
     results = {}
 
     for period_type, period_id, start_date, end_date in periods:
@@ -269,22 +498,15 @@ def compute_all_period_summary_stats(
             continue
 
         row = stats.row(0)
-        total_searches = int(row[0])
-        total_users = int(row[1])
-        unique_queries = int(row[2])
-        unique_pairs = int(row[3])
-        first_dt = row[4]
-        last_dt = row[5]
-
         results[(period_type, period_id)] = (
-            unique_queries, unique_pairs, total_searches, total_users, first_dt, last_dt
+            int(row[2]), int(row[3]), int(row[0]), int(row[1]), row[4], row[5]
         )
 
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
-        print(f"    {unique_queries} queries, {unique_pairs} pairs, "
-              f"{total_searches} searches, {total_users} users ({elapsed:.1f}s)")
+        print(f"    {row[2]} queries, {row[3]} pairs, "
+              f"{row[0]} searches, {row[1]} users ({elapsed:.1f}s)")
 
-    # Bulk upsert all results
+    # Bulk upsert
     if results:
         cursor = conn.cursor()
         values = [
@@ -313,14 +535,13 @@ def compute_all_period_summary_stats(
     return results
 
 
-def compute_period_top_queries(
-    conn, tuples_lf: pl.LazyFrame, period_type: str, period_id: str,
+def polars_compute_top_queries(
+    conn, tuples_lf, period_type: str, period_id: str,
     start_date: date, end_date: date
 ) -> int:
-    """Compute top queries for a period using polars and store in period_top_queries table.
+    """Compute top queries for a period using polars."""
+    import polars as pl
 
-    Returns number of queries inserted.
-    """
     if period_type == 'all_time':
         filtered = tuples_lf
     else:
@@ -341,7 +562,6 @@ def compute_period_top_queries(
         .collect()
     )
 
-    # Delete old data
     cursor = conn.cursor()
     cursor.execute("""
         DELETE FROM period_top_queries
@@ -369,18 +589,16 @@ def compute_period_top_queries(
 
     conn.commit()
     cursor.close()
-
     return len(values)
 
 
-def compute_period_query_length_dist(
-    conn, tuples_lf: pl.LazyFrame, period_type: str, period_id: str,
+def polars_compute_query_length_dist(
+    conn, tuples_lf, period_type: str, period_id: str,
     start_date: date, end_date: date
 ) -> int:
-    """Compute query length distribution for a period using polars.
+    """Compute query length distribution for a period using polars."""
+    import polars as pl
 
-    Returns number of rows inserted.
-    """
     if period_type == 'all_time':
         filtered = tuples_lf
     else:
@@ -400,7 +618,6 @@ def compute_period_query_length_dist(
         .collect()
     )
 
-    # Delete old data
     cursor = conn.cursor()
     cursor.execute("""
         DELETE FROM period_query_length_dist
@@ -427,20 +644,14 @@ def compute_period_query_length_dist(
 
     conn.commit()
     cursor.close()
-
     return len(values)
 
 
-def compute_query_daily_stats(conn, tuples_lf: pl.LazyFrame, min_live_date: Optional[date]):
-    """Compute daily stats for queries with 35+ all-time unique users.
+def polars_compute_query_daily_stats(conn, tuples_lf, min_live_date: Optional[date]):
+    """Compute daily stats for queries with 35+ unique users, using polars."""
+    import polars as pl
 
-    Uses period_top_queries (all_time) to identify eligible queries.
-    Only deletes and reinserts rows for date >= min_live_date, preserving
-    archived rows.
-    """
     cursor = conn.cursor()
-
-    # Get eligible queries from the all_time top queries
     cursor.execute("""
         SELECT query_normalized FROM period_top_queries
         WHERE period_type = 'all_time' AND unique_users >= 35
@@ -454,13 +665,11 @@ def compute_query_daily_stats(conn, tuples_lf: pl.LazyFrame, min_live_date: Opti
 
     print(f"  Found {len(eligible)} eligible queries (35+ users)")
 
-    # Filter tuples_lf to only live date range if we have archived data
     if min_live_date is not None:
         live_lf = tuples_lf.filter(pl.col("date") >= min_live_date)
     else:
         live_lf = tuples_lf
 
-    # Process in chunks to avoid memory issues
     chunk_size = 500
     total_inserted = 0
 
@@ -468,7 +677,6 @@ def compute_query_daily_stats(conn, tuples_lf: pl.LazyFrame, min_live_date: Opti
         chunk = eligible[chunk_start:chunk_start + chunk_size]
         chunk_label = f"[{chunk_start + 1}-{min(chunk_start + chunk_size, len(eligible))}/{len(eligible)}]"
 
-        # Compute daily stats from polars
         chunk_df = (
             live_lf
             .filter(pl.col("query_normalized").is_in(chunk))
@@ -485,7 +693,6 @@ def compute_query_daily_stats(conn, tuples_lf: pl.LazyFrame, min_live_date: Opti
             print(f"  {chunk_label} No daily data found")
             continue
 
-        # Delete old data only for live date range
         cursor = conn.cursor()
         if min_live_date is not None:
             cursor.execute("""
@@ -521,37 +728,45 @@ def compute_query_daily_stats(conn, tuples_lf: pl.LazyFrame, min_live_date: Opti
     return total_inserted
 
 
+# ---------------------------------------------------------------------------
+# Main orchestration
+# ---------------------------------------------------------------------------
+
 def refresh_period_stats(conn):
-    """Refresh all period statistics"""
+    """Refresh all period statistics."""
     archive_path = os.environ.get('ARCHIVE_PATH', '/archives')
+    use_polars = has_archived_parquet(archive_path)
 
     ensure_period_summary_stats_table(conn)
 
-    print("Loading all daily tuples (archived + live)...")
-    tuples_lf = load_all_tuples(conn, archive_path)
+    if use_polars:
+        print("MODE: Polars (archived Parquet files found)")
+        print("Loading all daily tuples (archived + live)...")
+        tuples_lf = _load_all_tuples_polars(conn, archive_path)
+    else:
+        print("MODE: SQL (no archived Parquet files, using mv_daily_search_tuples directly)")
+        tuples_lf = None
 
-    # Get date range from the LazyFrame
+    # Get date range
     print("Getting date range...")
-    date_range = tuples_lf.select(
-        pl.col("date").min().alias("min_date"),
-        pl.col("date").max().alias("max_date"),
-    ).collect()
-
-    if date_range.height == 0 or date_range["min_date"][0] is None:
-        raise ValueError("No data found in archives or mv_daily_search_tuples")
-
-    min_date = date_range["min_date"][0]
-    max_date = date_range["max_date"][0]
-    print(f"  Data range: {min_date.isoformat()} to {max_date.isoformat()}")
+    if use_polars:
+        import polars as pl
+        date_range = tuples_lf.select(
+            pl.col("date").min().alias("min_date"),
+            pl.col("date").max().alias("max_date"),
+        ).collect()
+        if date_range.height == 0 or date_range["min_date"][0] is None:
+            raise ValueError("No data found")
+        min_date, max_date = date_range["min_date"][0], date_range["max_date"][0]
+    else:
+        min_date, max_date = _sql_date_range(conn)
+    print(f"  Data range: {min_date} to {max_date}")
 
     print("Generating period definitions...")
     periods = generate_periods(min_date, max_date)
     weeks = [p for p in periods if p[0] == 'week']
     months = [p for p in periods if p[0] == 'month']
-    print(f"  Found {len(periods)} periods to process")
-    print(f"    - {len(weeks)} weeks")
-    print(f"    - {len(months)} months")
-    print(f"    - 1 all_time")
+    print(f"  Found {len(periods)} periods ({len(weeks)} weeks, {len(months)} months, 1 all_time)")
 
     # Determine which periods can be skipped
     min_live_date = get_min_live_date(conn)
@@ -562,31 +777,31 @@ def refresh_period_stats(conn):
     periods_to_process = []
     for period_type, period_id, start_date, end_date in periods:
         if period_type == 'all_time':
-            # Always recompute all_time
             periods_to_process.append((period_type, period_id, start_date, end_date))
             continue
-
-        # Skip if period is fully archived (end_date < min_live_date) and already computed
         if (
             min_live_date is not None
             and end_date < min_live_date
             and (period_type, period_id) in existing_stats
         ):
             continue
-
         periods_to_process.append((period_type, period_id, start_date, end_date))
 
     skipped = len(periods) - len(periods_to_process)
     print(f"  Skipping {skipped} fully-archived periods with existing stats")
     print(f"  Processing {len(periods_to_process)} periods")
 
-    # Compute summary stats for all non-skipped periods
-    print("\nComputing summary stats for all non-skipped periods...")
-    start = datetime.now(timezone.utc)
-    summary_lookup = compute_all_period_summary_stats(conn, tuples_lf, periods_to_process)
-    elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+    # Compute summary stats
+    print("\nComputing summary stats for all periods...")
+    t0 = datetime.now(timezone.utc)
+    if use_polars:
+        summary_lookup = polars_compute_all_summary_stats(conn, tuples_lf, periods_to_process)
+    else:
+        summary_lookup = sql_compute_all_summary_stats(conn, periods_to_process)
+    elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
     print(f"  Done: {len(summary_lookup)} period summaries in {elapsed:.1f}s")
 
+    # Compute top queries and query length dist per period
     total_queries = 0
     total_dists = 0
 
@@ -598,36 +813,29 @@ def refresh_period_stats(conn):
         if summary:
             print(f"  Summary stats: {summary[0]} unique queries, {summary[1]} pairs")
 
-        # Compute top queries
-        start = datetime.now(timezone.utc)
-        queries_inserted = compute_period_top_queries(
-            conn, tuples_lf, period_type, period_id, start_date, end_date
-        )
-        elapsed = (datetime.now(timezone.utc) - start).total_seconds()
-        print(f"  Top queries: {queries_inserted} inserted in {elapsed:.1f}s")
-        total_queries += queries_inserted
+        t0 = datetime.now(timezone.utc)
+        if use_polars:
+            qi = polars_compute_top_queries(conn, tuples_lf, period_type, period_id, start_date, end_date)
+        else:
+            qi = sql_compute_top_queries(conn, period_type, period_id, start_date, end_date)
+        elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
+        print(f"  Top queries: {qi} inserted in {elapsed:.1f}s")
+        total_queries += qi
 
-        # Compute query length distribution
-        start = datetime.now(timezone.utc)
-        dists_inserted = compute_period_query_length_dist(
-            conn, tuples_lf, period_type, period_id, start_date, end_date
-        )
-        elapsed = (datetime.now(timezone.utc) - start).total_seconds()
-        print(f"  Query length dist: {dists_inserted} rows in {elapsed:.1f}s")
-        total_dists += dists_inserted
+        t0 = datetime.now(timezone.utc)
+        if use_polars:
+            di = polars_compute_query_length_dist(conn, tuples_lf, period_type, period_id, start_date, end_date)
+        else:
+            di = sql_compute_query_length_dist(conn, period_type, period_id, start_date, end_date)
+        elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
+        print(f"  Query length dist: {di} rows in {elapsed:.1f}s")
+        total_dists += di
 
     print(f"\nProcessed {len(periods_to_process)} periods successfully")
     print(f"  - {total_queries} top query entries")
     print(f"  - {total_dists} query length distribution rows")
 
-    return tuples_lf, min_live_date
-
-
-def _cleanup_live_chunks(archive_path: str):
-    """Remove temporary _live_chunk_*.parquet files."""
-    for f in glob.glob(os.path.join(archive_path, "_live_chunk_*.parquet")):
-        os.remove(f)
-    print("Cleaned up temporary live Parquet chunks")
+    return tuples_lf, min_live_date, use_polars
 
 
 def main():
@@ -637,19 +845,20 @@ def main():
 
     try:
         conn = get_db_connection()
-        tuples_lf, min_live_date = refresh_period_stats(conn)
+        tuples_lf, min_live_date, use_polars = refresh_period_stats(conn)
 
         print("\n" + "=" * 60)
         print("COMPUTING QUERY DAILY STATS")
         print("=" * 60)
-        start = datetime.now(timezone.utc)
-        total_daily = compute_query_daily_stats(conn, tuples_lf, min_live_date)
-        elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+        t0 = datetime.now(timezone.utc)
+        if use_polars:
+            total_daily = polars_compute_query_daily_stats(conn, tuples_lf, min_live_date)
+        else:
+            total_daily = sql_compute_query_daily_stats(conn, min_live_date)
+        elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
         print(f"  Query daily stats: {total_daily} rows in {elapsed:.1f}s")
 
         conn.close()
-
-        _cleanup_live_chunks(os.environ.get('ARCHIVE_PATH', '/archives'))
 
         print("=" * 60)
         print("Period stats refresh completed successfully")
@@ -659,7 +868,6 @@ def main():
         print(f"\nERROR: Period stats refresh failed: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc()
-        _cleanup_live_chunks(os.environ.get('ARCHIVE_PATH', '/archives'))
         return 1
 
 
