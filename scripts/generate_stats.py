@@ -312,12 +312,12 @@ def get_period_stats(conn, start_date, end_date, period_type: str = None, period
 
     cursor.close()
 
-    # Get precomputed unique queries and pairs from period_summary_stats
+    # Get precomputed stats from period_summary_stats (correct distinct counts)
     summary_row = None
     if period_type and period_id:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT unique_queries, unique_pairs
+            SELECT unique_queries, unique_pairs, total_searches, total_users
             FROM period_summary_stats
             WHERE period_type = %s AND period_id = %s
         """, (period_type, period_id))
@@ -327,6 +327,13 @@ def get_period_stats(conn, start_date, end_date, period_type: str = None, period
     if summary_row:
         total_queries = int(summary_row[0])
         total_pairs = int(summary_row[1])
+        # Override total_searches and total_users from precomputed stats
+        # (the UNION-based SUM(unique_users) is wrong: it sums per-client-per-day
+        # counts, massively overcounting users who appear across days/clients)
+        if summary_row[2] is not None:
+            total_searches = int(summary_row[2])
+        if summary_row[3] is not None:
+            total_users = int(summary_row[3])
     else:
         total_queries = int(total_users * 0.6) if total_users > 0 else 0
         total_pairs = total_users
