@@ -199,21 +199,45 @@ def update_cumulative_stats(conn, month: str):
 def export_daily_tuples_to_parquet(conn, month: str, archive_path: str) -> Tuple[str, int]:
     """Export daily search tuples for a month to Parquet.
 
-    Reads from mv_daily_search_tuples (still populated before deletion).
-    Output: daily_tuples_YYYY-MM.parquet with (date, username, query_normalized, search_count).
+    Reads from mv_daily_search_tuples via server-side cursor in chunks
+    to avoid OOM on 8 GB servers.
     """
     filepath = os.path.join(archive_path, f"daily_tuples_{month}.parquet")
 
-    df = pd.read_sql_query(
+    cursor = conn.cursor(name="export_tuples_cursor")
+    cursor.itersize = 500_000
+    cursor.execute(
         "SELECT date, username, query_normalized, search_count "
         "FROM mv_daily_search_tuples WHERE TO_CHAR(date, 'YYYY-MM') = %s",
-        conn,
-        params=(month,),
+        (month,),
     )
 
-    df.to_parquet(filepath, compression='snappy', index=False, engine='pyarrow')
-    print(f"  Exported {len(df):,} daily tuples to {filepath} ({os.path.getsize(filepath):,} bytes)")
-    return filepath, len(df)
+    writer = None
+    record_count = 0
+    try:
+        while True:
+            rows = cursor.fetchmany(cursor.itersize)
+            if not rows:
+                break
+            df = pd.DataFrame(rows, columns=['date', 'username', 'query_normalized', 'search_count'])
+            if writer is None:
+                import pyarrow as pa
+                import pyarrow.parquet as pq
+                table = pa.Table.from_pandas(df)
+                writer = pq.ParquetWriter(filepath, table.schema, compression='snappy')
+                writer.write_table(table)
+            else:
+                writer.write_table(pa.Table.from_pandas(df))
+            record_count += len(rows)
+            del rows, df
+    finally:
+        if writer is not None:
+            writer.close()
+        cursor.close()
+
+    file_size = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+    print(f"  Exported {record_count:,} daily tuples to {filepath} ({file_size:,} bytes)")
+    return filepath, record_count
 
 
 def archive_daily_client_stats(conn, month: str):
@@ -236,45 +260,49 @@ def archive_daily_client_stats(conn, month: str):
 
 
 def export_month_to_parquet(conn, month: str, archive_path: str) -> Tuple[str, int, int]:
-    """
-    Export a month's data to Parquet format (columnar, compressed).
+    """Export a month's raw search data to Parquet via chunked server-side cursor.
+
+    Streams data in 500k-row chunks to avoid OOM on 8 GB servers.
     Returns (file_path, record_count, file_size).
-
-    Parquet benefits:
-    - 10x smaller than CSV.gz (better compression + columnar format)
-    - Much faster to read (DuckDB optimized)
-    - Native timestamp support (no parsing needed)
     """
-    filename = f"searches_{month}.parquet"
-    filepath = os.path.join(archive_path, filename)
+    import pyarrow as pa
+    import pyarrow.parquet as pq
 
-    print(f"  Loading month data into pandas...")
+    filepath = os.path.join(archive_path, f"searches_{month}.parquet")
 
-    # Load data for this month using pandas
-    query = f"""
-        SELECT client_id, timestamp, username, query
-        FROM searches
-        WHERE TO_CHAR(timestamp, 'YYYY-MM') = '{month}'
-        ORDER BY timestamp
-    """
+    print(f"  Streaming month data to Parquet...")
 
-    df = pd.read_sql_query(query, conn, parse_dates=['timestamp'])
-    record_count = len(df)
-
-    print(f"  Exporting {record_count:,} records to Parquet...")
-
-    # Write to Parquet with good compression
-    # Snappy compression: fast compression/decompression, good ratio
-    df.to_parquet(
-        filepath,
-        compression='snappy',
-        index=False,
-        engine='pyarrow'
+    cursor = conn.cursor(name="export_month_cursor")
+    cursor.itersize = 500_000
+    cursor.execute(
+        "SELECT client_id, timestamp, username, query "
+        "FROM searches WHERE TO_CHAR(timestamp, 'YYYY-MM') = %s ORDER BY timestamp",
+        (month,),
     )
 
-    file_size = os.path.getsize(filepath)
-    compression_ratio = 100 * (1 - file_size / (record_count * 200)) if record_count > 0 else 0
-    print(f"  Parquet file: {file_size:,} bytes (~{compression_ratio:.1f}% compressed)")
+    writer = None
+    record_count = 0
+    try:
+        while True:
+            rows = cursor.fetchmany(cursor.itersize)
+            if not rows:
+                break
+            df = pd.DataFrame(rows, columns=['client_id', 'timestamp', 'username', 'query'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            table = pa.Table.from_pandas(df)
+            if writer is None:
+                writer = pq.ParquetWriter(filepath, table.schema, compression='snappy')
+            writer.write_table(table)
+            record_count += len(rows)
+            del rows, df, table
+            print(f"    {record_count:,} rows exported...")
+    finally:
+        if writer is not None:
+            writer.close()
+        cursor.close()
+
+    file_size = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+    print(f"  Parquet file: {file_size:,} bytes, {record_count:,} records")
 
     return filepath, record_count, file_size
 
