@@ -172,6 +172,52 @@ def _sql_date_filter(period_type: str, start_date: date, end_date: date) -> Tupl
     return "WHERE date >= %s AND date <= %s", [start_date, end_date]
 
 
+def _sql_compute_summary_single(cursor, where: str, params: list):
+    """Compute summary stats with a single combined query (for smaller periods)."""
+    cursor.execute(f"""
+        SELECT
+            SUM(search_count) AS total_searches,
+            COUNT(DISTINCT username) AS total_users,
+            COUNT(DISTINCT query_normalized) AS unique_queries,
+            COUNT(DISTINCT (username, query_normalized)) AS unique_pairs,
+            MIN(date) AS first_date,
+            MAX(date) AS last_date
+        FROM mv_daily_search_tuples
+        {where}
+    """, params)
+    return cursor.fetchone()
+
+
+def _sql_compute_summary_split(cursor, where: str, params: list):
+    """Compute summary stats with separate queries to reduce temp disk usage.
+
+    Used for all_time (61M+ rows) where 3 concurrent COUNT(DISTINCT ...)
+    would exceed available disk space for temp files.
+    """
+    cursor.execute(f"""
+        SELECT SUM(search_count), MIN(date), MAX(date)
+        FROM mv_daily_search_tuples {where}
+    """, params)
+    total_searches, first_dt, last_dt = cursor.fetchone()
+
+    cursor.execute(f"""
+        SELECT COUNT(DISTINCT username) FROM mv_daily_search_tuples {where}
+    """, params)
+    total_users = cursor.fetchone()[0]
+
+    cursor.execute(f"""
+        SELECT COUNT(DISTINCT query_normalized) FROM mv_daily_search_tuples {where}
+    """, params)
+    unique_queries = cursor.fetchone()[0]
+
+    cursor.execute(f"""
+        SELECT COUNT(DISTINCT (username, query_normalized)) FROM mv_daily_search_tuples {where}
+    """, params)
+    unique_pairs = cursor.fetchone()[0]
+
+    return (total_searches, total_users, unique_queries, unique_pairs, first_dt, last_dt)
+
+
 def sql_compute_all_summary_stats(
     conn, periods: List[Tuple[str, str, date, date]]
 ) -> Dict[Tuple[str, str], Tuple[int, int, int, int, date, date]]:
@@ -184,18 +230,13 @@ def sql_compute_all_summary_stats(
         start = datetime.now(timezone.utc)
 
         where, params = _sql_date_filter(period_type, start_date, end_date)
-        cursor.execute(f"""
-            SELECT
-                SUM(search_count) AS total_searches,
-                COUNT(DISTINCT username) AS total_users,
-                COUNT(DISTINCT query_normalized) AS unique_queries,
-                COUNT(DISTINCT (username, query_normalized)) AS unique_pairs,
-                MIN(date) AS first_date,
-                MAX(date) AS last_date
-            FROM mv_daily_search_tuples
-            {where}
-        """, params)
-        row = cursor.fetchone()
+
+        # Use split queries for all_time to avoid disk-full from concurrent
+        # COUNT(DISTINCT) temp files over 61M+ rows
+        if period_type == 'all_time':
+            row = _sql_compute_summary_split(cursor, where, params)
+        else:
+            row = _sql_compute_summary_single(cursor, where, params)
 
         if not row or row[0] is None:
             elapsed = (datetime.now(timezone.utc) - start).total_seconds()
