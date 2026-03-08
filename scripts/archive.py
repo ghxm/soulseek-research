@@ -357,10 +357,9 @@ def main():
     conn = get_db_connection()
 
     try:
-        # Ensure persistent user-query pairs table exists and seed from current data
+        # Ensure persistent user-query pairs table exists
         ensure_user_query_pairs_table(conn)
-        inserted = populate_user_query_pairs(conn)
-        print(f"Seeded user_query_pairs table ({inserted} new pairs)")
+        # Per-month seeding happens in archive_month() before each deletion
 
         # Find months to archive (complete and 7+ days old)
         months = get_months_to_archive(conn)
