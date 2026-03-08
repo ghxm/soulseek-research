@@ -85,35 +85,39 @@ def load_all_tuples(conn, archive_path: str) -> pl.LazyFrame:
     else:
         print("  No archived Parquet files found")
 
-    # Load live data from mv_daily_search_tuples via server-side cursor
+    # Load live data from mv_daily_search_tuples via server-side cursor.
+    # Build polars DataFrames in chunks to avoid holding all rows in a Python
+    # list (61M+ rows would exceed 8 GB RAM if accumulated then column-split).
     print("  Loading live data from mv_daily_search_tuples...")
     cursor = conn.cursor(name="load_tuples_cursor")
-    cursor.itersize = 100_000
+    cursor.itersize = 500_000
     cursor.execute("SELECT date, username, query_normalized, search_count FROM mv_daily_search_tuples")
 
-    batches = []
+    live_frames = []
     row_count = 0
     while True:
         rows = cursor.fetchmany(cursor.itersize)
         if not rows:
             break
-        batches.extend(rows)
-        row_count += len(rows)
-
-    cursor.close()
-    print(f"  Loaded {row_count} live rows")
-
-    if batches:
-        live_df = pl.DataFrame(
+        chunk_df = pl.DataFrame(
             {
-                "date": [r[0] for r in batches],
-                "username": [r[1] for r in batches],
-                "query_normalized": [r[2] for r in batches],
-                "search_count": [r[3] for r in batches],
+                "date": [r[0] for r in rows],
+                "username": [r[1] for r in rows],
+                "query_normalized": [r[2] for r in rows],
+                "search_count": [r[3] for r in rows],
             },
             schema=schema,
         )
-        frames.append(live_df.lazy())
+        live_frames.append(chunk_df.lazy())
+        row_count += len(rows)
+        # Free the Python list immediately
+        del rows
+        print(f"    Loaded {row_count:,} rows so far...")
+
+    cursor.close()
+    print(f"  Loaded {row_count:,} live rows total")
+
+    frames.extend(live_frames)
 
     if not frames:
         return pl.LazyFrame(schema=schema)
