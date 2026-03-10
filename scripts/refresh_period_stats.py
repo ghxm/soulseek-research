@@ -448,12 +448,48 @@ def sql_compute_query_daily_stats(conn, min_live_date: Optional[date]):
 # ---------------------------------------------------------------------------
 
 def _load_all_tuples_polars(conn, archive_path: str):
-    """Load archived Parquet + live MV data into a polars LazyFrame.
+    """Build a polars LazyFrame over archived Parquet + live MV data.
 
-    After archival, the live MV is small (~1 month, ~20M rows) so it fits
-    in memory. Archived Parquet is streamed from disk via scan_parquet.
+    Writes live MV data to a temp Parquet file so the entire LazyFrame
+    is backed by Parquet scans (no in-memory DataFrames). This lets Polars
+    stream through the data without materializing all ~56M+ rows at once.
     """
     import polars as pl
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    # Collect all Parquet files to scan
+    all_parquet_files = sorted(glob.glob(os.path.join(archive_path, "daily_tuples_*.parquet")))
+    print(f"  Found {len(all_parquet_files)} archived Parquet files")
+
+    # Export live MV data to a temp Parquet file
+    live_parquet = os.path.join(archive_path, "_live_tuples.parquet")
+    print("  Exporting live MV data to temp Parquet...")
+    cursor = conn.cursor(name="load_tuples_cursor")
+    cursor.itersize = 500_000
+    cursor.execute("SELECT date, username, query_normalized, search_count FROM mv_daily_search_tuples")
+
+    writer = None
+    row_count = 0
+    while True:
+        rows = cursor.fetchmany(cursor.itersize)
+        if not rows:
+            break
+        df = pd.DataFrame(rows, columns=["date", "username", "query_normalized", "search_count"])
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+        df["search_count"] = df["search_count"].astype("int64")
+        table = pa.Table.from_pandas(df)
+        if writer is None:
+            writer = pq.ParquetWriter(live_parquet, table.schema, compression="snappy")
+        writer.write_table(table)
+        row_count += len(rows)
+        del rows, df, table
+    cursor.close()
+    if writer is not None:
+        writer.close()
+    print(f"  Exported {row_count:,} live rows to temp Parquet")
+
+    all_parquet_files.append(live_parquet)
 
     schema = {
         "date": pl.Date,
@@ -461,48 +497,13 @@ def _load_all_tuples_polars(conn, archive_path: str):
         "query_normalized": pl.Utf8,
         "search_count": pl.Int64,
     }
-    frames = []
 
-    # Scan archived Parquet files (streaming, memory-efficient)
-    parquet_files = sorted(glob.glob(os.path.join(archive_path, "daily_tuples_*.parquet")))
-    print(f"  Found {len(parquet_files)} archived Parquet files")
-    if parquet_files:
-        archive_lf = pl.scan_parquet(parquet_files)
-        archive_lf = archive_lf.cast(schema)
-        frames.append(archive_lf)
+    if not all_parquet_files:
+        return pl.LazyFrame(schema=schema), live_parquet
 
-    # Load live MV data (should be small after archival)
-    print("  Loading live data from mv_daily_search_tuples...")
-    cursor = conn.cursor(name="load_tuples_cursor")
-    cursor.itersize = 500_000
-    cursor.execute("SELECT date, username, query_normalized, search_count FROM mv_daily_search_tuples")
-
-    rows_all = []
-    while True:
-        rows = cursor.fetchmany(cursor.itersize)
-        if not rows:
-            break
-        rows_all.extend(rows)
-    cursor.close()
-    print(f"  Loaded {len(rows_all):,} live rows")
-
-    if rows_all:
-        live_df = pl.DataFrame(
-            {
-                "date": [r[0] for r in rows_all],
-                "username": [r[1] for r in rows_all],
-                "query_normalized": [r[2] for r in rows_all],
-                "search_count": [r[3] for r in rows_all],
-            },
-            schema=schema,
-        )
-        frames.append(live_df.lazy())
-        del rows_all
-
-    if not frames:
-        return pl.LazyFrame(schema=schema)
-
-    return pl.concat(frames)
+    lf = pl.scan_parquet(all_parquet_files)
+    lf = lf.cast(schema)
+    return lf, live_parquet
 
 
 def _polars_compute_summary_split(conn, archive_path: str):
@@ -925,10 +926,11 @@ def refresh_period_stats(conn):
     if use_polars:
         print("MODE: Polars (archived Parquet files found)")
         print("Loading all daily tuples (archived + live)...")
-        tuples_lf = _load_all_tuples_polars(conn, archive_path)
+        tuples_lf, live_parquet = _load_all_tuples_polars(conn, archive_path)
     else:
         print("MODE: SQL (no archived Parquet files, using mv_daily_search_tuples directly)")
         tuples_lf = None
+        live_parquet = None
 
     # Get date range
     print("Getting date range...")
@@ -1017,6 +1019,11 @@ def refresh_period_stats(conn):
     print(f"\nProcessed {len(periods_to_process)} periods successfully")
     print(f"  - {total_queries} top query entries")
     print(f"  - {total_dists} query length distribution rows")
+
+    # Clean up temp live Parquet file
+    if use_polars and live_parquet and os.path.exists(live_parquet):
+        os.remove(live_parquet)
+        print(f"  Cleaned up temp file: {live_parquet}")
 
     return tuples_lf, min_live_date, use_polars
 
