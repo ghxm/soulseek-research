@@ -505,6 +505,46 @@ def _load_all_tuples_polars(conn, archive_path: str):
     return pl.concat(frames)
 
 
+def _polars_compute_summary_split(tuples_lf):
+    """Compute all_time summary stats with separate queries to reduce peak memory.
+
+    Running 3 concurrent n_unique() aggregations over ~56M rows OOMs on 8GB.
+    Split them so each runs and frees memory before the next.
+    """
+    import polars as pl
+
+    basics = tuples_lf.select(
+        pl.col("search_count").sum().alias("total_searches"),
+        pl.col("date").min().alias("first_date"),
+        pl.col("date").max().alias("last_date"),
+    ).collect()
+    total_searches = basics["total_searches"][0]
+    first_date = basics["first_date"][0]
+    last_date = basics["last_date"][0]
+    del basics
+
+    if total_searches is None:
+        return None
+
+    print("    total_searches/dates done, computing distinct users...")
+    total_users = tuples_lf.select(
+        pl.col("username").n_unique()
+    ).collect().item()
+
+    print("    distinct users done, computing distinct queries...")
+    unique_queries = tuples_lf.select(
+        pl.col("query_normalized").n_unique()
+    ).collect().item()
+
+    print("    distinct queries done, computing distinct pairs...")
+    unique_pairs = tuples_lf.select(
+        pl.struct(["username", "query_normalized"]).n_unique()
+    ).collect().item()
+
+    return (int(unique_queries), int(unique_pairs), int(total_searches),
+            int(total_users), first_date, last_date)
+
+
 def polars_compute_all_summary_stats(
     conn, tuples_lf, periods: List[Tuple[str, str, date, date]]
 ) -> Dict[Tuple[str, str], Tuple[int, int, int, int, date, date]]:
@@ -518,11 +558,21 @@ def polars_compute_all_summary_stats(
         start = datetime.now(timezone.utc)
 
         if period_type == 'all_time':
-            filtered = tuples_lf
-        else:
-            filtered = tuples_lf.filter(
-                (pl.col("date") >= start_date) & (pl.col("date") <= end_date)
-            )
+            # Split into separate queries to avoid OOM on 8GB server
+            row = _polars_compute_summary_split(tuples_lf)
+            if row is None:
+                elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+                print(f"    No data for this period ({elapsed:.1f}s)")
+                continue
+            results[(period_type, period_id)] = row
+            elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+            print(f"    {row[0]} queries, {row[1]} pairs, "
+                  f"{row[2]} searches, {row[3]} users ({elapsed:.1f}s)")
+            continue
+
+        filtered = tuples_lf.filter(
+            (pl.col("date") >= start_date) & (pl.col("date") <= end_date)
+        )
 
         stats = filtered.select(
             pl.col("search_count").sum().alias("total_searches"),
