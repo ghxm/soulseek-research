@@ -447,25 +447,12 @@ def sql_compute_query_daily_stats(conn, min_live_date: Optional[date]):
 # Used after archival when some data only exists in Parquet files.
 # ---------------------------------------------------------------------------
 
-def _load_all_tuples_polars(conn, archive_path: str):
-    """Build a polars LazyFrame over archived Parquet + live MV data.
-
-    Writes live MV data to a temp Parquet file so the entire LazyFrame
-    is backed by Parquet scans (no in-memory DataFrames). This lets Polars
-    stream through the data without materializing all ~56M+ rows at once.
-    """
-    import polars as pl
+def _export_live_to_parquet(conn, live_parquet: str) -> int:
+    """Export live MV data to a Parquet file using server-side cursor."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    # Collect all Parquet files to scan
-    all_parquet_files = sorted(glob.glob(os.path.join(archive_path, "daily_tuples_*.parquet")))
-    print(f"  Found {len(all_parquet_files)} archived Parquet files")
-
-    # Export live MV data to a temp Parquet file
-    live_parquet = os.path.join(archive_path, "_live_tuples.parquet")
-    print("  Exporting live MV data to temp Parquet...")
-    cursor = conn.cursor(name="load_tuples_cursor")
+    cursor = conn.cursor(name="export_live_cursor")
     cursor.itersize = 500_000
     cursor.execute("SELECT date, username, query_normalized, search_count FROM mv_daily_search_tuples")
 
@@ -490,6 +477,26 @@ def _load_all_tuples_polars(conn, archive_path: str):
     if writer is not None:
         writer.close()
     print(f"  Exported {row_count:,} live rows to temp Parquet")
+    return row_count
+
+
+def _load_all_tuples_polars(conn, archive_path: str):
+    """Build a polars LazyFrame over archived Parquet + live MV data.
+
+    Writes live MV data to a temp Parquet file so the entire LazyFrame
+    is backed by Parquet scans (no in-memory DataFrames). This lets Polars
+    stream through the data without materializing all ~56M+ rows at once.
+    """
+    import polars as pl
+
+    # Collect all Parquet files to scan
+    all_parquet_files = sorted(glob.glob(os.path.join(archive_path, "daily_tuples_*.parquet")))
+    print(f"  Found {len(all_parquet_files)} archived Parquet files")
+
+    # Export live MV data to a temp Parquet file
+    live_parquet = os.path.join(archive_path, "_live_tuples.parquet")
+    print("  Exporting live MV data to temp Parquet...")
+    _export_live_to_parquet(conn, live_parquet)
 
     all_parquet_files.append(live_parquet)
 
@@ -1157,12 +1164,26 @@ def refresh_period_stats(conn):
 
 def main():
     """Main execution"""
+    skip_periods = '--daily-stats-only' in sys.argv
     print(f"Starting period stats refresh at {datetime.now(timezone.utc).isoformat()}")
+    if skip_periods:
+        print("  (--daily-stats-only: skipping period stats, running query_daily_stats only)")
     print("=" * 60)
 
     try:
         conn = get_db_connection()
-        min_live_date, use_polars, live_parquet = refresh_period_stats(conn)
+        archive_path = os.environ.get('ARCHIVE_PATH', '/archives')
+        use_polars = has_archived_parquet(archive_path)
+        live_parquet = os.path.join(archive_path, "_live_tuples.parquet")
+
+        if not skip_periods:
+            min_live_date, use_polars, live_parquet = refresh_period_stats(conn)
+        else:
+            min_live_date = get_min_live_date(conn)
+            # Ensure live Parquet exists for query_daily_stats
+            if use_polars and not os.path.exists(live_parquet):
+                print("  Exporting live MV to temp Parquet for daily stats...")
+                _export_live_to_parquet(conn, live_parquet)
 
         print("\n" + "=" * 60)
         print("COMPUTING QUERY DAILY STATS")
