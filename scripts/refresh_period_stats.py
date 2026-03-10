@@ -513,7 +513,7 @@ def _polars_compute_summary_split(conn, archive_path: str):
     so memory from the previous pass is freed before the next one starts.
     Unique pairs use integer hashes instead of string tuples (~700MB vs ~3.6GB).
     """
-    import polars as pl
+    import pyarrow.parquet as pq
 
     parquet_files = sorted(glob.glob(os.path.join(archive_path, "daily_tuples_*.parquet")))
     cursor = conn.cursor()
@@ -524,14 +524,18 @@ def _polars_compute_summary_split(conn, archive_path: str):
     first_date = None
     last_date = None
     for pf in parquet_files:
-        df = pl.read_parquet(pf, columns=["date", "search_count"])
-        total_searches += df["search_count"].sum()
-        d_min, d_max = df["date"].min(), df["date"].max()
-        if first_date is None or d_min < first_date:
-            first_date = d_min
-        if last_date is None or d_max > last_date:
-            last_date = d_max
-        del df
+        pf_reader = pq.ParquetFile(pf)
+        for batch in pf_reader.iter_batches(batch_size=500_000, columns=["date", "search_count"]):
+            import pyarrow.compute as pc
+            total_searches += pc.sum(batch.column("search_count")).as_py()
+            d_min = pc.min(batch.column("date")).as_py()
+            d_max = pc.max(batch.column("date")).as_py()
+            if first_date is None or d_min < first_date:
+                first_date = d_min
+            if last_date is None or d_max > last_date:
+                last_date = d_max
+            del batch
+        del pf_reader
     cursor.execute("SELECT SUM(search_count), MIN(date), MAX(date) FROM mv_daily_search_tuples")
     mv_sum, mv_min, mv_max = cursor.fetchone()
     if mv_sum:
@@ -550,9 +554,11 @@ def _polars_compute_summary_split(conn, archive_path: str):
     print("    Pass 2: unique users...")
     unique_users = set()
     for pf in parquet_files:
-        df = pl.read_parquet(pf, columns=["username"])
-        unique_users.update(df["username"].unique().to_list())
-        del df
+        pf_reader = pq.ParquetFile(pf)
+        for batch in pf_reader.iter_batches(batch_size=500_000, columns=["username"]):
+            unique_users.update(batch.column("username").to_pylist())
+            del batch
+        del pf_reader
     cursor.execute("SELECT DISTINCT username FROM mv_daily_search_tuples")
     for row in cursor:
         unique_users.add(row[0])
@@ -560,32 +566,50 @@ def _polars_compute_summary_split(conn, archive_path: str):
     del unique_users
     print(f"      {n_users:,} unique users")
 
-    # Pass 3: unique queries
+    # Pass 3: unique queries (hash-based to save memory on ~20M strings)
     print("    Pass 3: unique queries...")
-    unique_queries = set()
+    query_hashes = set()
     for pf in parquet_files:
-        df = pl.read_parquet(pf, columns=["query_normalized"])
-        unique_queries.update(df["query_normalized"].unique().to_list())
-        del df
-    cursor.execute("SELECT DISTINCT query_normalized FROM mv_daily_search_tuples")
-    for row in cursor:
-        unique_queries.add(row[0])
-    n_queries = len(unique_queries)
-    del unique_queries
+        pf_reader = pq.ParquetFile(pf)
+        for batch in pf_reader.iter_batches(
+            batch_size=500_000, columns=["query_normalized"]
+        ):
+            for q in batch.column("query_normalized").to_pylist():
+                query_hashes.add(hash(q))
+            del batch
+        del pf_reader
+    mv_cursor = conn.cursor(name="alltime_queries_cursor")
+    mv_cursor.itersize = 500_000
+    mv_cursor.execute("SELECT DISTINCT query_normalized FROM mv_daily_search_tuples")
+    while True:
+        rows = mv_cursor.fetchmany(mv_cursor.itersize)
+        if not rows:
+            break
+        for row in rows:
+            query_hashes.add(hash(row[0]))
+        del rows
+    mv_cursor.close()
+    n_queries = len(query_hashes)
+    del query_hashes
     print(f"      {n_queries:,} unique queries")
 
-    # Pass 4: unique pairs (using hashes to save memory)
+    # Pass 4: unique pairs (hash-based, streamed in batches)
     print("    Pass 4: unique pairs (hash-based)...")
     pair_hashes = set()
     for pf in parquet_files:
         print(f"      Scanning {os.path.basename(pf)}...")
-        df = pl.read_parquet(pf, columns=["username", "query_normalized"])
-        pairs = df.unique()
-        for u, q in zip(pairs["username"].to_list(), pairs["query_normalized"].to_list()):
-            pair_hashes.add(hash((u, q)))
-        del df, pairs
+        pf_reader = pq.ParquetFile(pf)
+        for batch in pf_reader.iter_batches(
+            batch_size=500_000, columns=["username", "query_normalized"]
+        ):
+            users_col = batch.column("username").to_pylist()
+            queries_col = batch.column("query_normalized").to_pylist()
+            for u, q in zip(users_col, queries_col):
+                pair_hashes.add(hash((u, q)))
+            del users_col, queries_col, batch
+        del pf_reader
         print(f"        {len(pair_hashes):,} unique pair hashes so far")
-    # Live MV pairs via server-side cursor to avoid loading all at once
+    # Live MV pairs via server-side cursor
     mv_cursor = conn.cursor(name="alltime_pairs_cursor")
     mv_cursor.itersize = 500_000
     mv_cursor.execute(
