@@ -508,70 +508,108 @@ def _load_all_tuples_polars(conn, archive_path: str):
 def _polars_compute_summary_split(conn, archive_path: str):
     """Compute all_time summary stats with minimal peak memory.
 
-    Processing the full dataset (archived + live, ~56M+ rows) with n_unique()
-    OOMs on 8GB. Instead, scan each source file individually and accumulate
-    unique sets incrementally.
+    The full dataset (archived + live, ~56M+ rows) cannot fit in memory on 8GB.
+    Each metric is computed in a separate pass, reading only the columns needed,
+    so memory from the previous pass is freed before the next one starts.
+    Unique pairs use integer hashes instead of string tuples (~700MB vs ~3.6GB).
     """
     import polars as pl
 
     parquet_files = sorted(glob.glob(os.path.join(archive_path, "daily_tuples_*.parquet")))
+    cursor = conn.cursor()
 
+    # Pass 1: total_searches, first_date, last_date (minimal memory)
+    print("    Pass 1: total_searches, date range...")
     total_searches = 0
     first_date = None
     last_date = None
-    unique_users = set()
-    unique_queries = set()
-    unique_pairs = set()
-
-    # Process each archived Parquet file
     for pf in parquet_files:
-        print(f"    Scanning {os.path.basename(pf)}...")
-        df = pl.read_parquet(pf)
+        df = pl.read_parquet(pf, columns=["date", "search_count"])
         total_searches += df["search_count"].sum()
         d_min, d_max = df["date"].min(), df["date"].max()
         if first_date is None or d_min < first_date:
             first_date = d_min
         if last_date is None or d_max > last_date:
             last_date = d_max
-        unique_users.update(df["username"].unique().to_list())
-        unique_queries.update(df["query_normalized"].unique().to_list())
-        # Collect pairs as tuples -- per-month fits in memory
-        pairs = df.select("username", "query_normalized").unique()
-        unique_pairs.update(zip(pairs["username"].to_list(), pairs["query_normalized"].to_list()))
-        del df, pairs
-        print(f"      {len(unique_users):,} users, {len(unique_queries):,} queries, "
-              f"{len(unique_pairs):,} pairs so far")
-
-    # Process live MV data
-    print("    Scanning live MV data...")
-    cursor = conn.cursor(name="alltime_cursor")
-    cursor.itersize = 500_000
-    cursor.execute("SELECT date, username, query_normalized, search_count FROM mv_daily_search_tuples")
-
-    while True:
-        rows = cursor.fetchmany(cursor.itersize)
-        if not rows:
-            break
-        for d, u, q, sc in rows:
-            total_searches += sc
-            if first_date is None or d < first_date:
-                first_date = d
-            if last_date is None or d > last_date:
-                last_date = d
-            unique_users.add(u)
-            unique_queries.add(q)
-            unique_pairs.add((u, q))
-        del rows
-    cursor.close()
+        del df
+    cursor.execute("SELECT SUM(search_count), MIN(date), MAX(date) FROM mv_daily_search_tuples")
+    mv_sum, mv_min, mv_max = cursor.fetchone()
+    if mv_sum:
+        total_searches += mv_sum
+        if first_date is None or mv_min < first_date:
+            first_date = mv_min
+        if last_date is None or mv_max > last_date:
+            last_date = mv_max
 
     if total_searches == 0:
+        cursor.close()
         return None
+    print(f"      {total_searches:,} searches, {first_date} to {last_date}")
 
-    print(f"    Final: {len(unique_users):,} users, {len(unique_queries):,} queries, "
-          f"{len(unique_pairs):,} pairs, {total_searches:,} searches")
+    # Pass 2: unique users
+    print("    Pass 2: unique users...")
+    unique_users = set()
+    for pf in parquet_files:
+        df = pl.read_parquet(pf, columns=["username"])
+        unique_users.update(df["username"].unique().to_list())
+        del df
+    cursor.execute("SELECT DISTINCT username FROM mv_daily_search_tuples")
+    for row in cursor:
+        unique_users.add(row[0])
+    n_users = len(unique_users)
+    del unique_users
+    print(f"      {n_users:,} unique users")
 
-    return (len(unique_queries), len(unique_pairs), int(total_searches),
-            len(unique_users), first_date, last_date)
+    # Pass 3: unique queries
+    print("    Pass 3: unique queries...")
+    unique_queries = set()
+    for pf in parquet_files:
+        df = pl.read_parquet(pf, columns=["query_normalized"])
+        unique_queries.update(df["query_normalized"].unique().to_list())
+        del df
+    cursor.execute("SELECT DISTINCT query_normalized FROM mv_daily_search_tuples")
+    for row in cursor:
+        unique_queries.add(row[0])
+    n_queries = len(unique_queries)
+    del unique_queries
+    print(f"      {n_queries:,} unique queries")
+
+    # Pass 4: unique pairs (using hashes to save memory)
+    print("    Pass 4: unique pairs (hash-based)...")
+    pair_hashes = set()
+    for pf in parquet_files:
+        print(f"      Scanning {os.path.basename(pf)}...")
+        df = pl.read_parquet(pf, columns=["username", "query_normalized"])
+        pairs = df.unique()
+        for u, q in zip(pairs["username"].to_list(), pairs["query_normalized"].to_list()):
+            pair_hashes.add(hash((u, q)))
+        del df, pairs
+        print(f"        {len(pair_hashes):,} unique pair hashes so far")
+    # Live MV pairs via server-side cursor to avoid loading all at once
+    mv_cursor = conn.cursor(name="alltime_pairs_cursor")
+    mv_cursor.itersize = 500_000
+    mv_cursor.execute(
+        "SELECT DISTINCT username, query_normalized FROM mv_daily_search_tuples"
+    )
+    while True:
+        rows = mv_cursor.fetchmany(mv_cursor.itersize)
+        if not rows:
+            break
+        for u, q in rows:
+            pair_hashes.add(hash((u, q)))
+        del rows
+    mv_cursor.close()
+    n_pairs = len(pair_hashes)
+    del pair_hashes
+    print(f"      {n_pairs:,} unique pairs")
+
+    cursor.close()
+
+    print(f"    Final: {n_users:,} users, {n_queries:,} queries, "
+          f"{n_pairs:,} pairs, {total_searches:,} searches")
+
+    return (n_queries, n_pairs, int(total_searches),
+            n_users, first_date, last_date)
 
 
 def polars_compute_all_summary_stats(
