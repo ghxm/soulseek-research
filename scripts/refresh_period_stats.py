@@ -505,44 +505,73 @@ def _load_all_tuples_polars(conn, archive_path: str):
     return pl.concat(frames)
 
 
-def _polars_compute_summary_split(tuples_lf):
-    """Compute all_time summary stats with separate queries to reduce peak memory.
+def _polars_compute_summary_split(conn, archive_path: str):
+    """Compute all_time summary stats with minimal peak memory.
 
-    Running 3 concurrent n_unique() aggregations over ~56M rows OOMs on 8GB.
-    Split them so each runs and frees memory before the next.
+    Processing the full dataset (archived + live, ~56M+ rows) with n_unique()
+    OOMs on 8GB. Instead, scan each source file individually and accumulate
+    unique sets incrementally.
     """
     import polars as pl
 
-    basics = tuples_lf.select(
-        pl.col("search_count").sum().alias("total_searches"),
-        pl.col("date").min().alias("first_date"),
-        pl.col("date").max().alias("last_date"),
-    ).collect()
-    total_searches = basics["total_searches"][0]
-    first_date = basics["first_date"][0]
-    last_date = basics["last_date"][0]
-    del basics
+    parquet_files = sorted(glob.glob(os.path.join(archive_path, "daily_tuples_*.parquet")))
 
-    if total_searches is None:
+    total_searches = 0
+    first_date = None
+    last_date = None
+    unique_users = set()
+    unique_queries = set()
+    unique_pairs = set()
+
+    # Process each archived Parquet file
+    for pf in parquet_files:
+        print(f"    Scanning {os.path.basename(pf)}...")
+        df = pl.read_parquet(pf)
+        total_searches += df["search_count"].sum()
+        d_min, d_max = df["date"].min(), df["date"].max()
+        if first_date is None or d_min < first_date:
+            first_date = d_min
+        if last_date is None or d_max > last_date:
+            last_date = d_max
+        unique_users.update(df["username"].unique().to_list())
+        unique_queries.update(df["query_normalized"].unique().to_list())
+        # Collect pairs as tuples -- per-month fits in memory
+        pairs = df.select("username", "query_normalized").unique()
+        unique_pairs.update(zip(pairs["username"].to_list(), pairs["query_normalized"].to_list()))
+        del df, pairs
+        print(f"      {len(unique_users):,} users, {len(unique_queries):,} queries, "
+              f"{len(unique_pairs):,} pairs so far")
+
+    # Process live MV data
+    print("    Scanning live MV data...")
+    cursor = conn.cursor(name="alltime_cursor")
+    cursor.itersize = 500_000
+    cursor.execute("SELECT date, username, query_normalized, search_count FROM mv_daily_search_tuples")
+
+    while True:
+        rows = cursor.fetchmany(cursor.itersize)
+        if not rows:
+            break
+        for d, u, q, sc in rows:
+            total_searches += sc
+            if first_date is None or d < first_date:
+                first_date = d
+            if last_date is None or d > last_date:
+                last_date = d
+            unique_users.add(u)
+            unique_queries.add(q)
+            unique_pairs.add((u, q))
+        del rows
+    cursor.close()
+
+    if total_searches == 0:
         return None
 
-    print("    total_searches/dates done, computing distinct users...")
-    total_users = tuples_lf.select(
-        pl.col("username").n_unique()
-    ).collect().item()
+    print(f"    Final: {len(unique_users):,} users, {len(unique_queries):,} queries, "
+          f"{len(unique_pairs):,} pairs, {total_searches:,} searches")
 
-    print("    distinct users done, computing distinct queries...")
-    unique_queries = tuples_lf.select(
-        pl.col("query_normalized").n_unique()
-    ).collect().item()
-
-    print("    distinct queries done, computing distinct pairs...")
-    unique_pairs = tuples_lf.select(
-        pl.struct(["username", "query_normalized"]).n_unique()
-    ).collect().item()
-
-    return (int(unique_queries), int(unique_pairs), int(total_searches),
-            int(total_users), first_date, last_date)
+    return (len(unique_queries), len(unique_pairs), int(total_searches),
+            len(unique_users), first_date, last_date)
 
 
 def polars_compute_all_summary_stats(
@@ -558,8 +587,9 @@ def polars_compute_all_summary_stats(
         start = datetime.now(timezone.utc)
 
         if period_type == 'all_time':
-            # Split into separate queries to avoid OOM on 8GB server
-            row = _polars_compute_summary_split(tuples_lf)
+            # Process files individually to avoid OOM on 8GB server
+            archive_path = os.environ.get('ARCHIVE_PATH', '/archives')
+            row = _polars_compute_summary_split(conn, archive_path)
             if row is None:
                 elapsed = (datetime.now(timezone.utc) - start).total_seconds()
                 print(f"    No data for this period ({elapsed:.1f}s)")
