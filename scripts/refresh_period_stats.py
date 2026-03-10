@@ -721,6 +721,53 @@ def polars_compute_all_summary_stats(
     return results
 
 
+def _compute_top_queries_streamed(conn, archive_path: str) -> list:
+    """Compute all_time top queries by streaming through Parquet + MV.
+
+    Accumulates per-query user hash sets and total_searches in a dict.
+    Only queries with 5+ unique users are kept to limit memory usage.
+    """
+    import pyarrow.parquet as pq
+    from collections import defaultdict
+
+    parquet_files = sorted(glob.glob(os.path.join(archive_path, "daily_tuples_*.parquet")))
+    # Also include the temp live Parquet if it exists
+    live_pq = os.path.join(archive_path, "_live_tuples.parquet")
+    if os.path.exists(live_pq):
+        parquet_files.append(live_pq)
+
+    # query -> [set of user hashes, total_searches]
+    query_stats = defaultdict(lambda: [set(), 0])
+
+    for pf in parquet_files:
+        print(f"      Scanning {os.path.basename(pf)}...")
+        pf_reader = pq.ParquetFile(pf)
+        for batch in pf_reader.iter_batches(
+            batch_size=500_000,
+            columns=["username", "query_normalized", "search_count"]
+        ):
+            users = batch.column("username").to_pylist()
+            queries = batch.column("query_normalized").to_pylist()
+            counts = batch.column("search_count").to_pylist()
+            for u, q, sc in zip(users, queries, counts):
+                entry = query_stats[q]
+                entry[0].add(hash(u))
+                entry[1] += sc
+            del users, queries, counts, batch
+        del pf_reader
+
+    # Filter to 5+ users, sort, rank
+    results = [
+        (q, len(s[0]), s[1])
+        for q, s in query_stats.items()
+        if len(s[0]) >= 5
+    ]
+    del query_stats
+    results.sort(key=lambda x: (-x[1], -x[2]))
+    print(f"      {len(results):,} queries with 5+ users")
+    return results
+
+
 def polars_compute_top_queries(
     conn, tuples_lf, period_type: str, period_id: str,
     start_date: date, end_date: date
@@ -729,11 +776,42 @@ def polars_compute_top_queries(
     import polars as pl
 
     if period_type == 'all_time':
-        filtered = tuples_lf
-    else:
-        filtered = tuples_lf.filter(
-            (pl.col("date") >= start_date) & (pl.col("date") <= end_date)
+        # Stream through files to avoid OOM
+        archive_path = os.environ.get('ARCHIVE_PATH', '/archives')
+        results = _compute_top_queries_streamed(conn, archive_path)
+
+        cursor = conn.cursor()
+        cursor.execute("""
+            DELETE FROM period_top_queries
+            WHERE period_type = %s AND period_id = %s
+        """, (period_type, period_id))
+
+        if not results:
+            conn.commit()
+            cursor.close()
+            return 0
+
+        values = [
+            (period_type, period_id, q, unique_users, total_searches, rank)
+            for rank, (q, unique_users, total_searches) in enumerate(results, 1)
+        ]
+        del results
+
+        execute_values(
+            cursor,
+            """INSERT INTO period_top_queries
+               (period_type, period_id, query_normalized, unique_users, total_searches, rank)
+               VALUES %s""",
+            values,
+            page_size=5000,
         )
+        conn.commit()
+        cursor.close()
+        return len(values)
+
+    filtered = tuples_lf.filter(
+        (pl.col("date") >= start_date) & (pl.col("date") <= end_date)
+    )
 
     result_df = (
         filtered
@@ -786,23 +864,51 @@ def polars_compute_query_length_dist(
     import polars as pl
 
     if period_type == 'all_time':
-        filtered = tuples_lf
+        # Stream through files: collect unique query hashes per word count
+        import pyarrow.parquet as pq
+        from collections import defaultdict
+
+        archive_path = os.environ.get('ARCHIVE_PATH', '/archives')
+        parquet_files = sorted(glob.glob(os.path.join(archive_path, "daily_tuples_*.parquet")))
+        live_pq = os.path.join(archive_path, "_live_tuples.parquet")
+        if os.path.exists(live_pq):
+            parquet_files.append(live_pq)
+
+        # length -> set of query hashes
+        length_queries = defaultdict(set)
+        for pf in parquet_files:
+            pf_reader = pq.ParquetFile(pf)
+            for batch in pf_reader.iter_batches(
+                batch_size=500_000, columns=["query_normalized"]
+            ):
+                for q in batch.column("query_normalized").to_pylist():
+                    qlen = q.count(" ") + 1
+                    if qlen <= 100:
+                        length_queries[qlen].add(hash(q))
+                del batch
+            del pf_reader
+
+        result_rows = sorted(
+            [(length, len(hashes)) for length, hashes in length_queries.items()]
+        )
+        del length_queries
     else:
         filtered = tuples_lf.filter(
             (pl.col("date") >= start_date) & (pl.col("date") <= end_date)
         )
 
-    result_df = (
-        filtered
-        .with_columns(
-            (pl.col("query_normalized").str.count_matches(" ") + 1).alias("query_length")
+        result_df = (
+            filtered
+            .with_columns(
+                (pl.col("query_normalized").str.count_matches(" ") + 1).alias("query_length")
+            )
+            .filter(pl.col("query_length") <= 100)
+            .group_by("query_length")
+            .agg(pl.col("query_normalized").n_unique().alias("unique_query_count"))
+            .sort("query_length")
+            .collect()
         )
-        .filter(pl.col("query_length") <= 100)
-        .group_by("query_length")
-        .agg(pl.col("query_normalized").n_unique().alias("unique_query_count"))
-        .sort("query_length")
-        .collect()
-    )
+        result_rows = [(int(row[0]), int(row[1])) for row in result_df.iter_rows()]
 
     cursor = conn.cursor()
     cursor.execute("""
@@ -810,14 +916,14 @@ def polars_compute_query_length_dist(
         WHERE period_type = %s AND period_id = %s
     """, (period_type, period_id))
 
-    if result_df.height == 0:
+    if not result_rows:
         conn.commit()
         cursor.close()
         return 0
 
     values = [
-        (period_type, period_id, int(row[0]), int(row[1]))
-        for row in result_df.iter_rows()
+        (period_type, period_id, length, count)
+        for length, count in result_rows
     ]
 
     execute_values(
