@@ -755,6 +755,15 @@ def _compute_top_queries_streamed(conn, archive_path: str) -> list:
                 entry[1] += sc
             del users, queries, counts, batch
         del pf_reader
+        # Prune single-user queries after each file to keep memory bounded.
+        # A query with 1 user after N files needs 4+ new users in remaining
+        # files to reach the 5-user threshold -- extremely unlikely.
+        before = len(query_stats)
+        query_stats = defaultdict(
+            lambda: [set(), 0],
+            {q: s for q, s in query_stats.items() if len(s[0]) >= 2}
+        )
+        print(f"        {before:,} -> {len(query_stats):,} queries after pruning single-user entries")
 
     # Filter to 5+ users, sort, rank
     results = [
