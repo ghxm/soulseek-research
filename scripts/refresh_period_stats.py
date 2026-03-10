@@ -995,7 +995,7 @@ def polars_compute_query_daily_stats(conn, live_parquet: str, min_live_date: Opt
             pl.col("username").n_unique().alias("unique_users"),
         )
         .sort(["query_normalized", "date"])
-        .collect(streaming=True)
+        .collect(engine="streaming")
     )
     print(f"  Computed {daily_df.height:,} daily rows")
 
