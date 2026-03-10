@@ -949,7 +949,11 @@ def polars_compute_query_length_dist(
 
 
 def polars_compute_query_daily_stats(conn, tuples_lf, min_live_date: Optional[date]):
-    """Compute daily stats for queries with 35+ unique users, using polars."""
+    """Compute daily stats for queries with 35+ unique users, using polars.
+
+    Single-pass: collects all eligible query daily stats in one scan,
+    then bulk-inserts in chunks.
+    """
     import polars as pl
 
     cursor = conn.cursor()
@@ -965,35 +969,36 @@ def polars_compute_query_daily_stats(conn, tuples_lf, min_live_date: Optional[da
         return 0
 
     print(f"  Found {len(eligible)} eligible queries (35+ users)")
+    eligible_set = set(eligible)
 
+    # Single scan: filter to eligible queries (+ live dates if applicable),
+    # group by query+date, collect once
+    lf = tuples_lf.filter(pl.col("query_normalized").is_in(eligible_set))
     if min_live_date is not None:
-        live_lf = tuples_lf.filter(pl.col("date") >= min_live_date)
-    else:
-        live_lf = tuples_lf
+        lf = lf.filter(pl.col("date") >= min_live_date)
 
+    print("  Collecting daily stats (single scan)...")
+    daily_df = (
+        lf
+        .group_by(["query_normalized", "date"])
+        .agg(
+            pl.col("search_count").sum().alias("search_count"),
+            pl.col("username").n_unique().alias("unique_users"),
+        )
+        .sort(["query_normalized", "date"])
+        .collect()
+    )
+    print(f"  Collected {daily_df.height:,} daily rows")
+
+    if daily_df.height == 0:
+        return 0
+
+    # Delete existing rows for these queries (live dates only if applicable)
     chunk_size = 500
     total_inserted = 0
 
     for chunk_start in range(0, len(eligible), chunk_size):
         chunk = eligible[chunk_start:chunk_start + chunk_size]
-        chunk_label = f"[{chunk_start + 1}-{min(chunk_start + chunk_size, len(eligible))}/{len(eligible)}]"
-
-        chunk_df = (
-            live_lf
-            .filter(pl.col("query_normalized").is_in(chunk))
-            .group_by(["query_normalized", "date"])
-            .agg(
-                pl.col("search_count").sum().alias("search_count"),
-                pl.col("username").n_unique().alias("unique_users"),
-            )
-            .sort(["query_normalized", "date"])
-            .collect()
-        )
-
-        if chunk_df.height == 0:
-            print(f"  {chunk_label} No daily data found")
-            continue
-
         cursor = conn.cursor()
         if min_live_date is not None:
             cursor.execute("""
@@ -1005,27 +1010,33 @@ def polars_compute_query_daily_stats(conn, tuples_lf, min_live_date: Optional[da
                 DELETE FROM query_daily_stats
                 WHERE query_normalized = ANY(%s)
             """, (chunk,))
+        conn.commit()
+        cursor.close()
 
-        values = [
-            (row[0], row[1], int(row[2]), int(row[3]))
-            for row in chunk_df.iter_rows()
-        ]
+    # Insert all rows in chunks
+    all_values = [
+        (row[0], row[1], int(row[2]), int(row[3]))
+        for row in daily_df.iter_rows()
+    ]
+    del daily_df
 
+    insert_chunk_size = 10000
+    for i in range(0, len(all_values), insert_chunk_size):
+        chunk_vals = all_values[i:i + insert_chunk_size]
+        cursor = conn.cursor()
         execute_values(
             cursor,
             """INSERT INTO query_daily_stats
                (query_normalized, date, search_count, unique_users)
                VALUES %s""",
-            values,
+            chunk_vals,
             page_size=5000,
         )
-
         conn.commit()
         cursor.close()
+        total_inserted += len(chunk_vals)
 
-        total_inserted += len(values)
-        print(f"  {chunk_label} Inserted {len(values)} daily rows")
-
+    print(f"  Inserted {total_inserted:,} daily rows total")
     return total_inserted
 
 
@@ -1137,12 +1148,7 @@ def refresh_period_stats(conn):
     print(f"  - {total_queries} top query entries")
     print(f"  - {total_dists} query length distribution rows")
 
-    # Clean up temp live Parquet file
-    if use_polars and live_parquet and os.path.exists(live_parquet):
-        os.remove(live_parquet)
-        print(f"  Cleaned up temp file: {live_parquet}")
-
-    return tuples_lf, min_live_date, use_polars
+    return tuples_lf, min_live_date, use_polars, live_parquet
 
 
 def main():
@@ -1152,7 +1158,7 @@ def main():
 
     try:
         conn = get_db_connection()
-        tuples_lf, min_live_date, use_polars = refresh_period_stats(conn)
+        tuples_lf, min_live_date, use_polars, live_parquet = refresh_period_stats(conn)
 
         print("\n" + "=" * 60)
         print("COMPUTING QUERY DAILY STATS")
@@ -1164,6 +1170,11 @@ def main():
             total_daily = sql_compute_query_daily_stats(conn, min_live_date)
         elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
         print(f"  Query daily stats: {total_daily} rows in {elapsed:.1f}s")
+
+        # Clean up temp live Parquet file after all computations
+        if live_parquet and os.path.exists(live_parquet):
+            os.remove(live_parquet)
+            print(f"  Cleaned up temp file: {live_parquet}")
 
         conn.close()
 
