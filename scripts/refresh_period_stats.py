@@ -475,15 +475,17 @@ def _load_all_tuples_polars(conn, archive_path: str):
         rows = cursor.fetchmany(cursor.itersize)
         if not rows:
             break
-        df = pd.DataFrame(rows, columns=["date", "username", "query_normalized", "search_count"])
-        df["date"] = pd.to_datetime(df["date"]).dt.date
-        df["search_count"] = df["search_count"].astype("int64")
-        table = pa.Table.from_pandas(df)
+        table = pa.table({
+            "date": [r[0] for r in rows],
+            "username": [r[1] for r in rows],
+            "query_normalized": [r[2] for r in rows],
+            "search_count": [int(r[3]) for r in rows],
+        })
         if writer is None:
             writer = pq.ParquetWriter(live_parquet, table.schema, compression="snappy")
         writer.write_table(table)
         row_count += len(rows)
-        del rows, df, table
+        del rows, table
     cursor.close()
     if writer is not None:
         writer.close()
