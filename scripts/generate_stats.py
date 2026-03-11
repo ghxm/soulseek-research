@@ -1071,44 +1071,57 @@ def generate_stats_grid_html(stats: Dict) -> str:
 
 
 def get_available_periods(conn, max_date=None) -> Dict[str, List[Dict]]:
-    """Get all available weeks and months from the database."""
+    """Get all available weeks and months from period_summary_stats.
+
+    Derives periods from precomputed stats rather than the searches table,
+    so archived months/weeks (deleted from searches) are still included.
+    """
     cursor = conn.cursor()
 
-    cursor.execute("SELECT MIN(timestamp), MAX(timestamp) FROM searches")
-    min_date, db_max_date = cursor.fetchone()
-
-    if not min_date or not db_max_date:
-        return {'weeks': [], 'months': []}
-
-    effective_max = min(db_max_date, max_date) if max_date else db_max_date
-
-    # Generate weeks
+    # Get weeks from period_summary_stats
+    cursor.execute("""
+        SELECT period_id, first_date, last_date
+        FROM period_summary_stats
+        WHERE period_type = 'week'
+        ORDER BY period_id
+    """)
     weeks = []
-    current = min_date
-    while current <= effective_max:
-        iso_year, iso_week, _ = current.isocalendar()
-        week_id = f"{iso_year}-W{iso_week:02d}"
+    for period_id, first_date, last_date in cursor.fetchall():
+        # period_id is like "2026-W03"
+        parts = period_id.split('-W')
+        iso_year, iso_week = int(parts[0]), int(parts[1])
         week_label = f"{iso_week:02d}/{iso_year}"
         week_start = datetime.fromisocalendar(iso_year, iso_week, 1).replace(tzinfo=timezone.utc)
         week_end = week_start + timedelta(days=6, hours=23, minutes=59, seconds=59)
-        weeks.append({'id': week_id, 'label': week_label, 'start': week_start, 'end': week_end})
-        current = week_end + timedelta(seconds=1)
+        weeks.append({'id': period_id, 'label': week_label, 'start': week_start, 'end': week_end})
 
-    # Generate months
+    # Get months from period_summary_stats
+    cursor.execute("""
+        SELECT period_id, first_date, last_date
+        FROM period_summary_stats
+        WHERE period_type = 'month'
+        ORDER BY period_id
+    """)
     months = []
-    current = min_date.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    while current <= effective_max:
-        month_id = current.strftime('%Y-%m')
-        month_label = current.strftime('%B %Y')
-        if current.month == 12:
-            next_month = current.replace(year=current.year + 1, month=1)
+    for period_id, first_date, last_date in cursor.fetchall():
+        # period_id is like "2026-01"
+        year, month = int(period_id[:4]), int(period_id[5:7])
+        month_start = datetime(year, month, 1, tzinfo=timezone.utc)
+        month_label = month_start.strftime('%B %Y')
+        if month == 12:
+            next_month = month_start.replace(year=year + 1, month=1)
         else:
-            next_month = current.replace(month=current.month + 1)
+            next_month = month_start.replace(month=month + 1)
         month_end = next_month - timedelta(seconds=1)
-        months.append({'id': month_id, 'label': month_label, 'start': current, 'end': month_end})
-        current = next_month
+        months.append({'id': period_id, 'label': month_label, 'start': month_start, 'end': month_end})
 
     cursor.close()
+
+    # Filter out periods that start after max_date if specified
+    if max_date:
+        weeks = [w for w in weeks if w['start'] <= max_date]
+        months = [m for m in months if m['start'] <= max_date]
+
     return {'weeks': weeks, 'months': months}
 
 
