@@ -64,7 +64,11 @@
         if (index !== null) return;
         fetch(baseUrl + '/queries/index.json')
             .then(function(r) { return r.json(); })
-            .then(function(data) { index = data; });
+            .then(function(data) {
+                index = data;
+                var term = input.value.trim();
+                if (term) search(term);
+            });
     }
 
     function escapeHtml(s) {
