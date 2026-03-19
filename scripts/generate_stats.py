@@ -1149,6 +1149,12 @@ def generate_all_time_page(conn, cutoff_date=None, query_slug_map=None, blacklis
         print("  No data available, skipping all-time page")
         return None
 
+    # Cap last_search at cutoff_date (exclude incomplete current day)
+    if cutoff_date and stats['last_search']:
+        cutoff_iso = cutoff_date.isoformat()
+        if stats['last_search'] > cutoff_iso:
+            stats['last_search'] = (cutoff_date - timedelta(seconds=1)).isoformat()
+
     print(f"  Total all-time: {stats['total_searches']:,} searches, {stats['total_users']:,} users")
 
     # Get chart data from materialized views (exclude incomplete current day)
