@@ -58,7 +58,7 @@ class ResearchClient:
         # Configure Settings for distributed network participation
         from aioslsk.settings import (
             SharesSettings, DirectoryShareMode, SharedDirectorySettingEntry,
-            NetworkSettings, UpnpSettings
+            NetworkSettings, UpnpSettings, ServerSettings, ReconnectSettings
         )
 
         # Create a minimal share directory (empty is fine, we just need to show willingness to share)
@@ -80,6 +80,9 @@ class ResearchClient:
                 scan_on_start=True
             ),
             network=NetworkSettings(
+                server=ServerSettings(
+                    reconnect=ReconnectSettings(auto=True, timeout=30)
+                ),
                 upnp=UpnpSettings(enabled=False)  # Disable UPnP for cloud servers
             )
         )
@@ -171,6 +174,17 @@ class ResearchClient:
         self.soulseek_client.events.register(
             SearchRequestReceivedEvent,
             self._on_search_received
+        )
+
+        # Log server connection events
+        from aioslsk.events import SessionDestroyedEvent, ServerReconnectedEvent
+        self.soulseek_client.events.register(
+            SessionDestroyedEvent,
+            lambda event: logger.warning("⚠️  Server session destroyed - waiting for auto-reconnect")
+        )
+        self.soulseek_client.events.register(
+            ServerReconnectedEvent,
+            lambda event: logger.info("✅ Server reconnected automatically")
         )
         
         # Start soulseek FIRST - don't let database block this
