@@ -515,6 +515,31 @@ def _load_all_tuples_polars(conn, archive_path: str):
     return lf, live_parquet
 
 
+def _sql_compute_period_summary(conn, start_date, end_date):
+    """Compute period summary stats via SQL against mv_daily_search_tuples.
+
+    Uses PostgreSQL's disk-based aggregation for COUNT(DISTINCT), which
+    handles large months (40M+ rows) without OOM, unlike polars n_unique.
+    """
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT
+            SUM(search_count),
+            COUNT(DISTINCT username),
+            COUNT(DISTINCT query_normalized),
+            COUNT(DISTINCT (username, query_normalized)),
+            MIN(date),
+            MAX(date)
+        FROM mv_daily_search_tuples
+        WHERE date >= %s AND date <= %s
+    """, (start_date, end_date))
+    row = cursor.fetchone()
+    cursor.close()
+    if row is None or row[0] is None:
+        return None
+    return (int(row[2]), int(row[3]), int(row[0]), int(row[1]), row[4], row[5])
+
+
 def _polars_compute_summary_split(conn, archive_path: str):
     """Compute all_time summary stats with minimal peak memory.
 
@@ -647,7 +672,8 @@ def _polars_compute_summary_split(conn, archive_path: str):
 
 
 def polars_compute_all_summary_stats(
-    conn, tuples_lf, periods: List[Tuple[str, str, date, date]]
+    conn, tuples_lf, periods: List[Tuple[str, str, date, date]],
+    min_live_date: Optional[date] = None
 ) -> Dict[Tuple[str, str], Tuple[int, int, int, int, date, date]]:
     """Compute summary stats for all periods using polars."""
     import polars as pl
@@ -672,28 +698,36 @@ def polars_compute_all_summary_stats(
                   f"{row[2]} searches, {row[3]} users ({elapsed:.1f}s)")
             continue
 
-        filtered = tuples_lf.filter(
-            (pl.col("date") >= start_date) & (pl.col("date") <= end_date)
-        )
+        # For periods that overlap with live data and are large, use SQL
+        # against the MV to avoid OOM from polars n_unique on 40M+ rows.
+        # For archived-only periods, polars is fast (data is small).
+        if min_live_date is not None and end_date >= min_live_date:
+            row = _sql_compute_period_summary(conn, start_date, end_date)
+        else:
+            filtered = tuples_lf.filter(
+                (pl.col("date") >= start_date) & (pl.col("date") <= end_date)
+            )
+            stats = filtered.select(
+                pl.col("search_count").sum().alias("total_searches"),
+                pl.col("username").n_unique().alias("total_users"),
+                pl.col("query_normalized").n_unique().alias("unique_queries"),
+                pl.struct(["username", "query_normalized"]).n_unique().alias("unique_pairs"),
+                pl.col("date").min().alias("first_date"),
+                pl.col("date").max().alias("last_date"),
+            ).collect()
+            if stats.height == 0 or stats["total_searches"][0] is None:
+                elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+                print(f"    No data for this period ({elapsed:.1f}s)")
+                continue
+            s = stats.row(0)
+            row = (int(s[2]), int(s[3]), int(s[0]), int(s[1]), s[4], s[5])
 
-        stats = filtered.select(
-            pl.col("search_count").sum().alias("total_searches"),
-            pl.col("username").n_unique().alias("total_users"),
-            pl.col("query_normalized").n_unique().alias("unique_queries"),
-            pl.struct(["username", "query_normalized"]).n_unique().alias("unique_pairs"),
-            pl.col("date").min().alias("first_date"),
-            pl.col("date").max().alias("last_date"),
-        ).collect()
-
-        if stats.height == 0 or stats["total_searches"][0] is None:
+        if row is None:
             elapsed = (datetime.now(timezone.utc) - start).total_seconds()
             print(f"    No data for this period ({elapsed:.1f}s)")
             continue
 
-        row = stats.row(0)
-        results[(period_type, period_id)] = (
-            int(row[2]), int(row[3]), int(row[0]), int(row[1]), row[4], row[5]
-        )
+        results[(period_type, period_id)] = row
 
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
         print(f"    {row[2]} queries, {row[3]} pairs, "
@@ -1119,7 +1153,7 @@ def refresh_period_stats(conn):
     print("\nComputing summary stats for all periods...")
     t0 = datetime.now(timezone.utc)
     if use_polars:
-        summary_lookup = polars_compute_all_summary_stats(conn, tuples_lf, periods_to_process)
+        summary_lookup = polars_compute_all_summary_stats(conn, tuples_lf, periods_to_process, min_live_date)
     else:
         summary_lookup = sql_compute_all_summary_stats(conn, periods_to_process)
     elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
