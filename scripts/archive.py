@@ -319,14 +319,51 @@ def record_archive(conn, month: str, file_path: str, record_count: int, file_siz
 
 
 def delete_archived_data(conn, month: str) -> int:
-    """Delete data for archived month from searches table"""
+    """Delete data for archived month from searches table.
+
+    Drops mv_daily_search_tuples first to free disk space for the DELETE
+    WAL, then recreates it after VACUUM reclaims space.
+    """
     cursor = conn.cursor()
+
+    # Drop MV to free disk space (the DELETE + WAL needs headroom)
+    print(f"  Dropping mv_daily_search_tuples to free disk space...")
+    cursor.execute("DROP MATERIALIZED VIEW IF EXISTS mv_daily_search_tuples")
+    conn.commit()
+
+    # Delete archived rows
     cursor.execute("""
         DELETE FROM searches
         WHERE TO_CHAR(timestamp, 'YYYY-MM') = %s
     """, (month,))
     deleted = cursor.rowcount
     conn.commit()
+
+    # VACUUM to reclaim space before recreating MV
+    print(f"  Running VACUUM FULL on searches...")
+    old_isolation = conn.isolation_level
+    conn.set_isolation_level(0)  # autocommit for VACUUM
+    cursor.execute("VACUUM FULL searches")
+    conn.set_isolation_level(old_isolation)
+
+    # Recreate MV + index
+    print(f"  Recreating mv_daily_search_tuples...")
+    cursor.execute("""
+        CREATE MATERIALIZED VIEW mv_daily_search_tuples AS
+        SELECT date(timestamp) AS date, username,
+               lower(trim(query)) AS query_normalized,
+               count(*) AS search_count
+        FROM searches
+        GROUP BY date(timestamp), username, lower(trim(query))
+    """)
+    cursor.execute("""
+        CREATE UNIQUE INDEX idx_mv_daily_search_tuples_unique
+        ON mv_daily_search_tuples (date, username, query_normalized)
+    """)
+    conn.commit()
+    cursor.close()
+    print(f"  MV recreated successfully")
+
     return deleted
 
 
