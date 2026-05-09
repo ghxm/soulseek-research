@@ -1258,13 +1258,13 @@ def generate_article_html_with_jekyll(stats: Dict, figures: Dict[str, go.Figure]
         if fig is not None:
             # For top_queries, combine chart + table
             if name == 'top_queries' and top_queries_data:
-                chart_part = fig.to_html(full_html=False, include_plotlyjs='cdn')
+                chart_part = fig.to_html(full_html=False, include_plotlyjs=False)
                 data_json_url = f'data/queries_{data_file_id}.json'
                 write_queries_data_file(top_queries_data, f'docs/{data_json_url}', query_slug_map)
                 table_part = create_queries_data_table(top_queries_data, data_json_url)
                 chart_html[name] = f'{chart_part}\n{table_part}'
             else:
-                chart_html[name] = fig.to_html(full_html=False, include_plotlyjs='cdn')
+                chart_html[name] = fig.to_html(full_html=False, include_plotlyjs=False)
         else:
             chart_html[name] = '<p>Not enough data for visualization</p>'
 
@@ -1341,13 +1341,13 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
         if fig is not None:
             # For top_queries, combine chart + table
             if name == 'top_queries' and top_queries_data:
-                chart_part = fig.to_html(full_html=False, include_plotlyjs='cdn')
+                chart_part = fig.to_html(full_html=False, include_plotlyjs=False)
                 data_json_url = f'data/queries_{data_file_id}.json'
                 write_queries_data_file(top_queries_data, f'docs/{data_json_url}', query_slug_map)
                 table_part = create_queries_data_table(top_queries_data, data_json_url)
                 chart_html[name] = f'{chart_part}\n{table_part}'
             else:
-                chart_html[name] = fig.to_html(full_html=False, include_plotlyjs='cdn')
+                chart_html[name] = fig.to_html(full_html=False, include_plotlyjs=False)
         else:
             chart_html[name] = '<p style="color: #999">Not enough data for visualization</p>'
 
