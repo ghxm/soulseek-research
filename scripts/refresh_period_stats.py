@@ -992,9 +992,9 @@ def polars_compute_query_length_dist(
 def polars_compute_query_daily_stats(conn, live_parquet: str, min_live_date: Optional[date]):
     """Compute daily stats for queries with 35+ unique users, using polars.
 
-    Only scans the live Parquet file (not archived ones) since archived
-    periods' daily stats are already frozen in the DB. Processes in chunks
-    to stay within memory limits.
+    Scans the live Parquet for all eligible queries (refreshing live dates).
+    Also scans archived daily_tuples Parquet files for newly-eligible queries
+    that have no existing rows in query_daily_stats (backfill from archives).
     """
     import polars as pl
 
@@ -1017,8 +1017,37 @@ def polars_compute_query_daily_stats(conn, live_parquet: str, min_live_date: Opt
     print(f"  Found {len(eligible)} eligible queries (35+ users)")
     eligible_set = set(eligible)
 
-    # Read live Parquet into memory (only live/March data, ~7M rows, ~500MB)
-    # and compute all daily stats in a single pass
+    # Find queries that need backfill from archives (no existing rows)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT DISTINCT query_normalized FROM query_daily_stats
+        WHERE query_normalized = ANY(%s)
+    """, (eligible,))
+    existing_queries = {row[0] for row in cursor.fetchall()}
+    cursor.close()
+    need_backfill = eligible_set - existing_queries
+
+    # Backfill from archived Parquet files for newly-eligible queries
+    backfill_df = None
+    if need_backfill:
+        archive_path = os.environ.get('ARCHIVE_PATH', '/archives')
+        archived_files = sorted(glob.glob(os.path.join(archive_path, "daily_tuples_*.parquet")))
+        if archived_files:
+            print(f"  Backfilling {len(need_backfill)} queries from {len(archived_files)} archived files...")
+            backfill_df = (
+                pl.scan_parquet(archived_files)
+                .filter(pl.col("query_normalized").is_in(need_backfill))
+                .group_by(["query_normalized", "date"])
+                .agg(
+                    pl.col("search_count").sum().alias("search_count"),
+                    pl.col("username").n_unique().alias("unique_users"),
+                )
+                .sort(["query_normalized", "date"])
+                .collect(engine="streaming")
+            )
+            print(f"  Backfill: {backfill_df.height:,} rows from archives")
+
+    # Compute live daily stats for all eligible queries
     print("  Loading live data and computing daily stats...")
     daily_df = (
         pl.scan_parquet(live_parquet)
@@ -1031,23 +1060,30 @@ def polars_compute_query_daily_stats(conn, live_parquet: str, min_live_date: Opt
         .sort(["query_normalized", "date"])
         .collect(engine="streaming")
     )
-    print(f"  Computed {daily_df.height:,} daily rows")
+    print(f"  Live: {daily_df.height:,} daily rows")
+
+    # Combine backfill + live
+    if backfill_df is not None and backfill_df.height > 0:
+        daily_df = pl.concat([backfill_df, daily_df])
+        del backfill_df
 
     if daily_df.height == 0:
         return 0
 
-    # Delete existing rows for eligible queries (live dates only)
+    # Delete existing rows for eligible queries (live dates only for existing,
+    # all dates for newly backfilled)
     print("  Deleting old daily stats for eligible queries...")
     chunk_size = 2000
     for chunk_start in range(0, len(eligible), chunk_size):
         chunk = eligible[chunk_start:chunk_start + chunk_size]
         cursor = conn.cursor()
-        if min_live_date is not None:
+        if min_live_date is not None and not need_backfill:
             cursor.execute("""
                 DELETE FROM query_daily_stats
                 WHERE query_normalized = ANY(%s) AND date >= %s
             """, (chunk, min_live_date))
         else:
+            # Full delete when backfilling to avoid duplicates
             cursor.execute("""
                 DELETE FROM query_daily_stats
                 WHERE query_normalized = ANY(%s)
