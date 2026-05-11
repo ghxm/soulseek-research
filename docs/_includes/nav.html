@@ -97,16 +97,15 @@
         }
         var words = term.toLowerCase().trim().split(/\s+/).filter(Boolean);
         if (words.length === 0) { results.style.display = 'none'; return; }
-        var conditions = words.map(function() {
-            return 'q.rank IN (SELECT rank FROM word_index WHERE word LIKE ?)';
+        // Build SQL with values inlined (safe: only appending % to user words for LIKE)
+        var conditions = words.map(function(w) {
+            var escaped = w.replace(/'/g, "''");
+            return "q.rank IN (SELECT rank FROM word_index WHERE word LIKE '" + escaped + "%')";
         });
-        var params = words.map(function(w) { return w + '%'; });
-        db.query(
-            'SELECT q.query, q.unique_users, q.total_searches, q.slug ' +
+        var sql = 'SELECT q.query, q.unique_users, q.total_searches, q.slug ' +
             'FROM queries q WHERE ' + conditions.join(' AND ') +
-            ' ORDER BY q.unique_users DESC LIMIT 12',
-            params
-        ).then(function(rows) {
+            ' ORDER BY q.unique_users DESC LIMIT 12';
+        db.query(sql).then(function(rows) {
             if (rows.length === 0) {
                 results.innerHTML = '<div class="query-search-empty">No queries found</div>';
                 results.style.display = 'block';
@@ -136,8 +135,9 @@
             }
             results.innerHTML = html;
             results.style.display = 'block';
-        }).catch(function() {
-            results.innerHTML = '<div class="query-search-empty">Search error</div>';
+        }).catch(function(err) {
+            console.error('Nav search error:', err);
+            results.innerHTML = '<div class="query-search-empty">Search error: ' + (err.message || err) + '</div>';
             results.style.display = 'block';
         });
     }

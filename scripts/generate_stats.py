@@ -886,17 +886,17 @@ def create_queries_data_table(top_queries: List[tuple], db_config_url: str) -> s
             var words = term.toLowerCase().trim().split(/\\s+/).filter(Boolean);
             if (words.length === 0) return loadTop();
 
-            // Build query: intersect word_index lookups per word (prefix match via B-tree)
-            var conditions = words.map(function() {{
-                return 'q.rank IN (SELECT rank FROM word_index WHERE word LIKE ?)';
+            // Build SQL with values inlined (safe: only appending % to user words for LIKE)
+            var conditions = words.map(function(w) {{
+                var escaped = w.replace(/'/g, "''");
+                return "q.rank IN (SELECT rank FROM word_index WHERE word LIKE '" + escaped + "%')";
             }});
-            var params = words.map(function(w) {{ return w + '%'; }});
             var sql = 'SELECT q.rank, q.query, q.unique_users, q.total_searches, q.slug ' +
                 'FROM queries q WHERE ' + conditions.join(' AND ') +
                 ' ORDER BY q.unique_users DESC LIMIT 200';
 
             resultsDiv.textContent = 'Searching...';
-            return db.query(sql, params).then(function(rows) {{
+            return db.query(sql).then(function(rows) {{
                 renderRows(rows);
                 var msg = rows.length >= 200
                     ? 'Showing first 200 matches'
