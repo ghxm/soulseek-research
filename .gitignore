@@ -332,3 +332,4 @@ maintenance-*.md
 !/docs/_config.yml
 !/docs/_includes/
 !/docs/_layouts/
+!/docs/assets/

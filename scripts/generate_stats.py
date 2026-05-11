@@ -677,43 +677,123 @@ def create_top_queries_chart(top_queries: List[tuple], limit: int = 25) -> go.Fi
     return fig
 
 
-def write_queries_data_file(top_queries: List[tuple], data_file_path: str,
-                            query_slug_map: Dict[str, str] = None):
-    """Write query data + slug map to an external JSON file for lazy loading.
+def write_queries_db_file(top_queries: List[tuple], db_dir: str,
+                          data_file_id: str,
+                          query_slug_map: Dict[str, str] = None):
+    """Write query data to a chunked SQLite database for sql.js-httpvfs.
+
+    Produces chunk files (queries_{id}.db.000, .001, ...) and a config JSON
+    that sql.js-httpvfs uses to serve the database via HTTP Range requests.
 
     Args:
         top_queries: List of (query, unique_users, total_searches) tuples
-        data_file_path: Path to write the JSON file (e.g. docs/data/queries_all.json)
+        db_dir: Directory to write files into (e.g. 'docs/data')
+        data_file_id: Period identifier (e.g. 'all', '2026-01', '2026-W03')
         query_slug_map: Optional dict mapping query_normalized -> slug
     """
-    all_data = []
-    for i, (query, users, searches) in enumerate(top_queries, 1):
-        all_data.append([i, query, users, searches])
+    import sqlite3 as sqlite3_mod
+    import tempfile
+    import glob as glob_mod
 
-    # Filter slug map to only include queries in this table's data
-    if query_slug_map:
-        table_queries = {q[0] for q in top_queries}
-        filtered_slugs = {q: s for q, s in query_slug_map.items() if q in table_queries}
-    else:
-        filtered_slugs = {}
+    os.makedirs(db_dir, exist_ok=True)
+    prefix = f'queries_{data_file_id}'
 
-    os.makedirs(os.path.dirname(data_file_path), exist_ok=True)
-    with open(data_file_path, 'w', encoding='utf-8') as f:
-        json.dump({'data': all_data, 'slugs': filtered_slugs}, f, separators=(',', ':'))
+    # Remove old chunk files for this period
+    for old_file in glob_mod.glob(os.path.join(db_dir, f'{prefix}.db.*')):
+        os.remove(old_file)
+
+    # Build SQLite in a temp file
+    with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        conn = sqlite3_mod.connect(tmp_path)
+        conn.execute('PRAGMA page_size = 4096')
+        conn.execute('PRAGMA journal_mode = DELETE')
+
+        conn.execute('''CREATE TABLE queries (
+            rank INTEGER PRIMARY KEY,
+            query TEXT NOT NULL,
+            unique_users INTEGER NOT NULL,
+            total_searches INTEGER NOT NULL,
+            slug TEXT
+        )''')
+
+        rows = []
+        for i, (query, users, searches) in enumerate(top_queries, 1):
+            slug = query_slug_map.get(query) if query_slug_map else None
+            rows.append((i, query, users, searches, slug))
+        conn.executemany('INSERT INTO queries VALUES (?, ?, ?, ?, ?)', rows)
+
+        # Word index for prefix search via B-tree (works with any SQLite build,
+        # unlike FTS5 which fails with sql.js-httpvfs's HTTP VFS)
+        conn.execute('CREATE TABLE word_index (word TEXT NOT NULL, rank INTEGER NOT NULL)')
+        word_rows = []
+        for i, (query, _, _) in enumerate(top_queries, 1):
+            for w in set(query.lower().split()):
+                if w:
+                    word_rows.append((w, i))
+        conn.executemany('INSERT INTO word_index VALUES (?, ?)', word_rows)
+        conn.execute('CREATE INDEX idx_word ON word_index(word)')
+
+        conn.commit()
+        conn.execute('VACUUM')
+        conn.close()
+
+        # Split into chunks for GitHub Pages compatibility
+        config = _split_db_file(tmp_path, db_dir, prefix)
+
+        # Write config JSON for sql.js-httpvfs
+        config_path = os.path.join(db_dir, f'{prefix}_config.json')
+        with open(config_path, 'w') as f:
+            json.dump(config, f, separators=(',', ':'))
+
+        db_size = os.path.getsize(tmp_path)
+        n_chunks = len(glob_mod.glob(os.path.join(db_dir, f'{prefix}.db.*')))
+        print(f"  SQLite: {db_size / 1024 / 1024:.1f} MB, {n_chunks} chunks, {len(top_queries):,} rows")
+    finally:
+        os.unlink(tmp_path)
 
 
-def create_queries_data_table(top_queries: List[tuple], data_json_url: str) -> str:
-    """Create a searchable HTML table that lazy-loads query data from an external JSON file.
+def _split_db_file(db_path: str, output_dir: str, prefix: str,
+                   chunk_size: int = 10 * 1024 * 1024) -> dict:
+    """Split a SQLite file into chunks and return sql.js-httpvfs config."""
+    file_size = os.path.getsize(db_path)
+    suffix_length = 3
+    chunk_num = 0
 
-    Uses Clusterize.js for virtual scrolling. Data is fetched on page load
-    from an external JSON file to keep HTML pages small.
+    with open(db_path, 'rb') as f:
+        while True:
+            data = f.read(chunk_size)
+            if not data:
+                break
+            chunk_filename = f'{prefix}.db.{str(chunk_num).zfill(suffix_length)}'
+            with open(os.path.join(output_dir, chunk_filename), 'wb') as cf:
+                cf.write(data)
+            chunk_num += 1
+
+    return {
+        'serverMode': 'chunked',
+        'requestChunkSize': 4096,
+        'databaseLengthBytes': file_size,
+        'serverChunkSize': chunk_size,
+        'urlPrefix': f'{prefix}.db.',
+        'suffixLength': suffix_length,
+    }
+
+
+def create_queries_data_table(top_queries: List[tuple], db_config_url: str) -> str:
+    """Create a searchable HTML table backed by sql.js-httpvfs.
+
+    Uses HTTP Range requests to query a SQLite database, fetching only the
+    bytes needed for each search instead of downloading the full dataset.
 
     Args:
         top_queries: List of (query, unique_users, total_searches) tuples (for count only)
-        data_json_url: URL path to the external JSON data file
+        db_config_url: URL path to the sql.js-httpvfs config JSON
 
     Returns:
-        HTML string with interactive table and loading state
+        HTML string with interactive table and search
     """
     total_count = len(top_queries)
 
@@ -726,17 +806,17 @@ def create_queries_data_table(top_queries: List[tuple], data_json_url: str) -> s
                     type="text"
                     id="table_search"
                     class="table-search-input"
-                    placeholder="Search queries..."
+                    placeholder="Search queries (e.g. radiohead, pink floyd...)"
                     autocomplete="off"
                     disabled
                 />
             </div>
             <div class="search-results" id="search_results">
-                Loading query data...
+                Loading query engine...
             </div>
         </div>
 
-        <div id="scroll_area" class="table-scroll-container">
+        <div class="table-scroll-container">
             <table class="queries-table">
                 <thead>
                     <tr>
@@ -747,100 +827,125 @@ def create_queries_data_table(top_queries: List[tuple], data_json_url: str) -> s
                     </tr>
                 </thead>
                 <tbody id="content_area">
-                    <tr><td colspan="4" class="loading-cell">Loading {total_count:,} queries...</td></tr>
+                    <tr><td colspan="4" class="loading-cell">Loading query engine...</td></tr>
                 </tbody>
             </table>
         </div>
     </div>
 
-    <!-- Include Clusterize.js (2.3KB gzipped) -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/clusterize.js/0.19.0/clusterize.min.js"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/clusterize.js/0.19.0/clusterize.min.css">
-
     <script>
     (function() {{
-        // Base URL for query links (set by Jekyll template processing)
         var baseUrl = '{{{{ site.baseurl }}}}';
-        var dataUrl = baseUrl + '/{data_json_url}';
+        var configUrl = baseUrl + '/{db_config_url}';
+        var workerUrl = baseUrl + '/assets/sqljs/sqlite.worker.js';
+        var wasmUrl = baseUrl + '/assets/sqljs/sql-wasm.wasm';
+        var totalCount = {total_count};
 
         var searchInput = document.getElementById('table_search');
         var resultsDiv = document.getElementById('search_results');
-        var totalCount = {total_count};
-        var allData = null;
-        var slugMap = {{}};
-        var filteredData = null;
-        var clusterize = null;
+        var tbody = document.getElementById('content_area');
+        var db = null;
+        var debounceTimer = null;
 
-        // Convert data to HTML rows for Clusterize.js
-        function dataToRows(data) {{
-            return data.map(function(item) {{
-                var rank = item[0];
-                var query = item[1];
-                var users = item[2];
-                var searches = item[3];
+        function escapeHtml(s) {{
+            return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }}
 
-                var queryEscaped = query
-                    .replace(/&/g, '&amp;')
-                    .replace(/</g, '&lt;')
-                    .replace(/>/g, '&gt;');
-
-                var slug = slugMap[query];
-                var queryCell = slug
-                    ? '<a href="' + baseUrl + '/queries/' + slug + '.html" class="query-link">' + queryEscaped + '</a>'
+        function renderRows(rows) {{
+            if (!rows || rows.length === 0) {{
+                tbody.innerHTML = '<tr><td colspan="4" class="loading-cell">No results found</td></tr>';
+                return;
+            }}
+            var html = '';
+            for (var i = 0; i < rows.length; i++) {{
+                var r = rows[i];
+                var queryEscaped = escapeHtml(r.query);
+                var queryCell = r.slug
+                    ? '<a href="' + baseUrl + '/queries/' + r.slug + '.html" class="query-link">' + queryEscaped + '</a>'
                     : queryEscaped;
-
-                return '<tr>' +
-                    '<td class="rank-col">' + rank + '</td>' +
+                html += '<tr>' +
+                    '<td class="rank-col">' + r.rank + '</td>' +
                     '<td class="query-col">' + queryCell + '</td>' +
-                    '<td class="users-col">' + users.toLocaleString() + '</td>' +
-                    '<td class="searches-col">' + searches.toLocaleString() + '</td>' +
+                    '<td class="users-col">' + r.unique_users.toLocaleString() + '</td>' +
+                    '<td class="searches-col">' + r.total_searches.toLocaleString() + '</td>' +
                     '</tr>';
+            }}
+            tbody.innerHTML = html;
+        }}
+
+        function loadTop() {{
+            return db.query(
+                'SELECT rank, query, unique_users, total_searches, slug FROM queries ORDER BY rank LIMIT 100'
+            ).then(function(rows) {{
+                renderRows(rows);
+                resultsDiv.textContent = 'Showing top 100 of ' + totalCount.toLocaleString() + ' queries';
             }});
         }}
 
-        // Fetch data and initialize table
-        fetch(dataUrl)
-            .then(function(response) {{ return response.json(); }})
-            .then(function(json) {{
-                allData = json.data;
-                slugMap = json.slugs || {{}};
-                filteredData = allData;
+        function search(term) {{
+            var words = term.toLowerCase().trim().split(/\\s+/).filter(Boolean);
+            if (words.length === 0) return loadTop();
 
-                clusterize = new Clusterize({{
-                    rows: dataToRows(allData),
-                    scrollId: 'scroll_area',
-                    contentId: 'content_area',
-                    rows_in_block: 50,
-                    blocks_in_cluster: 4
-                }});
+            // Build query: intersect word_index lookups per word (prefix match via B-tree)
+            var conditions = words.map(function() {{
+                return 'q.rank IN (SELECT rank FROM word_index WHERE word LIKE ?)';
+            }});
+            var params = words.map(function(w) {{ return w + '%'; }});
+            var sql = 'SELECT q.rank, q.query, q.unique_users, q.total_searches, q.slug ' +
+                'FROM queries q WHERE ' + conditions.join(' AND ') +
+                ' ORDER BY q.unique_users DESC LIMIT 200';
 
+            resultsDiv.textContent = 'Searching...';
+            return db.query(sql, params).then(function(rows) {{
+                renderRows(rows);
+                var msg = rows.length >= 200
+                    ? 'Showing first 200 matches'
+                    : 'Showing ' + rows.length.toLocaleString() + ' matching queries';
+                resultsDiv.textContent = msg;
+            }}).catch(function() {{
+                // Query error (e.g. special characters) -- fall back to top
+                loadTop();
+            }});
+        }}
+
+        // Initialize: reuse nav worker for all-time db, or create new one for period db
+        var isAllTime = configUrl.indexOf('queries_all') !== -1;
+        var dbReady = (isAllTime && window._queryDb)
+            ? window._queryDb
+            : fetch(configUrl)
+                .then(function(r) {{ return r.json(); }})
+                .then(function(config) {{
+                    config.urlPrefix = baseUrl + '/data/' + config.urlPrefix;
+                    return SqliteHttpvfs.createDbWorker(
+                        [{{ from: "inline", config: config }}],
+                        workerUrl,
+                        wasmUrl
+                    );
+                }})
+                .then(function(worker) {{ return worker.db; }});
+
+        dbReady.then(function(readyDb) {{
+                db = readyDb;
                 searchInput.disabled = false;
-                resultsDiv.textContent = 'Showing all ' + allData.length.toLocaleString() + ' queries (virtual scrolling enabled)';
+                return loadTop();
             }})
             .catch(function(err) {{
-                resultsDiv.textContent = 'Failed to load query data';
-                console.error('Query data load error:', err);
+                resultsDiv.textContent = 'Failed to load query database';
+                console.error('sql.js-httpvfs init error:', err);
             }});
 
-        // Search functionality
         searchInput.addEventListener('input', function() {{
-            if (!allData || !clusterize) return;
-
-            var searchTerm = this.value.toLowerCase().trim();
-
-            if (!searchTerm) {{
-                filteredData = allData;
-                clusterize.update(dataToRows(filteredData));
-                resultsDiv.textContent = 'Showing all ' + allData.length.toLocaleString() + ' queries (virtual scrolling enabled)';
-                return;
-            }}
-
-            filteredData = allData.filter(function(item) {{
-                return item[1].toLowerCase().includes(searchTerm);
-            }});
-
-            clusterize.update(dataToRows(filteredData));
-            resultsDiv.textContent = 'Showing ' + filteredData.length.toLocaleString() + ' of ' + allData.length.toLocaleString() + ' queries';
+            if (!db) return;
+            clearTimeout(debounceTimer);
+            var term = this.value.trim();
+            debounceTimer = setTimeout(function() {{
+                if (!term || term.length < 2) {{
+                    if (!term) loadTop();
+                    else resultsDiv.textContent = 'Type at least 2 characters to search';
+                    return;
+                }}
+                search(term);
+            }}, 300);
         }});
     }})();
     </script>
@@ -968,15 +1073,6 @@ def create_queries_data_table(top_queries: List[tuple], data_json_url: str) -> s
             width: 120px;
             text-align: right;
             font-variant-numeric: tabular-nums;
-        }}
-
-        /* Clusterize.js adjustments */
-        .clusterize-scroll {{
-            max-height: 600px;
-        }}
-
-        .clusterize-content {{
-            /* Clusterize.js manages this */
         }}
     </style>
     '''
@@ -1259,9 +1355,9 @@ def generate_article_html_with_jekyll(stats: Dict, figures: Dict[str, go.Figure]
             # For top_queries, combine chart + table
             if name == 'top_queries' and top_queries_data:
                 chart_part = fig.to_html(full_html=False, include_plotlyjs=False)
-                data_json_url = f'data/queries_{data_file_id}.json'
-                write_queries_data_file(top_queries_data, f'docs/{data_json_url}', query_slug_map)
-                table_part = create_queries_data_table(top_queries_data, data_json_url)
+                write_queries_db_file(top_queries_data, 'docs/data', data_file_id, query_slug_map)
+                db_config_url = f'data/queries_{data_file_id}_config.json'
+                table_part = create_queries_data_table(top_queries_data, db_config_url)
                 chart_html[name] = f'{chart_part}\n{table_part}'
             else:
                 chart_html[name] = fig.to_html(full_html=False, include_plotlyjs=False)
@@ -1342,9 +1438,9 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
             # For top_queries, combine chart + table
             if name == 'top_queries' and top_queries_data:
                 chart_part = fig.to_html(full_html=False, include_plotlyjs=False)
-                data_json_url = f'data/queries_{data_file_id}.json'
-                write_queries_data_file(top_queries_data, f'docs/{data_json_url}', query_slug_map)
-                table_part = create_queries_data_table(top_queries_data, data_json_url)
+                write_queries_db_file(top_queries_data, 'docs/data', data_file_id, query_slug_map)
+                db_config_url = f'data/queries_{data_file_id}_config.json'
+                table_part = create_queries_data_table(top_queries_data, db_config_url)
                 chart_html[name] = f'{chart_part}\n{table_part}'
             else:
                 chart_html[name] = fig.to_html(full_html=False, include_plotlyjs=False)
@@ -1720,35 +1816,6 @@ query_display: "{display_escaped}"
             print(f"  Generated {count}/{len(query_daily)} query pages...")
 
     print(f"  Generated {count} query pages in docs/queries/")
-
-    # Write search index JSON for client-side query search
-    # Include all queries from period_top_queries (5+ users), not just those with pages
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT query_normalized, unique_users, total_searches
-        FROM period_top_queries
-        WHERE period_type = 'all_time' AND period_id = 'all_time'
-    """)
-    all_queries = cursor.fetchall()
-    cursor.close()
-
-    search_index = []
-    for query_norm, unique_users, total_searches in all_queries:
-        if blacklist and is_blacklisted(query_norm, blacklist):
-            continue
-        entry = {
-            'q': query_norm,
-            'u': unique_users,
-            't': total_searches,
-        }
-        if query_norm in slug_map:
-            entry['s'] = slug_map[query_norm]
-        search_index.append(entry)
-    search_index.sort(key=lambda x: x['u'], reverse=True)
-    with open('docs/queries/index.json', 'w', encoding='utf-8') as f:
-        json.dump(search_index, f, separators=(',', ':'), ensure_ascii=False)
-    page_count = sum(1 for e in search_index if 's' in e)
-    print(f"  Wrote search index ({len(search_index)} queries, {page_count} with pages)")
 
     return slug_map
 
