@@ -54,33 +54,24 @@
 
 <script>
 (function() {
+    var index = null;
     var input = document.getElementById('query-search-input');
     var results = document.getElementById('query-search-results');
     var baseUrl = '{{ site.baseurl }}';
     var debounceTimer;
-    var db = null;
-    var initPromise = null;
 
-    // Shared sql.js-httpvfs worker (also used by query table on period pages)
-    function getDb() {
-        if (initPromise) return initPromise;
-        initPromise = fetch(baseUrl + '/data/queries_all_config.json')
+    function loadIndex() {
+        if (index !== null) return;
+        index = []; // prevent duplicate fetches
+        fetch(baseUrl + '/queries/index.json')
             .then(function(r) { return r.json(); })
-            .then(function(config) {
-                config.urlPrefix = baseUrl + '/data/' + config.urlPrefix;
-                return SqliteHttpvfs.createDbWorker(
-                    [{ from: "inline", config: config }],
-                    baseUrl + '/assets/sqljs/sqlite.worker.js',
-                    baseUrl + '/assets/sqljs/sql-wasm.wasm'
-                );
-            })
-            .then(function(worker) {
-                db = worker.db;
-                return db;
+            .then(function(data) {
+                index = data;
+                // Expose for query table component to reuse
+                window._queryIndex = data;
+                var term = input.value.trim();
+                if (term) search(term);
             });
-        // Expose for the query table component to reuse
-        window._queryDb = initPromise;
-        return initPromise;
     }
 
     function escapeHtml(s) {
@@ -89,63 +80,51 @@
 
     function search(term) {
         if (!term) { results.style.display = 'none'; return; }
-        if (!db) {
+        if (!index || index.length === 0) {
             results.innerHTML = '<div class="query-search-empty">Loading...</div>';
             results.style.display = 'block';
-            getDb().then(function() { search(term); });
             return;
         }
-        var words = term.toLowerCase().trim().split(/\s+/).filter(Boolean);
-        if (words.length === 0) { results.style.display = 'none'; return; }
-        // Build SQL with values inlined (safe: only appending % to user words for LIKE)
-        var conditions = words.map(function(w) {
-            var escaped = w.replace(/'/g, "''");
-            return "q.rank IN (SELECT rank FROM word_index WHERE word LIKE '" + escaped + "%')";
-        });
-        var sql = 'SELECT q.query, q.unique_users, q.total_searches, q.slug ' +
-            'FROM queries q WHERE ' + conditions.join(' AND ') +
-            ' ORDER BY q.unique_users DESC LIMIT 12';
-        db.query(sql).then(function(rows) {
-            if (rows.length === 0) {
-                results.innerHTML = '<div class="query-search-empty">No queries found</div>';
-                results.style.display = 'block';
-                return;
-            }
-            var html = '';
-            for (var j = 0; j < rows.length; j++) {
-                var m = rows[j];
-                if (m.slug) {
-                    html += '<a href="' + baseUrl + '/queries/' + m.slug + '.html" class="query-search-item">'
-                        + '<span class="query-search-name">' + escapeHtml(m.query) + '</span>'
-                        + '<span class="query-search-meta">'
-                        + m.unique_users.toLocaleString() + ' users, '
-                        + m.total_searches.toLocaleString() + ' total searches'
-                        + '</span>'
-                        + '</a>';
-                } else {
-                    html += '<div class="query-search-item query-search-nopage">'
-                        + '<span class="query-search-name">' + escapeHtml(m.query) + '</span>'
-                        + '<span class="query-search-meta">'
-                        + m.unique_users.toLocaleString() + ' users, '
-                        + m.total_searches.toLocaleString() + ' total searches'
-                        + ' &mdash; not enough data'
-                        + '</span>'
-                        + '</div>';
-                }
-            }
-            results.innerHTML = html;
+        var lower = term.toLowerCase();
+        var matches = [];
+        for (var i = 0; i < index.length && matches.length < 12; i++) {
+            if (index[i].q.indexOf(lower) !== -1) matches.push(index[i]);
+        }
+        if (matches.length === 0) {
+            results.innerHTML = '<div class="query-search-empty">No queries found</div>';
             results.style.display = 'block';
-        }).catch(function(err) {
-            console.error('Nav search error:', err);
-            results.innerHTML = '<div class="query-search-empty">Search error: ' + (err.message || err) + '</div>';
-            results.style.display = 'block';
-        });
+            return;
+        }
+        var html = '';
+        for (var j = 0; j < matches.length; j++) {
+            var m = matches[j];
+            if (m.s) {
+                html += '<a href="' + baseUrl + '/queries/' + m.s + '.html" class="query-search-item">'
+                    + '<span class="query-search-name">' + escapeHtml(m.q) + '</span>'
+                    + '<span class="query-search-meta">'
+                    + m.u.toLocaleString() + ' users, '
+                    + m.t.toLocaleString() + ' total searches'
+                    + '</span>'
+                    + '</a>';
+            } else {
+                html += '<div class="query-search-item query-search-nopage">'
+                    + '<span class="query-search-name">' + escapeHtml(m.q) + '</span>'
+                    + '<span class="query-search-meta">'
+                    + m.u.toLocaleString() + ' users, '
+                    + m.t.toLocaleString() + ' total searches'
+                    + ' &mdash; not enough data'
+                    + '</span>'
+                    + '</div>';
+            }
+        }
+        results.innerHTML = html;
+        results.style.display = 'block';
     }
 
-    input.addEventListener('focus', function() { getDb(); });
+    input.addEventListener('focus', loadIndex);
     input.addEventListener('input', function() {
         clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(function() { search(input.value.trim()); }, 200);
+        debounceTimer = setTimeout(function() { search(input.value.trim()); }, 150);
     });
     document.addEventListener('click', function(e) {
         if (!e.target.closest('.query-search')) results.style.display = 'none';
