@@ -176,16 +176,18 @@ class ResearchClient:
             self._on_search_received
         )
 
-        # Log server connection events
+        # Track disconnection for auto-exit
+        self._disconnected_since = None
+
         from aioslsk.events import SessionDestroyedEvent, ServerReconnectedEvent
-        self.soulseek_client.events.register(
-            SessionDestroyedEvent,
-            lambda event: logger.warning("⚠️  Server session destroyed - waiting for auto-reconnect")
-        )
-        self.soulseek_client.events.register(
-            ServerReconnectedEvent,
-            lambda event: logger.info("✅ Server reconnected automatically")
-        )
+        def _on_session_destroyed(event):
+            logger.warning("Server session destroyed - waiting for auto-reconnect")
+            self._disconnected_since = asyncio.get_event_loop().time()
+        def _on_server_reconnected(event):
+            logger.info("Server reconnected automatically")
+            self._disconnected_since = None
+        self.soulseek_client.events.register(SessionDestroyedEvent, _on_session_destroyed)
+        self.soulseek_client.events.register(ServerReconnectedEvent, _on_server_reconnected)
         
         # Start soulseek FIRST - don't let database block this
         logger.info("Starting Soulseek client...")
@@ -233,6 +235,15 @@ class ResearchClient:
                         f"received_searches deque: {received_count}, "
                         f"{db_status}"
                     )
+
+                    # Exit if disconnected too long -- Docker will restart us
+                    if self._disconnected_since is not None:
+                        disconnected_secs = asyncio.get_event_loop().time() - self._disconnected_since
+                        logger.warning(f"Disconnected for {disconnected_secs:.0f}s")
+                        if disconnected_secs > 300:
+                            logger.critical("Disconnected for >5 minutes, exiting for Docker restart")
+                            self._running = False
+                            break
 
                     # CRITICAL ALERT: If database has been failing for a long time
                     if self._db_retry_count > 10:
