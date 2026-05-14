@@ -902,20 +902,59 @@ def create_queries_data_table(top_queries: List[tuple], data_json_url: str) -> s
             tbody.innerHTML = html;
         }}
 
-        // Lazy-load data
-        fetch(dataUrl)
-            .then(function(response) {{ return response.json(); }})
-            .then(function(json) {{
-                allData = json.data;
-                slugMap = json.slugs || {{}};
-                searchInput.disabled = false;
-                renderRows(allData, 0, 100);
-                resultsDiv.textContent = 'Showing top 100 of ' + allData.length.toLocaleString() + ' queries';
-            }})
-            .catch(function(err) {{
-                resultsDiv.textContent = 'Failed to load query data';
-                console.error('Query data load error:', err);
+        function onDataReady(json) {{
+            allData = json.data;
+            slugMap = json.slugs || {{}};
+            searchInput.disabled = false;
+            searchInput.placeholder = 'Search queries...';
+            renderRows(allData, 0, 100);
+            resultsDiv.textContent = 'Showing top 100 of ' + allData.length.toLocaleString() + ' queries';
+        }}
+
+        // Load with IndexedDB cache (persists across pages, invalidates daily)
+        var cacheKey = dataUrl + ':' + new Date().toISOString().slice(0, 10);
+        var DB_NAME = 'querySearchCache';
+        var STORE_NAME = 'json';
+
+        function openCache() {{
+            return new Promise(function(resolve, reject) {{
+                var req = indexedDB.open(DB_NAME, 1);
+                req.onupgradeneeded = function() {{ req.result.createObjectStore(STORE_NAME); }};
+                req.onsuccess = function() {{ resolve(req.result); }};
+                req.onerror = function() {{ reject(req.error); }};
             }});
+        }}
+
+        openCache().then(function(db) {{
+            var tx = db.transaction(STORE_NAME, 'readonly');
+            var req = tx.objectStore(STORE_NAME).get(cacheKey);
+            req.onsuccess = function() {{
+                if (req.result) {{
+                    onDataReady(req.result);
+                    return;
+                }}
+                fetch(dataUrl)
+                    .then(function(r) {{ return r.json(); }})
+                    .then(function(json) {{
+                        var wtx = db.transaction(STORE_NAME, 'readwrite');
+                        wtx.objectStore(STORE_NAME).put(json, cacheKey);
+                        onDataReady(json);
+                    }})
+                    .catch(function(err) {{
+                        resultsDiv.textContent = 'Failed to load query data';
+                        console.error('Query data load error:', err);
+                    }});
+            }};
+        }}).catch(function() {{
+            // IndexedDB unavailable -- fetch directly
+            fetch(dataUrl)
+                .then(function(r) {{ return r.json(); }})
+                .then(onDataReady)
+                .catch(function(err) {{
+                    resultsDiv.textContent = 'Failed to load query data';
+                    console.error('Query data load error:', err);
+                }});
+        }});
 
         searchInput.addEventListener('input', function() {{
             if (!allData) return;

@@ -47,7 +47,7 @@
 
     <div class="query-search">
         <svg class="query-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-        <input type="text" id="query-search-input" placeholder="Search queries..." autocomplete="off">
+        <input type="text" id="query-search-input" placeholder="Loading search..." autocomplete="off" disabled>
         <div id="query-search-results" class="query-search-results"></div>
     </div>
 </nav>
@@ -60,19 +60,68 @@
     var baseUrl = '{{ site.baseurl }}';
     var debounceTimer;
 
-    function loadIndex() {
-        if (index !== null) return;
-        index = []; // prevent duplicate fetches
+    // IndexedDB cache: persists across page navigations, invalidates daily (dashboard regenerates at 6 AM UTC)
+    var DB_NAME = 'querySearchCache';
+    var STORE_NAME = 'json';
+
+    function cacheKey() {
+        // Cache is valid for the current UTC date
+        return new Date().toISOString().slice(0, 10);
+    }
+
+    function openCache() {
+        return new Promise(function(resolve, reject) {
+            var req = indexedDB.open(DB_NAME, 1);
+            req.onupgradeneeded = function() { req.result.createObjectStore(STORE_NAME); };
+            req.onsuccess = function() { resolve(req.result); };
+            req.onerror = function() { reject(req.error); };
+        });
+    }
+
+    function getFromCache(db, key) {
+        return new Promise(function(resolve) {
+            var tx = db.transaction(STORE_NAME, 'readonly');
+            var req = tx.objectStore(STORE_NAME).get(key);
+            req.onsuccess = function() { resolve(req.result || null); };
+            req.onerror = function() { resolve(null); };
+        });
+    }
+
+    function putInCache(db, key, data) {
+        var tx = db.transaction(STORE_NAME, 'readwrite');
+        var store = tx.objectStore(STORE_NAME);
+        store.clear(); // remove old dates
+        store.put(data, key);
+    }
+
+    function onReady(data) {
+        index = data;
+        window._queryIndex = data;
+        input.disabled = false;
+        input.placeholder = 'Search queries...';
+    }
+
+    // Load: try cache first, fall back to fetch
+    openCache().then(function(db) {
+        var key = cacheKey();
+        return getFromCache(db, key).then(function(cached) {
+            if (cached) {
+                onReady(cached);
+                return;
+            }
+            return fetch(baseUrl + '/queries/index.json')
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    putInCache(db, key, data);
+                    onReady(data);
+                });
+        });
+    }).catch(function() {
+        // IndexedDB unavailable (private browsing etc) -- fetch directly
         fetch(baseUrl + '/queries/index.json')
             .then(function(r) { return r.json(); })
-            .then(function(data) {
-                index = data;
-                // Expose for query table component to reuse
-                window._queryIndex = data;
-                var term = input.value.trim();
-                if (term) search(term);
-            });
-    }
+            .then(onReady);
+    });
 
     function escapeHtml(s) {
         return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -80,11 +129,7 @@
 
     function search(term) {
         if (!term) { results.style.display = 'none'; return; }
-        if (!index || index.length === 0) {
-            results.innerHTML = '<div class="query-search-empty">Loading...</div>';
-            results.style.display = 'block';
-            return;
-        }
+        if (!index) return;
         var lower = term.toLowerCase();
         var matches = [];
         for (var i = 0; i < index.length && matches.length < 12; i++) {
@@ -121,7 +166,6 @@
         results.style.display = 'block';
     }
 
-    input.addEventListener('focus', loadIndex);
     input.addEventListener('input', function() {
         clearTimeout(debounceTimer);
         debounceTimer = setTimeout(function() { search(input.value.trim()); }, 150);
