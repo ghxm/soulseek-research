@@ -1070,26 +1070,36 @@ def polars_compute_query_daily_stats(conn, live_parquet: str, min_live_date: Opt
     if daily_df.height == 0:
         return 0
 
-    # Delete existing rows for eligible queries (live dates only for existing,
-    # all dates for newly backfilled)
+    # Delete existing rows: live dates only for existing queries,
+    # full delete for newly-backfilled queries
     print("  Deleting old daily stats for eligible queries...")
     chunk_size = 2000
     for chunk_start in range(0, len(eligible), chunk_size):
         chunk = eligible[chunk_start:chunk_start + chunk_size]
-        cursor = conn.cursor()
-        if min_live_date is not None and not need_backfill:
+
+        # Split chunk into backfill vs existing queries
+        chunk_backfill = [q for q in chunk if q in need_backfill]
+        chunk_existing = [q for q in chunk if q not in need_backfill]
+
+        # Existing queries: only refresh live dates
+        if chunk_existing and min_live_date is not None:
+            cursor = conn.cursor()
             cursor.execute("""
                 DELETE FROM query_daily_stats
                 WHERE query_normalized = ANY(%s) AND date >= %s
-            """, (chunk, min_live_date))
-        else:
-            # Full delete when backfilling to avoid duplicates
+            """, (chunk_existing, min_live_date))
+            conn.commit()
+            cursor.close()
+
+        # Backfill queries: full delete to re-insert from archives + live
+        if chunk_backfill:
+            cursor = conn.cursor()
             cursor.execute("""
                 DELETE FROM query_daily_stats
                 WHERE query_normalized = ANY(%s)
-            """, (chunk,))
-        conn.commit()
-        cursor.close()
+            """, (chunk_backfill,))
+            conn.commit()
+            cursor.close()
 
     # Bulk insert all rows
     print("  Inserting daily stats rows...")

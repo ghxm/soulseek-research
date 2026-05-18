@@ -244,22 +244,28 @@ chmod +x /usr/local/bin/refresh-views.sh
 cat > /usr/local/bin/refresh-period-stats.sh << 'PERIOD_STATS_SCRIPT'
 #!/bin/bash
 # Refresh period-specific precomputed statistics
-# Runs daily at 4:30 AM UTC (after view refresh, before GitHub Actions at 5 AM)
+# Runs daily at 1 AM UTC (after view refresh at midnight, before GitHub Actions at 6 AM)
 
 cd /opt/soulseek-research
 
-DB_URL="postgresql://soulseek:${db_password}@localhost:5432/soulseek"
+DB_URL="postgresql://soulseek:$(grep DB_PASSWORD .env | cut -d= -f2)@localhost:5432/soulseek"
 
-# Run period stats refresh using Docker
+# Run period stats refresh using Docker, capturing output
 docker run --rm \
   --network=host \
   -v /opt/archives:/archives \
   -e DATABASE_URL="$DB_URL" \
   -e ARCHIVE_PATH=/archives \
   soulseek-research:latest \
-  uv run python /app/scripts/refresh_period_stats.py
+  uv run python /app/scripts/refresh_period_stats.py \
+  >> /var/log/soulseek-period-stats-output.log 2>&1
+EXIT_CODE=$?
 
-echo "$(date): Period stats refreshed" >> /var/log/soulseek-period-stats.log
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "$(date): Period stats refreshed" >> /var/log/soulseek-period-stats.log
+else
+    echo "$(date): Period stats FAILED (exit code $EXIT_CODE)" >> /var/log/soulseek-period-stats.log
+fi
 PERIOD_STATS_SCRIPT
 
 chmod +x /usr/local/bin/refresh-period-stats.sh
@@ -287,7 +293,7 @@ EOF
 
 # Period stats log rotation
 cat > /etc/logrotate.d/soulseek-period-stats << EOF
-/var/log/soulseek-period-stats.log {
+/var/log/soulseek-period-stats.log /var/log/soulseek-period-stats-output.log {
     rotate 30
     daily
     compress
