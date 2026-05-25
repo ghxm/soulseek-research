@@ -786,24 +786,33 @@ def _compute_top_queries_streamed(conn, archive_path: str) -> list:
 
     print(f"      Aggregating {len(parquet_files)} Parquet files via DuckDB...")
     con = duckdb.connect()
-    # Spill to root disk which has more free space than the archive volume.
-    # /tmp is on the root filesystem (cleared on reboot, that's fine).
+    # Spill to root disk (72GB free post-upgrade). /tmp inside the --rm
+    # container writes to docker overlay storage on the host root disk.
     spill_dir = "/tmp/_duckdb_spill"
     os.makedirs(spill_dir, exist_ok=True)
     con.execute(f"SET temp_directory='{spill_dir}'")
-    con.execute("SET memory_limit='6GB'")
-    # Reduce parallelism to lower peak memory; disable ordering for hash-agg speed
+    con.execute("SET memory_limit='10GB'")
     con.execute("SET threads=4")
     con.execute("SET preserve_insertion_order=false")
 
+    # Two-pass aggregation: inner deduplicates (query, user) pairs into a
+    # streamable intermediate; outer counts rows per query. DuckDB spills
+    # the intermediate to disk readily, unlike per-group COUNT(DISTINCT)
+    # which holds a hash set per group in memory.
     rows = con.execute(
         """
+        WITH pair_totals AS (
+            SELECT query_normalized, username,
+                   SUM(search_count) AS user_searches
+            FROM read_parquet(?)
+            GROUP BY query_normalized, username
+        )
         SELECT query_normalized,
-               COUNT(DISTINCT username)::BIGINT AS unique_users,
-               SUM(search_count)::BIGINT AS total_searches
-        FROM read_parquet(?)
+               COUNT(*)::BIGINT AS unique_users,
+               SUM(user_searches)::BIGINT AS total_searches
+        FROM pair_totals
         GROUP BY query_normalized
-        HAVING COUNT(DISTINCT username) >= 5
+        HAVING COUNT(*) >= 5
         ORDER BY unique_users DESC, total_searches DESC
         """,
         [parquet_files],
