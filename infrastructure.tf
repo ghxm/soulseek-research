@@ -78,7 +78,7 @@ resource "hcloud_firewall" "soulseek_firewall" {
 resource "hcloud_server" "database" {
   name        = "soulseek-db"
   image       = "ubuntu-22.04"
-  server_type = "cx33"
+  server_type = "cx43"
   location    = "nbg1"
   ssh_keys    = [data.hcloud_ssh_key.default.id]
   firewall_ids = [hcloud_firewall.soulseek_firewall.id]

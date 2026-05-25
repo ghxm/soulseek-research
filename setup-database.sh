@@ -210,6 +210,7 @@ docker run --rm \
   -e DATABASE_URL="$DB_URL" \
   -e ARCHIVE_PATH=/archives \
   -e DELETE_AFTER_ARCHIVE=true \
+  -e PYTHONUNBUFFERED=1 \
   soulseek-research:latest \
   uv run python /app/scripts/archive.py
 
@@ -256,6 +257,7 @@ docker run --rm \
   -v /opt/archives:/archives \
   -e DATABASE_URL="$DB_URL" \
   -e ARCHIVE_PATH=/archives \
+  -e PYTHONUNBUFFERED=1 \
   soulseek-research:latest \
   uv run python /app/scripts/refresh_period_stats.py \
   >> /var/log/soulseek-period-stats-output.log 2>&1

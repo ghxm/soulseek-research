@@ -700,27 +700,36 @@ def polars_compute_all_summary_stats(
 
         # For periods that overlap with live data and are large, use SQL
         # against the MV to avoid OOM from polars n_unique on 40M+ rows.
-        # For archived-only periods, polars is fast (data is small).
+        # For archived-only periods, polars streaming is fast and bounded.
         if min_live_date is not None and end_date >= min_live_date:
             row = _sql_compute_period_summary(conn, start_date, end_date)
         else:
             filtered = tuples_lf.filter(
                 (pl.col("date") >= start_date) & (pl.col("date") <= end_date)
             )
+            # Compute scalar aggregates (no struct.n_unique -- materializes pairs)
             stats = filtered.select(
                 pl.col("search_count").sum().alias("total_searches"),
                 pl.col("username").n_unique().alias("total_users"),
                 pl.col("query_normalized").n_unique().alias("unique_queries"),
-                pl.struct(["username", "query_normalized"]).n_unique().alias("unique_pairs"),
                 pl.col("date").min().alias("first_date"),
                 pl.col("date").max().alias("last_date"),
-            ).collect()
+            ).collect(engine="streaming")
             if stats.height == 0 or stats["total_searches"][0] is None:
                 elapsed = (datetime.now(timezone.utc) - start).total_seconds()
                 print(f"    No data for this period ({elapsed:.1f}s)")
                 continue
+            # Count unique (username, query_normalized) pairs via group_by
+            pairs_df = (
+                filtered
+                .group_by(["username", "query_normalized"])
+                .agg(pl.lit(1).alias("_one"))
+                .select(pl.len().alias("unique_pairs"))
+                .collect(engine="streaming")
+            )
+            unique_pairs = int(pairs_df["unique_pairs"][0])
             s = stats.row(0)
-            row = (int(s[2]), int(s[3]), int(s[0]), int(s[1]), s[4], s[5])
+            row = (int(s[2]), unique_pairs, int(s[0]), int(s[1]), s[3], s[4])
 
         if row is None:
             elapsed = (datetime.now(timezone.utc) - start).total_seconds()
@@ -763,59 +772,33 @@ def polars_compute_all_summary_stats(
 
 
 def _compute_top_queries_streamed(conn, archive_path: str) -> list:
-    """Compute all_time top queries by streaming through Parquet + MV.
+    """Compute all_time top queries via polars streaming aggregation.
 
-    Accumulates per-query user hash sets and total_searches in a dict.
-    Only queries with 5+ unique users are kept to limit memory usage.
+    Scans archived Parquet files + live Parquet, groups by query,
+    counts unique users and sums search_count, filters to 5+ users.
+    Polars streaming engine spills to disk on memory pressure.
     """
-    import pyarrow.parquet as pq
-    from collections import defaultdict
+    import polars as pl
 
     parquet_files = sorted(glob.glob(os.path.join(archive_path, "daily_tuples_*.parquet")))
-    # Also include the temp live Parquet if it exists
     live_pq = os.path.join(archive_path, "_live_tuples.parquet")
     if os.path.exists(live_pq):
         parquet_files.append(live_pq)
 
-    # query -> [set of user hashes, total_searches]
-    query_stats = defaultdict(lambda: [set(), 0])
-
-    for pf in parquet_files:
-        print(f"      Scanning {os.path.basename(pf)}...")
-        pf_reader = pq.ParquetFile(pf)
-        for batch in pf_reader.iter_batches(
-            batch_size=500_000,
-            columns=["username", "query_normalized", "search_count"]
-        ):
-            users = batch.column("username").to_pylist()
-            queries = batch.column("query_normalized").to_pylist()
-            counts = batch.column("search_count").to_pylist()
-            for u, q, sc in zip(users, queries, counts):
-                entry = query_stats[q]
-                entry[0].add(hash(u))
-                entry[1] += sc
-            del users, queries, counts, batch
-        del pf_reader
-        # Prune single-user queries after each file to keep memory bounded.
-        # A query with 1 user after N files needs 4+ new users in remaining
-        # files to reach the 5-user threshold -- extremely unlikely.
-        before = len(query_stats)
-        query_stats = defaultdict(
-            lambda: [set(), 0],
-            {q: s for q, s in query_stats.items() if len(s[0]) >= 2}
+    print(f"      Scanning {len(parquet_files)} Parquet files via polars streaming...")
+    df = (
+        pl.scan_parquet(parquet_files)
+        .group_by("query_normalized")
+        .agg(
+            pl.col("username").n_unique().alias("unique_users"),
+            pl.col("search_count").sum().alias("total_searches"),
         )
-        print(f"        {before:,} -> {len(query_stats):,} queries after pruning single-user entries")
-
-    # Filter to 5+ users, sort, rank
-    results = [
-        (q, len(s[0]), s[1])
-        for q, s in query_stats.items()
-        if len(s[0]) >= 5
-    ]
-    del query_stats
-    results.sort(key=lambda x: (-x[1], -x[2]))
-    print(f"      {len(results):,} queries with 5+ users")
-    return results
+        .filter(pl.col("unique_users") >= 5)
+        .sort(["unique_users", "total_searches"], descending=[True, True])
+        .collect(engine="streaming")
+    )
+    print(f"      {df.height:,} queries with 5+ users")
+    return [(row[0], int(row[1]), int(row[2])) for row in df.iter_rows()]
 
 
 def polars_compute_top_queries(
@@ -1101,18 +1084,30 @@ def polars_compute_query_daily_stats(conn, live_parquet: str, min_live_date: Opt
             conn.commit()
             cursor.close()
 
-    # Bulk insert all rows
+    # Stream insert in chunks directly from polars (no intermediate list)
     print("  Inserting daily stats rows...")
     total_inserted = 0
-    all_values = [
-        (row[0], row[1], int(row[2]), int(row[3]))
-        for row in daily_df.iter_rows()
-    ]
-    del daily_df
-
     insert_chunk_size = 10000
-    for i in range(0, len(all_values), insert_chunk_size):
-        chunk_vals = all_values[i:i + insert_chunk_size]
+    chunk_vals = []
+    for row in daily_df.iter_rows():
+        chunk_vals.append((row[0], row[1], int(row[2]), int(row[3])))
+        if len(chunk_vals) >= insert_chunk_size:
+            cursor = conn.cursor()
+            execute_values(
+                cursor,
+                """INSERT INTO query_daily_stats
+                   (query_normalized, date, search_count, unique_users)
+                   VALUES %s""",
+                chunk_vals,
+                page_size=5000,
+            )
+            conn.commit()
+            cursor.close()
+            total_inserted += len(chunk_vals)
+            chunk_vals = []
+
+    # Flush remainder
+    if chunk_vals:
         cursor = conn.cursor()
         execute_values(
             cursor,
@@ -1126,7 +1121,7 @@ def polars_compute_query_daily_stats(conn, live_parquet: str, min_live_date: Opt
         cursor.close()
         total_inserted += len(chunk_vals)
 
-    del all_values
+    del daily_df
     print(f"  Inserted {total_inserted:,} daily rows total")
     return total_inserted
 
