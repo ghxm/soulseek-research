@@ -786,11 +786,15 @@ def _compute_top_queries_streamed(conn, archive_path: str) -> list:
 
     print(f"      Aggregating {len(parquet_files)} Parquet files via DuckDB...")
     con = duckdb.connect()
-    # Cap memory and spill larger intermediates to the archive volume
-    con.execute("SET memory_limit='6GB'")
-    spill_dir = os.path.join(archive_path, "_duckdb_spill")
+    # Spill to root disk which has more free space than the archive volume.
+    # /tmp is on the root filesystem (cleared on reboot, that's fine).
+    spill_dir = "/tmp/_duckdb_spill"
     os.makedirs(spill_dir, exist_ok=True)
     con.execute(f"SET temp_directory='{spill_dir}'")
+    con.execute("SET memory_limit='6GB'")
+    # Reduce parallelism to lower peak memory; disable ordering for hash-agg speed
+    con.execute("SET threads=4")
+    con.execute("SET preserve_insertion_order=false")
 
     rows = con.execute(
         """
