@@ -772,33 +772,49 @@ def polars_compute_all_summary_stats(
 
 
 def _compute_top_queries_streamed(conn, archive_path: str) -> list:
-    """Compute all_time top queries via polars streaming aggregation.
+    """Compute all_time top queries via DuckDB out-of-core aggregation.
 
-    Scans archived Parquet files + live Parquet, groups by query,
-    counts unique users and sums search_count, filters to 5+ users.
-    Polars streaming engine spills to disk on memory pressure.
+    DuckDB's hash aggregation spills to disk when memory pressure is high,
+    handling the ~39M unique queries × ~328M rows that overflow polars.
     """
-    import polars as pl
+    import duckdb
 
     parquet_files = sorted(glob.glob(os.path.join(archive_path, "daily_tuples_*.parquet")))
     live_pq = os.path.join(archive_path, "_live_tuples.parquet")
     if os.path.exists(live_pq):
         parquet_files.append(live_pq)
 
-    print(f"      Scanning {len(parquet_files)} Parquet files via polars streaming...")
-    df = (
-        pl.scan_parquet(parquet_files)
-        .group_by("query_normalized")
-        .agg(
-            pl.col("username").n_unique().alias("unique_users"),
-            pl.col("search_count").sum().alias("total_searches"),
-        )
-        .filter(pl.col("unique_users") >= 5)
-        .sort(["unique_users", "total_searches"], descending=[True, True])
-        .collect(engine="streaming")
-    )
-    print(f"      {df.height:,} queries with 5+ users")
-    return [(row[0], int(row[1]), int(row[2])) for row in df.iter_rows()]
+    print(f"      Aggregating {len(parquet_files)} Parquet files via DuckDB...")
+    con = duckdb.connect()
+    # Cap memory and spill larger intermediates to the archive volume
+    con.execute("SET memory_limit='6GB'")
+    spill_dir = os.path.join(archive_path, "_duckdb_spill")
+    os.makedirs(spill_dir, exist_ok=True)
+    con.execute(f"SET temp_directory='{spill_dir}'")
+
+    rows = con.execute(
+        """
+        SELECT query_normalized,
+               COUNT(DISTINCT username)::BIGINT AS unique_users,
+               SUM(search_count)::BIGINT AS total_searches
+        FROM read_parquet(?)
+        GROUP BY query_normalized
+        HAVING COUNT(DISTINCT username) >= 5
+        ORDER BY unique_users DESC, total_searches DESC
+        """,
+        [parquet_files],
+    ).fetchall()
+    con.close()
+
+    # Best-effort cleanup of spill dir
+    try:
+        for f in glob.glob(os.path.join(spill_dir, "*")):
+            os.remove(f)
+    except OSError:
+        pass
+
+    print(f"      {len(rows):,} queries with 5+ users")
+    return [(q, int(u), int(t)) for q, u, t in rows]
 
 
 def polars_compute_top_queries(
