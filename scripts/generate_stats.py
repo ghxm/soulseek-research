@@ -89,7 +89,11 @@ def get_db_connection():
         password=user_pass[1] if len(user_pass) > 1 else '',
         dbname=host_db[1],
         connect_timeout=30,
-        options='-c statement_timeout=600000'
+        options='-c statement_timeout=600000',
+        keepalives=1,
+        keepalives_idle=60,
+        keepalives_interval=10,
+        keepalives_count=3,
     )
 
 

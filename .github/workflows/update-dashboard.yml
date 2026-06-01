@@ -35,7 +35,12 @@ jobs:
           echo "$DB_SERVER_SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DB_SERVER_IP" >> ~/.ssh/known_hosts
-          ssh -f -N -L 5432:localhost:5432 root@"$DB_SERVER_IP"
+          ssh -f -N \
+            -o ServerAliveInterval=60 \
+            -o ServerAliveCountMax=3 \
+            -o ExitOnForwardFailure=yes \
+            -o TCPKeepAlive=yes \
+            -L 5432:localhost:5432 root@"$DB_SERVER_IP"
 
       - name: Generate statistics
         env:
