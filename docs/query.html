@@ -64,6 +64,24 @@ query_display: "Query Detail"
     var wasmUrl = baseUrl + '/assets/sqljs/sql-wasm.wasm';
     var configUrl = baseUrl + '/data/queries_all_config.json';
 
+    // sql.js-httpvfs can return either column-name-keyed objects
+    // ([{rank: 3, query: 'x', ...}]) or the raw sql.js shape
+    // ([{columns: ['rank', ...], values: [[3, 'x', ...]]}]). Normalize both
+    // to objects so call sites don't have to care.
+    function rowsToObjects(result) {
+        if (!result || result.length === 0) return [];
+        var first = result[0];
+        if (first && first.columns && Array.isArray(first.values)) {
+            var cols = first.columns;
+            return first.values.map(function(vals) {
+                var obj = {};
+                for (var i = 0; i < cols.length; i++) obj[cols[i]] = vals[i];
+                return obj;
+            });
+        }
+        return result;
+    }
+
     fetch(configUrl)
         .then(function(r) {
             if (!r.ok) throw new Error('Failed to load config (HTTP ' + r.status + ')');
@@ -89,12 +107,16 @@ query_display: "Query Detail"
         return db.exec(
             'SELECT rank, query, unique_users, total_searches FROM queries WHERE slug = ? LIMIT 1',
             [slug]
-        ).then(function(rows) {
-            if (!rows || rows.length === 0) {
+        ).then(function(result) {
+            var rows = rowsToObjects(result);
+            if (rows.length === 0) {
                 showError('Query not found: ' + slug);
                 return;
             }
             var q = rows[0];
+            if (typeof q.rank !== 'number') {
+                throw new Error('Unexpected row shape from queries table: ' + JSON.stringify(q));
+            }
             titleEl.textContent = q.query;
             document.title = q.query + ' - Soulseek Search Monitor';
             return Promise.all([
@@ -108,7 +130,8 @@ query_display: "Query Detail"
         return db.exec(
             'SELECT date, search_count, unique_users FROM query_daily WHERE rank = ? ORDER BY date',
             [q.rank]
-        ).then(function(rows) {
+        ).then(function(result) {
+            var rows = rowsToObjects(result);
             renderStats(q, rows);
             renderChart(rows);
         });
@@ -258,8 +281,9 @@ query_display: "Query Detail"
             + 'FROM query_similar qs JOIN queries q2 ON q2.rank = qs.similar_rank '
             + 'WHERE qs.rank = ? ORDER BY qs.score DESC LIMIT 10',
             [rank]
-        ).then(function(rows) {
-            if (!rows || rows.length === 0) return;
+        ).then(function(result) {
+            var rows = rowsToObjects(result);
+            if (rows.length === 0) return;
             var items = rows.map(function(s) {
                 var name = escapeHtml(s.query);
                 var pct = Math.round(s.score * 100) + '%';
