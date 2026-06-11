@@ -707,7 +707,9 @@ def write_queries_data_file(top_queries: List[tuple], data_file_path: str,
 
 def write_queries_db_file(top_queries: List[tuple], db_dir: str,
                           data_file_id: str,
-                          query_slug_map: Dict[str, str] = None):
+                          query_slug_map: Dict[str, str] = None,
+                          query_daily: Dict[str, List[tuple]] = None,
+                          query_similarities: Dict[str, list] = None):
     """Write query data to a chunked SQLite database for sql.js-httpvfs.
 
     Produces chunk files (queries_{id}.db.000, .001, ...) and a config JSON
@@ -718,6 +720,11 @@ def write_queries_db_file(top_queries: List[tuple], db_dir: str,
         db_dir: Directory to write files into (e.g. 'docs/data')
         data_file_id: Period identifier (e.g. 'all', '2026-01', '2026-W03')
         query_slug_map: Optional dict mapping query_normalized -> slug
+        query_daily: Optional dict query_normalized -> list of (date, search_count, unique_users).
+            When provided, a query_daily table is added (used by /query.html).
+        query_similarities: Optional dict query_normalized -> list of
+            (similar_query, score, shared_users). When provided, a query_similar
+            table is added (used by /query.html).
     """
     import sqlite3 as sqlite3_mod
     import tempfile
@@ -747,11 +754,18 @@ def write_queries_db_file(top_queries: List[tuple], db_dir: str,
             slug TEXT
         )''')
 
+        # Build query -> rank lookup as we insert so the per-query tables below
+        # can use integer foreign keys (smaller + faster than text joins).
+        query_to_rank: Dict[str, int] = {}
         rows = []
         for i, (query, users, searches) in enumerate(top_queries, 1):
             slug = query_slug_map.get(query) if query_slug_map else None
             rows.append((i, query, users, searches, slug))
+            query_to_rank[query] = i
         conn.executemany('INSERT INTO queries VALUES (?, ?, ?, ?, ?)', rows)
+
+        # Slug lookup index (lets /query.html?q=<slug> do an indexed SELECT)
+        conn.execute('CREATE INDEX idx_queries_slug ON queries(slug)')
 
         # Word index for prefix search via B-tree (works with any SQLite build,
         # unlike FTS5 which fails with sql.js-httpvfs's HTTP VFS)
@@ -763,6 +777,48 @@ def write_queries_db_file(top_queries: List[tuple], db_dir: str,
                     word_rows.append((w, i))
         conn.executemany('INSERT INTO word_index VALUES (?, ?)', word_rows)
         conn.execute('CREATE INDEX idx_word ON word_index(word)')
+
+        # Per-query daily stats (for the daily-activity chart on /query.html)
+        if query_daily is not None:
+            conn.execute('''CREATE TABLE query_daily (
+                rank INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                search_count INTEGER NOT NULL,
+                unique_users INTEGER NOT NULL
+            )''')
+            daily_rows = []
+            for query, days in query_daily.items():
+                rank = query_to_rank.get(query)
+                if rank is None:
+                    continue
+                for date_val, sc, uu in days:
+                    date_str = date_val.isoformat() if hasattr(date_val, 'isoformat') else str(date_val)
+                    daily_rows.append((rank, date_str, int(sc), int(uu)))
+            conn.executemany('INSERT INTO query_daily VALUES (?, ?, ?, ?)', daily_rows)
+            conn.execute('CREATE INDEX idx_query_daily_rank ON query_daily(rank)')
+            print(f"      query_daily: {len(daily_rows):,} rows")
+
+        # Per-query similarity edges (for the "users also searched" list on /query.html)
+        if query_similarities is not None:
+            conn.execute('''CREATE TABLE query_similar (
+                rank INTEGER NOT NULL,
+                similar_rank INTEGER NOT NULL,
+                score REAL NOT NULL,
+                shared_users INTEGER NOT NULL
+            )''')
+            sim_rows = []
+            for query, similars in query_similarities.items():
+                rank = query_to_rank.get(query)
+                if rank is None:
+                    continue
+                for sim_query, score, shared_users in similars:
+                    sim_rank = query_to_rank.get(sim_query)
+                    if sim_rank is None:
+                        continue
+                    sim_rows.append((rank, sim_rank, float(score), int(shared_users)))
+            conn.executemany('INSERT INTO query_similar VALUES (?, ?, ?, ?)', sim_rows)
+            conn.execute('CREATE INDEX idx_query_similar_rank ON query_similar(rank)')
+            print(f"      query_similar: {len(sim_rows):,} rows")
 
         conn.commit()
         conn.execute('VACUUM')
@@ -894,7 +950,7 @@ def create_queries_data_table(top_queries: List[tuple], data_json_url: str) -> s
                 var queryEscaped = escapeHtml(query);
                 var slug = slugMap[query];
                 var queryCell = slug
-                    ? '<a href="' + baseUrl + '/queries/' + slug + '.html" class="query-link">' + queryEscaped + '</a>'
+                    ? '<a href="' + baseUrl + '/query.html?q=' + slug + '" class="query-link">' + queryEscaped + '</a>'
                     : queryEscaped;
                 html += '<tr>' +
                     '<td class="rank-col">' + rank + '</td>' +
@@ -1676,7 +1732,7 @@ def build_similar_queries_html(query_norm: str, query_similarities: Dict[str, li
         pct = f"{score * 100:.0f}%"
 
         if sim_slug:
-            link = f'<a href="{{{{ site.baseurl }}}}/queries/{sim_slug}.html">{sim_escaped}</a>'
+            link = f'<a href="{{{{ site.baseurl }}}}/query.html?q={sim_slug}">{sim_escaped}</a>'
         else:
             link = sim_escaped
 
@@ -1849,7 +1905,16 @@ query_display: "{display_escaped}"
 
     print(f"  Generated {count} query pages in docs/queries/")
 
-    # Write search index JSON for lazy-loaded client-side query search
+    write_query_search_index(conn, slug_map, blacklist)
+    return slug_map
+
+
+def write_query_search_index(conn, slug_map: Dict[str, str], blacklist: List[str] = None) -> None:
+    """Write docs/queries/index.json for the nav search-as-you-type box.
+
+    Lists all all-time queries with their unique_users / total_searches. Entries
+    that have a slug get an 's' field so the nav can deep-link to /query.html?q=<slug>.
+    """
     cursor = conn.cursor()
     cursor.execute("""
         SELECT query_normalized, unique_users, total_searches
@@ -1872,12 +1937,11 @@ query_display: "{display_escaped}"
             entry['s'] = slug_map[query_norm]
         search_index.append(entry)
     search_index.sort(key=lambda x: x['u'], reverse=True)
+    os.makedirs('docs/queries', exist_ok=True)
     with open('docs/queries/index.json', 'w', encoding='utf-8') as f:
         json.dump(search_index, f, separators=(',', ':'), ensure_ascii=False)
     page_count = sum(1 for e in search_index if 's' in e)
-    print(f"  Wrote search index ({len(search_index)} queries, {page_count} with pages)")
-
-    return slug_map
+    print(f"  Wrote search index ({len(search_index)} queries, {page_count} with detail pages)")
 
 
 def main():
@@ -1955,11 +2019,69 @@ def main():
         print(f"  {len(eligible_queries)} eligible queries")
         query_similarities = compute_query_similarities(conn, eligible_queries)
 
-        # Generate query detail pages (to get slug map for linking)
+        # Build slug map + SQLite for client-side query detail pages
+        # (replaces the static-HTML generate_query_pages flow; see docs/query.html
+        # which reads ?q=<slug> and queries this SQLite via sql.js-httpvfs)
         print("=" * 60)
-        print("GENERATING QUERY DETAIL PAGES")
+        print("BUILDING QUERY DETAIL SQLITE")
         print("=" * 60)
-        query_slug_map = generate_query_pages(conn, cutoff_date, query_similarities, blacklist)
+        cursor = conn.cursor()
+        if cutoff_date:
+            cursor.execute("""
+                SELECT query_normalized, date, search_count, unique_users
+                FROM query_daily_stats
+                WHERE date <= %s
+                ORDER BY query_normalized, date
+            """, (cutoff_date.date(),))
+        else:
+            cursor.execute("""
+                SELECT query_normalized, date, search_count, unique_users
+                FROM query_daily_stats
+                ORDER BY query_normalized, date
+            """)
+        query_daily: Dict[str, list] = defaultdict(list)
+        for q, d, sc, uu in cursor.fetchall():
+            query_daily[q].append((d, sc, uu))
+        cursor.close()
+        if blacklist:
+            before = len(query_daily)
+            query_daily = {q: v for q, v in query_daily.items()
+                           if not is_blacklisted(q, blacklist)}
+            print(f"  Blacklist removed {before - len(query_daily)} queries from detail data")
+        print(f"  Found daily data for {len(query_daily)} queries")
+
+        # Slug map (needed for in-table hyperlinking on the all-time/period pages
+        # and for the slug column in the SQLite).
+        query_slug_map = {q: slugify_query(q) for q in query_daily}
+
+        # Top queries with 35+ users define which rows go into the SQLite for /query.html.
+        # We pull from period_top_queries (same source generate_query_pages used).
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT query_normalized, unique_users, total_searches
+            FROM period_top_queries
+            WHERE period_type = 'all_time' AND period_id = 'all_time'
+              AND unique_users >= 35
+            ORDER BY unique_users DESC, total_searches DESC
+        """)
+        detail_top_queries = cursor.fetchall()
+        cursor.close()
+        if blacklist:
+            detail_top_queries = [r for r in detail_top_queries
+                                  if not is_blacklisted(r[0], blacklist)]
+        print(f"  {len(detail_top_queries)} queries in SQLite (35+ users)")
+
+        write_queries_db_file(
+            top_queries=detail_top_queries,
+            db_dir='docs/data',
+            data_file_id='all',
+            query_slug_map=query_slug_map,
+            query_daily=query_daily,
+            query_similarities=query_similarities,
+        )
+
+        # Nav search-as-you-type index (small JSON, deep-links into /query.html)
+        write_query_search_index(conn, query_slug_map, blacklist)
 
         # Generate all-time page (uses cumulative stats + materialized views)
         print("=" * 60)

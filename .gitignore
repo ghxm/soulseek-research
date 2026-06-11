@@ -333,3 +333,4 @@ maintenance-*.md
 !/docs/_includes/
 !/docs/_layouts/
 !/docs/assets/
+!/docs/query.html

@@ -144,7 +144,7 @@
         for (var j = 0; j < matches.length; j++) {
             var m = matches[j];
             if (m.s) {
-                html += '<a href="' + baseUrl + '/queries/' + m.s + '.html" class="query-search-item">'
+                html += '<a href="' + baseUrl + '/query.html?q=' + m.s + '" class="query-search-item">'
                     + '<span class="query-search-name">' + escapeHtml(m.q) + '</span>'
                     + '<span class="query-search-meta">'
                     + m.u.toLocaleString() + ' users, '

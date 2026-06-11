@@ -1,0 +1,281 @@
+---
+layout: query
+query_display: "Query Detail"
+---
+
+<div class="breadcrumb">
+    <a href="{{ site.baseurl }}/">All Time</a> / Query Detail
+</div>
+
+<h1 id="q-title">Loading...</h1>
+
+<div id="q-error" style="display:none; padding:20px; background:#fff5f5; border:1px solid #ffd0d0; color:#a04040;"></div>
+
+<div id="q-stats" class="stats-grid"></div>
+
+<h2 id="q-chart-heading" style="display:none;">Daily Search Activity</h2>
+<div id="q-chart" class="chart-container"></div>
+<p id="q-chart-note" style="display:none; font-size: 12px; color: #999; margin-top: 8px;">
+    Unique users are counted per day based on distinct (hashed) usernames. A user searching the same query multiple times in one day counts once for that day. All dates are in UTC.
+</p>
+
+<div id="q-similar"></div>
+
+<div class="back-link">
+    <a href="{{ site.baseurl }}/">Back to dashboard</a>
+</div>
+
+<script src="{{ site.baseurl }}/assets/sqljs/sqljs-httpvfs.js"></script>
+<script>
+(function() {
+    'use strict';
+    var baseUrl = '{{ site.baseurl }}';
+
+    var qParam = (new URLSearchParams(window.location.search).get('q') || '').trim();
+
+    var titleEl = document.getElementById('q-title');
+    var errorEl = document.getElementById('q-error');
+    var statsEl = document.getElementById('q-stats');
+    var chartHeadingEl = document.getElementById('q-chart-heading');
+    var chartEl = document.getElementById('q-chart');
+    var chartNoteEl = document.getElementById('q-chart-note');
+    var similarEl = document.getElementById('q-similar');
+
+    function escapeHtml(s) {
+        return String(s)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+
+    function showError(msg) {
+        titleEl.textContent = 'Query Detail';
+        errorEl.style.display = 'block';
+        errorEl.textContent = msg;
+    }
+
+    if (!qParam) {
+        showError('No query specified. Open this page from a query link or use /query.html?q=<slug>.');
+        return;
+    }
+
+    var workerUrl = baseUrl + '/assets/sqljs/sqlite.worker.js';
+    var wasmUrl = baseUrl + '/assets/sqljs/sql-wasm.wasm';
+    var configUrl = baseUrl + '/data/queries_all_config.json';
+
+    fetch(configUrl)
+        .then(function(r) {
+            if (!r.ok) throw new Error('Failed to load config (HTTP ' + r.status + ')');
+            return r.json();
+        })
+        .then(function(config) {
+            config.urlPrefix = baseUrl + '/data/queries_all.db.';
+            return SqliteHttpvfs.createDbWorker(
+                [{ from: 'inline', config: config }],
+                workerUrl,
+                wasmUrl
+            );
+        })
+        .then(function(worker) {
+            return renderQuery(worker.db, qParam);
+        })
+        .catch(function(err) {
+            showError('Failed to load query data: ' + (err && err.message ? err.message : err));
+            if (window.console) console.error(err);
+        });
+
+    function renderQuery(db, slug) {
+        return db.exec(
+            'SELECT rank, query, unique_users, total_searches FROM queries WHERE slug = ? LIMIT 1',
+            [slug]
+        ).then(function(rows) {
+            if (!rows || rows.length === 0) {
+                showError('Query not found: ' + slug);
+                return;
+            }
+            var q = rows[0];
+            titleEl.textContent = q.query;
+            document.title = q.query + ' - Soulseek Search Monitor';
+            return Promise.all([
+                renderDaily(db, q),
+                renderSimilar(db, q.rank)
+            ]);
+        });
+    }
+
+    function renderDaily(db, q) {
+        return db.exec(
+            'SELECT date, search_count, unique_users FROM query_daily WHERE rank = ? ORDER BY date',
+            [q.rank]
+        ).then(function(rows) {
+            renderStats(q, rows);
+            renderChart(rows);
+        });
+    }
+
+    function renderStats(q, dailyRows) {
+        var firstDate = '-';
+        var lastDate = '-';
+        var activeDays = 0;
+        if (dailyRows && dailyRows.length) {
+            firstDate = dailyRows[0].date;
+            lastDate = dailyRows[dailyRows.length - 1].date;
+            activeDays = dailyRows.length;
+        }
+        var cards = [
+            ['Unique Users', q.unique_users.toLocaleString(), 'All-time unique searchers'],
+            ['Total Searches', q.total_searches.toLocaleString(), 'All-time search events'],
+            ['First Seen', firstDate, ''],
+            ['Last Seen', lastDate, ''],
+            ['Active Days', activeDays.toLocaleString(), 'Days with at least 1 search']
+        ];
+        statsEl.innerHTML = cards.map(function(c) {
+            return '<div class="stat-card">' +
+                '<h3>' + c[0] + '</h3>' +
+                '<div class="value">' + escapeHtml(c[1]) + '</div>' +
+                (c[2] ? '<div class="label">' + c[2] + '</div>' : '') +
+                '</div>';
+        }).join('');
+    }
+
+    function renderChart(rows) {
+        if (!rows || rows.length < 2) {
+            chartEl.innerHTML = '<p style="color: #999;">Not enough data for chart</p>';
+            return;
+        }
+        chartHeadingEl.style.display = '';
+        chartNoteEl.style.display = '';
+        chartEl.innerHTML = buildSvgChart(rows);
+    }
+
+    function buildSvgChart(rows) {
+        var width = 800, height = 320;
+        var padL = 60, padR = 60, padT = 40, padB = 50;
+        var plotW = width - padL - padR;
+        var plotH = height - padT - padB;
+
+        var counts = rows.map(function(r) { return r.search_count; });
+        var users = rows.map(function(r) { return r.unique_users; });
+        var maxCount = Math.max.apply(null, counts) || 1;
+        var maxUsers = Math.max.apply(null, users) || 1;
+        var n = rows.length;
+
+        function xPos(i) { return padL + (i / Math.max(n - 1, 1)) * plotW; }
+        function yCount(v) { return padT + plotH - (v / Math.max(maxCount, 1)) * plotH; }
+        function yUser(v) { return padT + plotH - (v / Math.max(maxUsers, 1)) * plotH; }
+
+        var searchColor = '#333';
+        var userColor = '#b04040';
+
+        var searchPts = rows.map(function(r, i) { return [xPos(i), yCount(r.search_count)]; });
+        var searchLine = 'M ' + searchPts.map(function(p) { return p[0].toFixed(1) + ',' + p[1].toFixed(1); }).join(' L ');
+        var lastP = searchPts[n - 1];
+        var firstP = searchPts[0];
+        var searchArea = searchLine
+            + ' L ' + lastP[0].toFixed(1) + ',' + (padT + plotH).toFixed(1)
+            + ' L ' + firstP[0].toFixed(1) + ',' + (padT + plotH).toFixed(1)
+            + ' Z';
+
+        var userPts = rows.map(function(r, i) { return [xPos(i), yUser(r.unique_users)]; });
+        var userLine = 'M ' + userPts.map(function(p) { return p[0].toFixed(1) + ',' + p[1].toFixed(1); }).join(' L ');
+
+        var months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+        var xLabels = [];
+        var labelCount = Math.min(8, n);
+        for (var i = 0; i < labelCount; i++) {
+            var idx = Math.round(i * (n - 1) / Math.max(labelCount - 1, 1));
+            var dStr = rows[idx].date;
+            var parts = dStr.split('-');
+            var label = (parts.length === 3)
+                ? months[parseInt(parts[1], 10) - 1] + ' ' + parseInt(parts[2], 10)
+                : dStr;
+            xLabels.push(
+                '<text x="' + xPos(idx).toFixed(1) + '" y="' + (height - 5)
+                + '" text-anchor="middle" font-size="11" fill="#999">' + label + '</text>'
+            );
+        }
+
+        var yLabels = [];
+        for (var j = 0; j < 5; j++) {
+            var cv = Math.round(maxCount * j / 4);
+            var cy = yCount(cv);
+            yLabels.push(
+                '<text x="' + (padL - 8) + '" y="' + cy.toFixed(1)
+                + '" text-anchor="end" font-size="11" fill="' + searchColor
+                + '" dominant-baseline="middle">' + cv.toLocaleString() + '</text>'
+            );
+            yLabels.push(
+                '<line x1="' + padL + '" y1="' + cy.toFixed(1)
+                + '" x2="' + (width - padR) + '" y2="' + cy.toFixed(1)
+                + '" stroke="#eee" stroke-width="1"/>'
+            );
+            var uv = Math.round(maxUsers * j / 4);
+            var uy = yUser(uv);
+            yLabels.push(
+                '<text x="' + (width - padR + 8) + '" y="' + uy.toFixed(1)
+                + '" text-anchor="start" font-size="11" fill="' + userColor
+                + '" dominant-baseline="middle">' + uv.toLocaleString() + '</text>'
+            );
+        }
+
+        var legend =
+            '<line x1="' + padL + '" y1="12" x2="' + (padL + 20)
+            + '" y2="12" stroke="' + searchColor + '" stroke-width="2"/>' +
+            '<text x="' + (padL + 25) + '" y="12" font-size="11" fill="' + searchColor
+            + '" dominant-baseline="middle">Searches</text>' +
+            '<line x1="' + (padL + 100) + '" y1="12" x2="' + (padL + 120)
+            + '" y2="12" stroke="' + userColor + '" stroke-width="2" stroke-dasharray="4,3"/>' +
+            '<text x="' + (padL + 125) + '" y="12" font-size="11" fill="' + userColor
+            + '" dominant-baseline="middle">Unique users</text>';
+
+        var hoverCircles = rows.map(function(r, i) {
+            var x = xPos(i);
+            var ys = yCount(r.search_count);
+            return '<circle cx="' + x.toFixed(1) + '" cy="' + ys.toFixed(1)
+                + '" r="8" fill="transparent" style="cursor:pointer">'
+                + '<title>' + r.date + ': ' + r.search_count.toLocaleString()
+                + ' searches, ' + r.unique_users.toLocaleString() + ' unique users</title>'
+                + '</circle>';
+        }).join('');
+
+        return '<svg viewBox="0 0 ' + width + ' ' + height
+            + '" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;max-width:' + width + 'px;">'
+            + legend
+            + yLabels.join('')
+            + '<path d="' + searchArea + '" fill="rgba(51,51,51,0.06)" stroke="none"/>'
+            + '<path d="' + searchLine + '" fill="none" stroke="' + searchColor + '" stroke-width="2"/>'
+            + '<path d="' + userLine + '" fill="none" stroke="' + userColor
+            + '" stroke-width="1.5" stroke-dasharray="4,3"/>'
+            + xLabels.join('')
+            + hoverCircles
+            + '</svg>';
+    }
+
+    function renderSimilar(db, rank) {
+        return db.exec(
+            'SELECT q2.query AS query, q2.slug AS slug, qs.score AS score, qs.shared_users AS shared_users '
+            + 'FROM query_similar qs JOIN queries q2 ON q2.rank = qs.similar_rank '
+            + 'WHERE qs.rank = ? ORDER BY qs.score DESC LIMIT 10',
+            [rank]
+        ).then(function(rows) {
+            if (!rows || rows.length === 0) return;
+            var items = rows.map(function(s) {
+                var name = escapeHtml(s.query);
+                var pct = Math.round(s.score * 100) + '%';
+                var link = s.slug
+                    ? '<a href="' + baseUrl + '/query.html?q=' + encodeURIComponent(s.slug) + '">' + name + '</a>'
+                    : name;
+                return '<li>' + link
+                    + ' <span class="sim-meta">' + pct + ' similar, '
+                    + s.shared_users.toLocaleString() + ' shared users</span></li>';
+            }).join('');
+            similarEl.innerHTML = '<div class="similar-queries">'
+                + '<h2>Users who searched this also searched '
+                + '<span style="font-weight: normal; font-size: 14px; color: #999;">(last 90 days)</span></h2>'
+                + '<ul>' + items + '</ul>'
+                + '</div>';
+        });
+    }
+})();
+</script>
