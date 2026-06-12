@@ -82,13 +82,23 @@ query_display: "Query Detail"
         return result;
     }
 
-    fetch(configUrl)
+    // The chunks are content-addressed (queries_all.<hash>.db.NNN) so
+    // Fastly can never serve a stale chunk for a current URL. The small
+    // config JSON sits at a stable path though, so we must bypass both
+    // browser cache (cache: 'no-store') AND Fastly's edge cache (unique
+    // query string per request) to make sure the bootstrap reflects the
+    // latest build's chunk hash.
+    var configFetchUrl = configUrl + '?t=' + Date.now();
+    fetch(configFetchUrl, { cache: 'no-store' })
         .then(function(r) {
             if (!r.ok) throw new Error('Failed to load config (HTTP ' + r.status + ')');
             return r.json();
         })
         .then(function(config) {
-            config.urlPrefix = baseUrl + '/data/queries_all.db.';
+            // urlPrefix in the config is just the basename of the chunk
+            // files; prepend the site baseUrl + /data/ so fetches resolve
+            // against the GH Pages origin.
+            config.urlPrefix = baseUrl + '/data/' + config.urlPrefix;
             return SqliteHttpvfs.createDbWorker(
                 [{ from: 'inline', config: config }],
                 workerUrl,

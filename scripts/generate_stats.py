@@ -729,12 +729,16 @@ def write_queries_db_file(top_queries: List[tuple], db_dir: str,
     import sqlite3 as sqlite3_mod
     import tempfile
     import glob as glob_mod
+    import hashlib
 
     os.makedirs(db_dir, exist_ok=True)
     prefix = f'queries_{data_file_id}'
 
-    # Remove old chunk files for this period
+    # Remove old chunk files for this period (both un-versioned and
+    # content-versioned filenames from any prior build).
     for old_file in glob_mod.glob(os.path.join(db_dir, f'{prefix}.db.*')):
+        os.remove(old_file)
+    for old_file in glob_mod.glob(os.path.join(db_dir, f'{prefix}.*.db.*')):
         os.remove(old_file)
 
     # Build SQLite in a temp file
@@ -824,17 +828,31 @@ def write_queries_db_file(top_queries: List[tuple], db_dir: str,
         conn.execute('VACUUM')
         conn.close()
 
-        # Split into chunks for GitHub Pages compatibility
-        config = _split_db_file(tmp_path, db_dir, prefix)
+        # Content-address the chunks so a stale Fastly cache entry from a
+        # prior build can never be served for a current-build URL. Without
+        # this the chunk filenames stay constant across nightly rebuilds and
+        # any mismatched edge-cached chunk corrupts the SQLite as seen from
+        # the browser ("database disk image is malformed").
+        hasher = hashlib.sha256()
+        with open(tmp_path, 'rb') as f:
+            for block in iter(lambda: f.read(1024 * 1024), b''):
+                hasher.update(block)
+        version = hasher.hexdigest()[:8]
+        chunk_prefix = f'{prefix}.{version}'
 
-        # Write config JSON for sql.js-httpvfs
+        # Split into chunks for GitHub Pages compatibility
+        config = _split_db_file(tmp_path, db_dir, chunk_prefix)
+
+        # Write config JSON for sql.js-httpvfs. The config sits at a stable
+        # path; query.html fetches it with cache: 'no-store' so the small
+        # bootstrap always picks up the latest chunk version.
         config_path = os.path.join(db_dir, f'{prefix}_config.json')
         with open(config_path, 'w') as f:
             json.dump(config, f, separators=(',', ':'))
 
         db_size = os.path.getsize(tmp_path)
-        n_chunks = len(glob_mod.glob(os.path.join(db_dir, f'{prefix}.db.*')))
-        print(f"  SQLite: {db_size / 1024 / 1024:.1f} MB, {n_chunks} chunks, {len(top_queries):,} rows")
+        n_chunks = len(glob_mod.glob(os.path.join(db_dir, f'{chunk_prefix}.db.*')))
+        print(f"  SQLite: {db_size / 1024 / 1024:.1f} MB, {n_chunks} chunks ({version}), {len(top_queries):,} rows")
     finally:
         os.unlink(tmp_path)
 
