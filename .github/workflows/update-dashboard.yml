@@ -34,7 +34,11 @@ jobs:
           mkdir -p ~/.ssh
           echo "$DB_SERVER_SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H "$DB_SERVER_IP" >> ~/.ssh/known_hosts
+          # Silence stderr so the "# <ip>:22 SSH-<banner>" comment lines
+          # from ssh-keyscan never reach the workflow log. Even with GH's
+          # automatic secret masking, keeping the IP out of the log stream
+          # entirely is safer.
+          ssh-keyscan -H "$DB_SERVER_IP" 2>/dev/null >> ~/.ssh/known_hosts
           ssh -f -N \
             -o ServerAliveInterval=60 \
             -o ServerAliveCountMax=3 \

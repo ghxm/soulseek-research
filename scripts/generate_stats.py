@@ -579,8 +579,20 @@ def create_daily_flow_chart(df: pd.DataFrame) -> go.Figure:
     clients = df['client_id'].unique()
     greys = ['#000000', '#555555', '#999999', '#333333', '#777777']
 
+    # Full calendar range across all clients so days with zero collection
+    # (client outages) render as 0 instead of being visually skipped.
+    dates = pd.to_datetime(df['date'])
+    full_range = pd.date_range(dates.min(), dates.max(), freq='D')
+
     for i, client in enumerate(clients):
-        client_data = df[df['client_id'] == client].sort_values('date')
+        client_data = (
+            df[df['client_id'] == client]
+            .assign(date=lambda d: pd.to_datetime(d['date']))
+            .set_index('date')
+            .reindex(full_range, fill_value=0)
+            .rename_axis('date')
+            .reset_index()
+        )
         fig.add_trace(go.Scatter(
             x=client_data['date'],
             y=client_data['search_count'],
@@ -607,12 +619,20 @@ def create_daily_flow_chart(df: pd.DataFrame) -> go.Figure:
 
 def create_daily_unique_users_chart(df: pd.DataFrame) -> go.Figure:
     """Create line chart showing daily unique users trend"""
-    df_sorted = df.sort_values('date')
+    dates = pd.to_datetime(df['date'])
+    full_range = pd.date_range(dates.min(), dates.max(), freq='D')
+    df_filled = (
+        df.assign(date=lambda d: pd.to_datetime(d['date']))
+        .set_index('date')
+        .reindex(full_range, fill_value=0)
+        .rename_axis('date')
+        .reset_index()
+    )
     fig = go.Figure()
 
     fig.add_trace(go.Scatter(
-        x=df_sorted['date'],
-        y=df_sorted['unique_users'],
+        x=df_filled['date'],
+        y=df_filled['unique_users'],
         mode='lines+markers',
         line=dict(width=3, color='#333333'),
         marker=dict(size=10, color='#333333', line=dict(color='black', width=1)),

@@ -108,6 +108,15 @@ class ResearchClient:
         self._db_retry_count = 0
         self._db_retry_delay = 1.0  # Start with 1 second
         self._max_retry_delay = 300.0  # Max 5 minutes
+
+        # Watchdog: if searches_logged does not advance while DB is healthy,
+        # the incoming stream from the Soulseek network is dead. This has
+        # happened before on server EOF where aioslsk deliberately does not
+        # reconnect, and the SessionDestroyedEvent path did not fire either.
+        # Independent counter check catches it regardless.
+        self._stall_last_logged = 0
+        self._stall_last_change_at = None
+        self._stall_max_seconds = 600  # 10 minutes
     
     def _setup_hashing_salt(self, encryption_key: Optional[str] = None):
         """Setup secret salt for username hashing (prevents reverse-lookup attacks)"""
@@ -244,6 +253,31 @@ class ResearchClient:
                             logger.critical("Disconnected for >5 minutes, exiting for Docker restart")
                             self._running = False
                             break
+
+                    # Stall watchdog: independent of aioslsk events. If DB is
+                    # healthy and no new searches have been logged for
+                    # _stall_max_seconds, the upstream feed is silently dead.
+                    now = asyncio.get_event_loop().time()
+                    if self._db_ready and self._db_retry_count == 0:
+                        if self.searches_logged != self._stall_last_logged:
+                            self._stall_last_logged = self.searches_logged
+                            self._stall_last_change_at = now
+                        elif self._stall_last_change_at is None:
+                            self._stall_last_change_at = now
+                        else:
+                            stalled_secs = now - self._stall_last_change_at
+                            if stalled_secs > self._stall_max_seconds:
+                                logger.critical(
+                                    f"🚨 searches_logged frozen at {self.searches_logged} "
+                                    f"for {stalled_secs:.0f}s while DB is OK. "
+                                    f"Upstream feed appears dead, exiting for Docker restart."
+                                )
+                                self._running = False
+                                break
+                    else:
+                        # Do not accuse a healthy feed of being stalled while
+                        # the DB writer is unhealthy. Reset the timer.
+                        self._stall_last_change_at = None
 
                     # CRITICAL ALERT: If database has been failing for a long time
                     if self._db_retry_count > 10:
