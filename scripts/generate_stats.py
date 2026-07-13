@@ -585,10 +585,13 @@ def create_daily_flow_chart(df: pd.DataFrame) -> go.Figure:
     full_range = pd.date_range(dates.min(), dates.max(), freq='D')
 
     for i, client in enumerate(clients):
+        # Reindex only the numeric column we plot -- client_id would be
+        # a string dtype and fill_value=0 (int) would raise.
         client_data = (
             df[df['client_id'] == client]
             .assign(date=lambda d: pd.to_datetime(d['date']))
             .set_index('date')
+            [['search_count']]
             .reindex(full_range, fill_value=0)
             .rename_axis('date')
             .reset_index()
@@ -624,6 +627,7 @@ def create_daily_unique_users_chart(df: pd.DataFrame) -> go.Figure:
     df_filled = (
         df.assign(date=lambda d: pd.to_datetime(d['date']))
         .set_index('date')
+        [['unique_users']]
         .reindex(full_range, fill_value=0)
         .rename_axis('date')
         .reset_index()
