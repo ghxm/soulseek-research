@@ -95,10 +95,13 @@ query_display: "Query Detail"
             return r.json();
         })
         .then(function(config) {
-            // urlPrefix in the config is just the basename of the chunk
-            // files; prepend the site baseUrl + /data/ so fetches resolve
-            // against the GH Pages origin.
-            config.urlPrefix = baseUrl + '/data/' + config.urlPrefix;
+            // urlPrefix is either an absolute URL (chunks hosted on R2 or
+            // another external Range-request-capable host) or a bare
+            // filename prefix (chunks shipped in the Pages artifact under
+            // /data/). Prepend baseUrl + /data/ only in the latter case.
+            if (!/^https?:\/\//.test(config.urlPrefix)) {
+                config.urlPrefix = baseUrl + '/data/' + config.urlPrefix;
+            }
             return SqliteHttpvfs.createDbWorker(
                 [{ from: 'inline', config: config }],
                 workerUrl,

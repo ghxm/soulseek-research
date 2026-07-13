@@ -52,6 +52,54 @@ jobs:
           QUERY_BLACKLIST: ${{ vars.QUERY_BLACKLIST }}
         run: python -u scripts/generate_stats.py
 
+      - name: Upload query DB chunks to Cloudflare R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_PUBLIC_URL: ${{ vars.R2_PUBLIC_URL }}
+        run: |
+          set -euo pipefail
+          # Only run if the R2 target is configured; otherwise keep chunks
+          # in the Pages artifact (legacy behavior). This lets us disable
+          # R2 for a run by clearing the R2_BUCKET repo variable.
+          if [ -z "$R2_BUCKET" ] || [ -z "$R2_PUBLIC_URL" ]; then
+            echo "R2 not configured, keeping chunks in Pages artifact"
+            exit 0
+          fi
+
+          # aws-cli talks to R2 via the S3-compatible endpoint. Streaming
+          # payload signing is off because R2 does not implement it.
+          ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
+          # Upload all query DB chunks in one sync. Content-addressed
+          # filenames mean old chunks stay valid; new chunks land alongside.
+          # Cache-Control: 1 year (chunks are immutable per content hash).
+          aws s3 sync docs/data/ "s3://${R2_BUCKET}/data/" \
+            --endpoint-url "$ENDPOINT" \
+            --exclude "*" \
+            --include "queries_*.db.*" \
+            --cache-control "public, max-age=31536000, immutable" \
+            --no-progress
+
+          # Rewrite each config JSON so urlPrefix points at R2. We keep
+          # the config in the Pages artifact (small, stable path, cache-
+          # busted by query.html) so the browser can bootstrap without
+          # any cross-origin request until the chunks themselves.
+          python scripts/rewrite_config_urlprefix.py docs/data/queries_*_config.json
+
+          # Remove chunk files from the Pages artifact so they don't
+          # count against the 1 GB cap.
+          find docs/data -type f -name 'queries_*.db.*' -delete
+
+          # Housekeeping: delete R2 chunks that no build in the last
+          # 30 days has referenced. Not implemented yet -- content-
+          # addressed names mean stale versions accumulate silently.
+          # TODO: add lifecycle rule on the bucket (Cloudflare UI) to
+          # expire objects untouched for 30 days.
+
       - name: Configure analytics
         if: vars.GOATCOUNTER_URL != ''
         env:
