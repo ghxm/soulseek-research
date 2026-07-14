@@ -146,8 +146,41 @@ query_display: "Query Detail"
         ).then(function(result) {
             var rows = rowsToObjects(result);
             renderStats(q, rows);
-            renderChart(rows);
+            // query_daily only stores days with >=1 search. The chart must
+            // drop to 0 on inactive days, otherwise adjacent recorded days
+            // get connected across gaps and outages look like activity.
+            renderChart(fillDailyGaps(rows));
         });
+    }
+
+    function fillDailyGaps(rows) {
+        if (!rows || rows.length < 2) return rows;
+        function parseDate(s) {
+            var p = s.split('-');
+            return new Date(Date.UTC(
+                parseInt(p[0], 10),
+                parseInt(p[1], 10) - 1,
+                parseInt(p[2], 10)
+            ));
+        }
+        function formatDate(d) {
+            var m = String(d.getUTCMonth() + 1);
+            var day = String(d.getUTCDate());
+            return d.getUTCFullYear()
+                + '-' + (m.length < 2 ? '0' + m : m)
+                + '-' + (day.length < 2 ? '0' + day : day);
+        }
+        var byDate = {};
+        rows.forEach(function(r) { byDate[r.date] = r; });
+        var filled = [];
+        var cur = parseDate(rows[0].date);
+        var end = parseDate(rows[rows.length - 1].date);
+        while (cur <= end) {
+            var key = formatDate(cur);
+            filled.push(byDate[key] || { date: key, search_count: 0, unique_users: 0 });
+            cur.setUTCDate(cur.getUTCDate() + 1);
+        }
+        return filled;
     }
 
     function renderStats(q, dailyRows) {
