@@ -1614,22 +1614,22 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
 <h2>Summary Statistics</h2>
 {stats_grid}
 
-<h2>User Activity Trends <span style="font-weight: normal; font-size: 14px; color: #999;">(Unique Users per Day)</span></h2>
+<h2>User Activity Trends</h2>
 <div class="chart">
     {chart_html.get('daily_unique_users', '<p>Not enough data</p>')}
 </div>
 
-<h2>Top Search Terms <span style="font-weight: normal; font-size: 14px; color: #999;">(Count once per user)</span> <span class="info-icon" onclick="this.classList.toggle('open')">i<span class="info-tooltip">Queries are ranked by unique users, not raw search count. Only queries with 5 or more unique users are shown. Query detail pages are available for queries with 35 or more unique users.</span></span></h2>
+<h2>Top Search Terms <span class="info-icon" onclick="this.classList.toggle('open')">i<span class="info-tooltip">Ranked by unique searching users. Queries need 5 users to appear here and 35 for a detail page.</span></span></h2>
 <div class="chart">
     {chart_html.get('top_queries', '<p>Not enough data</p>')}
 </div>
 
-<h2>Query Length Distribution <span style="font-weight: normal; font-size: 14px; color: #999;">(Unique Queries)</span></h2>
+<h2>Query Length Distribution</h2>
 <div class="chart">
     {chart_html.get('query_length', '<p>Not enough data</p>')}
 </div>
 
-<h2>Data Collection Overview <span style="font-weight: normal; font-size: 14px; color: #999;">(Raw Counts)</span> <span class="info-icon" onclick="this.classList.toggle('open')">i<span class="info-tooltip">Total search events show the raw count of search requests received by the research client, including duplicate queries by the same user(s). Top queries are ranked by unique users, not raw event count.</span></span></h2>
+<h2>Data Collection Overview <span class="info-icon" onclick="this.classList.toggle('open')">i<span class="info-tooltip">Raw search events, including repeat searches by the same user.</span></span></h2>
 <div class="chart">
     {chart_html['daily_flow']}
 </div>
