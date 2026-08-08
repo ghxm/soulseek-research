@@ -3,6 +3,8 @@
 
 set -e
 
+cd "$(dirname "$0")/../infrastructure"
+
 echo "🚀 Deploying Soulseek Research Infrastructure..."
 
 # Check if terraform.tfvars exists

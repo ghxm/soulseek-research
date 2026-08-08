@@ -7,20 +7,20 @@ install: ## Install package in development mode
 	pip install -e ".[dev]"
 
 test-local: ## Test local setup with Docker
-	@chmod +x scripts/test-local.sh
-	./scripts/test-local.sh
+	@chmod +x ops/test-local.sh
+	./ops/test-local.sh
 
 deploy: ## Deploy production infrastructure 
-	@chmod +x scripts/deploy.sh
-	./scripts/deploy.sh
+	@chmod +x ops/deploy.sh
+	./ops/deploy.sh
 
 monitor: ## Monitor production deployment
-	@chmod +x scripts/monitor.sh
-	./scripts/monitor.sh
+	@chmod +x ops/monitor.sh
+	./ops/monitor.sh
 
 destroy: ## Destroy production infrastructure
-	@chmod +x scripts/destroy.sh
-	./scripts/destroy.sh
+	@chmod +x ops/destroy.sh
+	./ops/destroy.sh
 
 clean: ## Clean up cache and temporary files
 	rm -rf src/soulseek_research/__pycache__/

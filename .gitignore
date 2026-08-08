@@ -322,9 +322,9 @@ tasks/
 
 # Temporary files
 maintenance-*.md
-!/scripts/test-local.sh
-/.terraform.lock.hcl
-/tfplan
+!/ops/test-local.sh
+/infrastructure/.terraform.lock.hcl
+tfplan
 
 # Generated docs (ignore everything except templates and config)
 /docs/*

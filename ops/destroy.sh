@@ -3,6 +3,8 @@
 
 set -e
 
+cd "$(dirname "$0")/../infrastructure"
+
 echo "🛑 Destroying Soulseek Research Infrastructure..."
 
 if [ ! -f "terraform.tfstate" ]; then

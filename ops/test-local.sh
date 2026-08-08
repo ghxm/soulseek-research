@@ -3,6 +3,8 @@
 
 set -e
 
+cd "$(dirname "$0")/.."
+
 echo "🧪 Testing local Soulseek Research setup..."
 
 # Check if Docker is running

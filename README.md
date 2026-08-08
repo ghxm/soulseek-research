@@ -58,7 +58,7 @@ mv_summary_stats        -- Overall summary statistics
 
 ```bash
 # Copy and fill in API tokens and Soulseek credentials
-cp terraform.tfvars.example terraform.tfvars
+cp infrastructure/terraform.tfvars.example infrastructure/terraform.tfvars
 
 # Deploy infrastructure
 make deploy

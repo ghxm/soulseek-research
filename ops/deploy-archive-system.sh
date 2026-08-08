@@ -4,12 +4,14 @@
 
 set -e
 
+cd "$(dirname "$0")/.."
+
 echo "🚀 Deploying Archival System to Database Server"
 echo "================================================"
 
 # Check if we're in the right directory
-if [ ! -f "setup-database.sh" ]; then
-    echo "❌ Error: Must run from /opt/soulseek-research directory"
+if [ ! -f "infrastructure/setup-database.sh" ]; then
+    echo "❌ Error: Must run from a soulseek-research checkout"
     exit 1
 fi
 

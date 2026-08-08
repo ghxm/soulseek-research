@@ -3,6 +3,8 @@
 
 set -e
 
+cd "$(dirname "$0")/../infrastructure"
+
 if [ ! -f "terraform.tfstate" ]; then
     echo "❌ No terraform state found. Deploy infrastructure first."
     exit 1
