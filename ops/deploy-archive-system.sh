@@ -61,9 +61,12 @@ chmod +x /usr/local/bin/weekly-archive.sh
 echo "💾 Backing up cron..."
 crontab -l > /tmp/cron-backup-$(date +%Y%m%d-%H%M%S).txt 2>/dev/null || true
 
-# Update cron
+# Update cron: drop any existing entry for this script, keep every other entry,
+# then append. Safe to re-run.
 echo "⏰ Setting up cron job..."
-echo "0 2 * * 0 /usr/local/bin/weekly-archive.sh" | crontab -
+{ crontab -l 2>/dev/null | grep -Fv '/usr/local/bin/weekly-archive.sh'
+  echo "0 2 * * 0 /usr/local/bin/weekly-archive.sh"
+} | crontab -
 
 echo ""
 echo "✅ Deployment complete!"
