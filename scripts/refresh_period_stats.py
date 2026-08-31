@@ -13,6 +13,7 @@ Two modes:
 import glob
 import os
 import sys
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -540,135 +541,94 @@ def _sql_compute_period_summary(conn, start_date, end_date):
     return (int(row[2]), int(row[3]), int(row[0]), int(row[1]), row[4], row[5])
 
 
-def _polars_compute_summary_split(conn, archive_path: str):
-    """Compute all_time summary stats with minimal peak memory.
+_DUCKDB_SPILL_DIR = "/tmp/_duckdb_spill"
 
-    The full dataset (archived + live, ~56M+ rows) cannot fit in memory on 8GB.
-    Each metric is computed in a separate pass, reading only the columns needed,
-    so memory from the previous pass is freed before the next one starts.
-    Unique pairs use integer hashes instead of string tuples (~700MB vs ~3.6GB).
+
+def _all_time_parquet_files(archive_path: str) -> list:
+    """Archived daily_tuples files plus the live MV snapshot, if present."""
+    files = sorted(glob.glob(os.path.join(archive_path, "daily_tuples_*.parquet")))
+    live_pq = os.path.join(archive_path, "_live_tuples.parquet")
+    if os.path.exists(live_pq):
+        files.append(live_pq)
+    return files
+
+
+@contextmanager
+def _duckdb_session():
+    """DuckDB connection capped at 10 GB RAM and 20 GiB of spill.
+
+    /tmp inside the --rm container is docker overlay storage on the host
+    root disk, which postgres shares. Spill files are removed on exit.
     """
-    import pyarrow.parquet as pq
+    import duckdb
 
-    parquet_files = sorted(glob.glob(os.path.join(archive_path, "daily_tuples_*.parquet")))
-    cursor = conn.cursor()
+    os.makedirs(_DUCKDB_SPILL_DIR, exist_ok=True)
+    con = duckdb.connect()
+    con.execute(f"SET temp_directory='{_DUCKDB_SPILL_DIR}'")
+    con.execute("SET memory_limit='10GB'")
+    con.execute("SET max_temp_directory_size='20GiB'")
+    con.execute("SET threads=4")
+    con.execute("SET preserve_insertion_order=false")
+    try:
+        yield con
+    finally:
+        con.close()
+        for f in glob.glob(os.path.join(_DUCKDB_SPILL_DIR, "*")):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
 
-    # Pass 1: total_searches, first_date, last_date (minimal memory)
-    print("    Pass 1: total_searches, date range...")
-    total_searches = 0
-    first_date = None
-    last_date = None
-    for pf in parquet_files:
-        pf_reader = pq.ParquetFile(pf)
-        for batch in pf_reader.iter_batches(batch_size=500_000, columns=["date", "search_count"]):
-            import pyarrow.compute as pc
-            total_searches += pc.sum(batch.column("search_count")).as_py()
-            d_min = pc.min(batch.column("date")).as_py()
-            d_max = pc.max(batch.column("date")).as_py()
-            if first_date is None or d_min < first_date:
-                first_date = d_min
-            if last_date is None or d_max > last_date:
-                last_date = d_max
-            del batch
-        del pf_reader
-    cursor.execute("SELECT SUM(search_count), MIN(date), MAX(date) FROM mv_daily_search_tuples")
-    mv_sum, mv_min, mv_max = cursor.fetchone()
-    if mv_sum:
-        total_searches += mv_sum
-        if first_date is None or mv_min < first_date:
-            first_date = mv_min
-        if last_date is None or mv_max > last_date:
-            last_date = mv_max
 
-    if total_searches == 0:
-        cursor.close()
+def _compute_summary_streamed(archive_path: str):
+    """Compute all_time summary stats via DuckDB out-of-core aggregation.
+
+    Unique queries are counted exactly. Unique pairs are counted over
+    64-bit hashes so the distinct table holds integers rather than
+    string pairs; both spill to disk when they outgrow the memory cap.
+    """
+    parquet_files = _all_time_parquet_files(archive_path)
+    if not parquet_files:
         return None
-    print(f"      {total_searches:,} searches, {first_date} to {last_date}")
 
-    # Pass 2: unique users
-    print("    Pass 2: unique users...")
-    unique_users = set()
-    for pf in parquet_files:
-        pf_reader = pq.ParquetFile(pf)
-        for batch in pf_reader.iter_batches(batch_size=500_000, columns=["username"]):
-            unique_users.update(batch.column("username").to_pylist())
-            del batch
-        del pf_reader
-    cursor.execute("SELECT DISTINCT username FROM mv_daily_search_tuples")
-    for row in cursor:
-        unique_users.add(row[0])
-    n_users = len(unique_users)
-    del unique_users
-    print(f"      {n_users:,} unique users")
+    with _duckdb_session() as con:
+        print("    Pass 1: total_searches, date range...")
+        total_searches, first_date, last_date = con.execute(
+            "SELECT SUM(search_count), MIN(date), MAX(date) FROM read_parquet(?)",
+            [parquet_files],
+        ).fetchone()
+        if not total_searches:
+            return None
+        print(f"      {total_searches:,} searches, {first_date} to {last_date}")
 
-    # Pass 3: unique queries (hash-based to save memory on ~20M strings)
-    print("    Pass 3: unique queries...")
-    query_hashes = set()
-    for pf in parquet_files:
-        pf_reader = pq.ParquetFile(pf)
-        for batch in pf_reader.iter_batches(
-            batch_size=500_000, columns=["query_normalized"]
-        ):
-            for q in batch.column("query_normalized").to_pylist():
-                query_hashes.add(hash(q))
-            del batch
-        del pf_reader
-    mv_cursor = conn.cursor(name="alltime_queries_cursor")
-    mv_cursor.itersize = 500_000
-    mv_cursor.execute("SELECT DISTINCT query_normalized FROM mv_daily_search_tuples")
-    while True:
-        rows = mv_cursor.fetchmany(mv_cursor.itersize)
-        if not rows:
-            break
-        for row in rows:
-            query_hashes.add(hash(row[0]))
-        del rows
-    mv_cursor.close()
-    n_queries = len(query_hashes)
-    del query_hashes
-    print(f"      {n_queries:,} unique queries")
+        print("    Pass 2: unique users...")
+        n_users = con.execute(
+            "SELECT COUNT(*) FROM (SELECT DISTINCT username FROM read_parquet(?))",
+            [parquet_files],
+        ).fetchone()[0]
+        print(f"      {n_users:,} unique users")
 
-    # Pass 4: unique pairs (hash-based, streamed in batches)
-    print("    Pass 4: unique pairs (hash-based)...")
-    pair_hashes = set()
-    for pf in parquet_files:
-        print(f"      Scanning {os.path.basename(pf)}...")
-        pf_reader = pq.ParquetFile(pf)
-        for batch in pf_reader.iter_batches(
-            batch_size=500_000, columns=["username", "query_normalized"]
-        ):
-            users_col = batch.column("username").to_pylist()
-            queries_col = batch.column("query_normalized").to_pylist()
-            for u, q in zip(users_col, queries_col):
-                pair_hashes.add(hash((u, q)))
-            del users_col, queries_col, batch
-        del pf_reader
-        print(f"        {len(pair_hashes):,} unique pair hashes so far")
-    # Live MV pairs via server-side cursor
-    mv_cursor = conn.cursor(name="alltime_pairs_cursor")
-    mv_cursor.itersize = 500_000
-    mv_cursor.execute(
-        "SELECT DISTINCT username, query_normalized FROM mv_daily_search_tuples"
-    )
-    while True:
-        rows = mv_cursor.fetchmany(mv_cursor.itersize)
-        if not rows:
-            break
-        for u, q in rows:
-            pair_hashes.add(hash((u, q)))
-        del rows
-    mv_cursor.close()
-    n_pairs = len(pair_hashes)
-    del pair_hashes
-    print(f"      {n_pairs:,} unique pairs")
+        print("    Pass 3: unique queries...")
+        n_queries = con.execute(
+            "SELECT COUNT(*) FROM ("
+            "  SELECT DISTINCT query_normalized FROM read_parquet(?))",
+            [parquet_files],
+        ).fetchone()[0]
+        print(f"      {n_queries:,} unique queries")
 
-    cursor.close()
+        print("    Pass 4: unique pairs...")
+        n_pairs = con.execute(
+            "SELECT COUNT(*) FROM ("
+            "  SELECT DISTINCT hash(username, query_normalized) FROM read_parquet(?))",
+            [parquet_files],
+        ).fetchone()[0]
+        print(f"      {n_pairs:,} unique pairs")
 
     print(f"    Final: {n_users:,} users, {n_queries:,} queries, "
           f"{n_pairs:,} pairs, {total_searches:,} searches")
 
-    return (n_queries, n_pairs, int(total_searches),
-            n_users, first_date, last_date)
+    return (int(n_queries), int(n_pairs), int(total_searches),
+            int(n_users), first_date, last_date)
 
 
 def polars_compute_all_summary_stats(
@@ -685,9 +645,8 @@ def polars_compute_all_summary_stats(
         start = datetime.now(timezone.utc)
 
         if period_type == 'all_time':
-            # Process files individually to avoid OOM on 8GB server
             archive_path = os.environ.get('ARCHIVE_PATH', '/archives')
-            row = _polars_compute_summary_split(conn, archive_path)
+            row = _compute_summary_streamed(archive_path)
             if row is None:
                 elapsed = (datetime.now(timezone.utc) - start).total_seconds()
                 print(f"    No data for this period ({elapsed:.1f}s)")
@@ -774,57 +733,43 @@ def polars_compute_all_summary_stats(
 def _compute_top_queries_streamed(conn, archive_path: str) -> list:
     """Compute all_time top queries via DuckDB out-of-core aggregation.
 
-    DuckDB's hash aggregation spills to disk when memory pressure is high,
-    handling the ~39M unique queries × ~328M rows that overflow polars.
+    (query, user) pairs are deduplicated on 64-bit hashes so the spilled
+    intermediate holds three integers per pair instead of two strings.
+    Query strings are joined back only for queries with 5+ users.
     """
-    import duckdb
-
-    parquet_files = sorted(glob.glob(os.path.join(archive_path, "daily_tuples_*.parquet")))
-    live_pq = os.path.join(archive_path, "_live_tuples.parquet")
-    if os.path.exists(live_pq):
-        parquet_files.append(live_pq)
-
+    parquet_files = _all_time_parquet_files(archive_path)
     print(f"      Aggregating {len(parquet_files)} Parquet files via DuckDB...")
-    con = duckdb.connect()
-    # Spill to root disk (72GB free post-upgrade). /tmp inside the --rm
-    # container writes to docker overlay storage on the host root disk.
-    spill_dir = "/tmp/_duckdb_spill"
-    os.makedirs(spill_dir, exist_ok=True)
-    con.execute(f"SET temp_directory='{spill_dir}'")
-    con.execute("SET memory_limit='10GB'")
-    con.execute("SET threads=4")
-    con.execute("SET preserve_insertion_order=false")
 
-    # Two-pass aggregation: inner deduplicates (query, user) pairs into a
-    # streamable intermediate; outer counts rows per query. DuckDB spills
-    # the intermediate to disk readily, unlike per-group COUNT(DISTINCT)
-    # which holds a hash set per group in memory.
-    rows = con.execute(
-        """
-        WITH pair_totals AS (
-            SELECT query_normalized, username,
-                   SUM(search_count) AS user_searches
-            FROM read_parquet(?)
-            GROUP BY query_normalized, username
-        )
-        SELECT query_normalized,
-               COUNT(*)::BIGINT AS unique_users,
-               SUM(user_searches)::BIGINT AS total_searches
-        FROM pair_totals
-        GROUP BY query_normalized
-        HAVING COUNT(*) >= 5
-        ORDER BY unique_users DESC, total_searches DESC
-        """,
-        [parquet_files],
-    ).fetchall()
-    con.close()
-
-    # Best-effort cleanup of spill dir
-    try:
-        for f in glob.glob(os.path.join(spill_dir, "*")):
-            os.remove(f)
-    except OSError:
-        pass
+    with _duckdb_session() as con:
+        rows = con.execute(
+            """
+            WITH pairs AS (
+                SELECT hash(query_normalized) AS qh, hash(username) AS uh,
+                       SUM(search_count) AS user_searches
+                FROM read_parquet(?)
+                GROUP BY qh, uh
+            ),
+            agg AS (
+                SELECT qh,
+                       COUNT(*)::BIGINT AS unique_users,
+                       SUM(user_searches)::BIGINT AS total_searches
+                FROM pairs
+                GROUP BY qh
+                HAVING COUNT(*) >= 5
+            ),
+            names AS (
+                SELECT hash(query_normalized) AS qh,
+                       any_value(query_normalized) AS query_normalized
+                FROM read_parquet(?)
+                WHERE hash(query_normalized) IN (SELECT qh FROM agg)
+                GROUP BY qh
+            )
+            SELECT names.query_normalized, agg.unique_users, agg.total_searches
+            FROM agg JOIN names USING (qh)
+            ORDER BY unique_users DESC, total_searches DESC
+            """,
+            [parquet_files, parquet_files],
+        ).fetchall()
 
     print(f"      {len(rows):,} queries with 5+ users")
     return [(q, int(u), int(t)) for q, u, t in rows]
