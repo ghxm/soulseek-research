@@ -128,10 +128,10 @@ resource "hcloud_server" "client" {
   }
 }
 
-# Archive Volume (50 GB, for Parquet archives)
+# Archive Volume (100 GB, for Parquet archives)
 resource "hcloud_volume" "archive" {
   name      = "soulseek-archive"
-  size      = 50
+  size      = 100
   server_id = hcloud_server.database.id
   automount = true
   format    = "ext4"
