@@ -101,7 +101,8 @@ def prune_user_query_pairs(conn) -> int:
     conn.commit()
     old_isolation = conn.isolation_level
     conn.set_isolation_level(0)  # autocommit for VACUUM
-    cursor.execute("VACUUM user_query_pairs")
+    # PARALLEL 0: a parallel vacuum needs more /dev/shm than the DB container has (64 MB)
+    cursor.execute("VACUUM (PARALLEL 0) user_query_pairs")
     conn.set_isolation_level(old_isolation)
     cursor.close()
     print(f"Pruned {deleted:,} user-query pairs older than 90 days")
