@@ -212,10 +212,15 @@ docker run --rm \
   -e DELETE_AFTER_ARCHIVE=true \
   -e PYTHONUNBUFFERED=1 \
   soulseek-research:latest \
-  uv run python /app/scripts/archive.py
+  uv run python /app/scripts/archive.py \
+  >> /var/log/soulseek-archive-output.log 2>&1
+EXIT_CODE=$?
 
-# Log the result
-echo "$(date): Weekly archive completed" >> /var/log/soulseek-archive.log
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "$(date): Weekly archive completed" >> /var/log/soulseek-archive.log
+else
+    echo "$(date): Weekly archive FAILED (exit code $EXIT_CODE)" >> /var/log/soulseek-archive.log
+fi
 ARCHIVE_SCRIPT
 
 chmod +x /usr/local/bin/weekly-archive.sh
