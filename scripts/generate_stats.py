@@ -97,6 +97,20 @@ def get_db_connection():
     )
 
 
+# Daily stats per client: archived rows win, live rows fill only days that
+# have no archived row yet (the two overlap between archival and MV refresh).
+DAILY_STATS_SQL = """
+    SELECT client_id, date, search_count, unique_users FROM daily_client_stats
+    UNION ALL
+    SELECT m.client_id, m.date, m.search_count, m.unique_users
+    FROM mv_daily_stats m
+    WHERE NOT EXISTS (
+        SELECT 1 FROM daily_client_stats d
+        WHERE d.client_id = m.client_id AND d.date = m.date
+    )
+"""
+
+
 def get_cumulative_stats(conn) -> Dict[str, Any]:
     """Get all-time stats from precomputed period_summary_stats."""
     cursor = conn.cursor()
@@ -125,13 +139,9 @@ def get_cumulative_stats(conn) -> Dict[str, Any]:
     total_searches, total_users, total_queries, total_pairs, first_date, last_date = row
 
     # Client totals: union archived + live daily client stats
-    cursor.execute("""
+    cursor.execute(f"""
         SELECT client_id, SUM(search_count)::bigint
-        FROM (
-            SELECT client_id, search_count FROM daily_client_stats
-            UNION ALL
-            SELECT client_id, search_count FROM mv_daily_stats
-        ) combined
+        FROM ({DAILY_STATS_SQL}) combined
         GROUP BY client_id
     """)
     client_totals = {r[0]: int(r[1]) for r in cursor.fetchall()}
@@ -163,11 +173,7 @@ def get_daily_stats(conn, start_date=None, end_date=None) -> pd.DataFrame:
     """Get daily stats from archived + live data, optionally filtered by date range"""
     cursor = conn.cursor()
 
-    base_query = """
-        SELECT client_id, date, search_count, unique_users FROM daily_client_stats
-        UNION ALL
-        SELECT client_id, date, search_count, unique_users FROM mv_daily_stats
-    """
+    base_query = DAILY_STATS_SQL
 
     if start_date and end_date:
         cursor.execute(f"""
@@ -203,11 +209,7 @@ def get_daily_unique_users(conn, start_date=None, end_date=None) -> pd.DataFrame
     """Get daily unique users from archived + live data (approximation - max across clients per day)"""
     cursor = conn.cursor()
 
-    base_query = """
-        SELECT client_id, date, search_count, unique_users FROM daily_client_stats
-        UNION ALL
-        SELECT client_id, date, search_count, unique_users FROM mv_daily_stats
-    """
+    base_query = DAILY_STATS_SQL
 
     if start_date and end_date:
         cursor.execute(f"""
@@ -278,11 +280,7 @@ def get_period_stats(conn, start_date, end_date, period_type: str = None, period
     """Get stats for a specific period using archived + live daily stats"""
     cursor = conn.cursor()
 
-    base_query = """
-        SELECT client_id, date, search_count, unique_users FROM daily_client_stats
-        UNION ALL
-        SELECT client_id, date, search_count, unique_users FROM mv_daily_stats
-    """
+    base_query = DAILY_STATS_SQL
 
     # Use archived + live daily stats for fast aggregation
     cursor.execute(f"""
