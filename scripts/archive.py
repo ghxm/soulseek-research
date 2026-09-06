@@ -90,6 +90,24 @@ def populate_user_query_pairs(conn, month: str = None):
     return inserted
 
 
+def prune_user_query_pairs(conn) -> int:
+    """Delete pairs older than the 90-day window generate_stats.py reads, then VACUUM."""
+    cursor = conn.cursor()
+    cursor.execute("""
+        DELETE FROM user_query_pairs
+        WHERE last_seen < CURRENT_DATE - INTERVAL '90 days'
+    """)
+    deleted = cursor.rowcount
+    conn.commit()
+    old_isolation = conn.isolation_level
+    conn.set_isolation_level(0)  # autocommit for VACUUM
+    cursor.execute("VACUUM user_query_pairs")
+    conn.set_isolation_level(old_isolation)
+    cursor.close()
+    print(f"Pruned {deleted:,} user-query pairs older than 90 days")
+    return deleted
+
+
 def get_months_to_archive(conn) -> List[str]:
     """
     Find months that are complete and ready to archive.
@@ -424,6 +442,8 @@ def main():
         # Ensure persistent user-query pairs table exists
         ensure_user_query_pairs_table(conn)
         # Per-month seeding happens in archive_month() before each deletion
+        if delete_after:
+            prune_user_query_pairs(conn)
 
         # Find completed months to archive
         months = get_months_to_archive(conn)
