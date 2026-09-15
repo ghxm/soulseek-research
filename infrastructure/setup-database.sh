@@ -258,6 +258,7 @@ DB_URL="postgresql://soulseek:$(grep DB_PASSWORD .env | cut -d= -f2)@localhost:5
 
 # Run period stats refresh using Docker, capturing output
 docker run --rm \
+  --memory=12g \
   --network=host \
   -v /opt/archives:/archives \
   -e DATABASE_URL="$DB_URL" \

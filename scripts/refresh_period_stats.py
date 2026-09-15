@@ -1101,6 +1101,212 @@ def polars_compute_query_daily_stats(conn, live_parquet: str, min_live_date: Opt
 
 
 # ---------------------------------------------------------------------------
+# Query similarities (user co-occurrence)
+# ---------------------------------------------------------------------------
+
+def compute_query_similarities(conn, eligible_queries: set, top_n: int = 20,
+                                min_shared_users: int = 5) -> Dict[str, list]:
+    """Compute cosine similarity between queries based on user co-occurrence.
+
+    Builds a binary user-query co-occurrence matrix and computes cosine
+    similarity in chunks to stay within memory budget.
+
+    Args:
+        conn: Database connection
+        eligible_queries: Set of query_normalized strings to include
+        top_n: Number of most similar queries to return per query
+        min_shared_users: Minimum shared users to include a pair
+
+    Returns:
+        Dict mapping query_normalized -> [(similar_query, score, shared_users), ...]
+    """
+    import time
+    import numpy as np
+    from scipy.sparse import csr_matrix
+    from sklearn.metrics.pairwise import cosine_similarity
+    t0 = time.time()
+    print("  Loading user-query pairs from database...")
+
+    # Build index mappings and sparse matrix data in a single pass
+    query_to_idx = {}
+    user_to_idx = {}
+    rows, cols = [], []
+
+    cursor = conn.cursor('similarity_cursor')
+    cursor.itersize = 50000
+    cursor.execute("""
+        SELECT username, query_normalized
+        FROM user_query_pairs
+        WHERE query_normalized = ANY(%s)
+          AND last_seen >= CURRENT_DATE - INTERVAL '90 days'
+    """, (list(eligible_queries),))
+
+    for username, query_norm in cursor:
+        if query_norm not in query_to_idx:
+            query_to_idx[query_norm] = len(query_to_idx)
+        if username not in user_to_idx:
+            user_to_idx[username] = len(user_to_idx)
+        rows.append(query_to_idx[query_norm])
+        cols.append(user_to_idx[username])
+
+    cursor.close()
+
+    n_queries = len(query_to_idx)
+    n_users = len(user_to_idx)
+    print(f"  Built index: {n_queries} queries x {n_users} users, {len(rows)} pairs "
+          f"({time.time() - t0:.1f}s)")
+
+    if n_queries < 2:
+        return {}
+
+    # Build sparse binary matrix (queries x users)
+    data = np.ones(len(rows), dtype=np.float32)
+    matrix = csr_matrix((data, (rows, cols)), shape=(n_queries, n_users))
+
+    # Reverse mapping for output
+    idx_to_query = {idx: q for q, idx in query_to_idx.items()}
+
+    # Compute similarities in chunks
+    chunk_size = 500
+    similarities = {}
+
+    for start in range(0, n_queries, chunk_size):
+        end = min(start + chunk_size, n_queries)
+        chunk = matrix[start:end]
+
+        # Cosine similarity: chunk (500 x users) vs full matrix (queries x users)
+        sim_chunk = cosine_similarity(chunk, matrix)
+
+        # Shared user counts: dot product of binary matrices
+        shared_chunk = (chunk @ matrix.T).toarray()
+
+        for i in range(end - start):
+            global_idx = start + i
+            query = idx_to_query[global_idx]
+
+            # Zero out self-similarity
+            sim_chunk[i, global_idx] = 0.0
+
+            # Filter by min shared users
+            valid_mask = shared_chunk[i] >= min_shared_users
+            if not valid_mask.any():
+                continue
+
+            # Get top-N from valid entries
+            valid_indices = np.where(valid_mask)[0]
+            scores = sim_chunk[i, valid_indices]
+
+            if len(valid_indices) <= top_n:
+                top_local = np.argsort(-scores)
+            else:
+                top_local = np.argpartition(-scores, top_n)[:top_n]
+                top_local = top_local[np.argsort(-scores[top_local])]
+
+            result = []
+            for li in top_local:
+                gi = valid_indices[li]
+                score = float(scores[li])
+                if score <= 0:
+                    continue
+                result.append((idx_to_query[gi], score, int(shared_chunk[i, gi])))
+            if result:
+                similarities[query] = result
+
+        if end % 2000 == 0 or end == n_queries:
+            print(f"  Similarity progress: {end}/{n_queries} queries ({time.time() - t0:.1f}s)")
+
+    print(f"  Computed similarities for {len(similarities)} queries ({time.time() - t0:.1f}s)")
+    return similarities
+
+
+def ensure_query_similarities_tables(conn):
+    """Create the query similarity result tables if they don't exist."""
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS query_similarities (
+            query_normalized TEXT NOT NULL,
+            similar_query TEXT NOT NULL,
+            score DOUBLE PRECISION NOT NULL,
+            shared_users INTEGER NOT NULL,
+            PRIMARY KEY (query_normalized, similar_query)
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS query_similarities_meta (
+            id INTEGER PRIMARY KEY,
+            computed_at TIMESTAMPTZ NOT NULL,
+            pairs_from_month TEXT,
+            pairs_to_month TEXT,
+            n_queries INTEGER,
+            n_rows INTEGER
+        )
+    """)
+    conn.commit()
+    cursor.close()
+
+
+def refresh_query_similarities(conn):
+    """Recompute query similarities from user_query_pairs and store them.
+
+    Eligible queries are those in query_daily_stats (35+ users). The new result
+    replaces the previous one in one transaction; an empty result keeps the old
+    rows. The dashboard workflow applies the query blacklist when it reads them.
+    """
+    ensure_query_similarities_tables(conn)
+    t0 = datetime.now(timezone.utc)
+
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT query_normalized FROM query_daily_stats")
+    eligible_queries = {row[0] for row in cursor.fetchall()}
+    cursor.close()
+    print(f"  {len(eligible_queries)} eligible queries")
+
+    similarities = compute_query_similarities(conn, eligible_queries)
+    if not similarities:
+        print("  WARNING: no similarities computed, keeping previous results")
+        return 0
+
+    # Months whose pairs fall inside the 90-day last_seen window used above
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT MIN(month), MAX(month) FROM archives
+        WHERE deleted AND archived_at::date >= CURRENT_DATE - 90
+    """)
+    pairs_from_month, pairs_to_month = cursor.fetchone()
+
+    n_rows = sum(len(sims) for sims in similarities.values())
+    rows = ((query, sim_query, score, shared_users)
+            for query, sims in similarities.items()
+            for sim_query, score, shared_users in sims)
+    cursor.execute("TRUNCATE query_similarities")
+    execute_values(cursor, """
+        INSERT INTO query_similarities (query_normalized, similar_query, score, shared_users)
+        VALUES %s
+    """, rows, page_size=5000)
+    cursor.execute("""
+        INSERT INTO query_similarities_meta
+            (id, computed_at, pairs_from_month, pairs_to_month, n_queries, n_rows)
+        VALUES (1, %s, %s, %s, %s, %s)
+        ON CONFLICT (id) DO UPDATE SET
+            computed_at = EXCLUDED.computed_at,
+            pairs_from_month = EXCLUDED.pairs_from_month,
+            pairs_to_month = EXCLUDED.pairs_to_month,
+            n_queries = EXCLUDED.n_queries,
+            n_rows = EXCLUDED.n_rows
+    """, (datetime.now(timezone.utc), pairs_from_month, pairs_to_month,
+          len(similarities), n_rows))
+    conn.commit()
+    cursor.execute("ANALYZE query_similarities")
+    conn.commit()
+    cursor.close()
+
+    elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
+    print(f"  Stored {n_rows:,} similarity rows for {len(similarities):,} queries "
+          f"(pairs from {pairs_from_month} to {pairs_to_month}) in {elapsed:.1f}s")
+    return n_rows
+
+
+# ---------------------------------------------------------------------------
 # Main orchestration
 # ---------------------------------------------------------------------------
 
@@ -1214,41 +1420,51 @@ def refresh_period_stats(conn):
 def main():
     """Main execution"""
     skip_periods = '--daily-stats-only' in sys.argv
+    similarity_only = '--similarity-only' in sys.argv
     print(f"Starting period stats refresh at {datetime.now(timezone.utc).isoformat()}")
     if skip_periods:
         print("  (--daily-stats-only: skipping period stats, running query_daily_stats only)")
+    if similarity_only:
+        print("  (--similarity-only: running query similarities only)")
     print("=" * 60)
 
     try:
         conn = get_db_connection()
-        archive_path = os.environ.get('ARCHIVE_PATH', '/archives')
-        use_polars = has_archived_parquet(archive_path)
-        live_parquet = os.path.join(archive_path, "_live_tuples.parquet")
 
-        if not skip_periods:
-            min_live_date, use_polars, live_parquet = refresh_period_stats(conn)
-        else:
-            min_live_date = get_min_live_date(conn)
-            # Ensure live Parquet exists for query_daily_stats
-            if use_polars and not os.path.exists(live_parquet):
-                print("  Exporting live MV to temp Parquet for daily stats...")
-                _export_live_to_parquet(conn, live_parquet)
+        if not similarity_only:
+            archive_path = os.environ.get('ARCHIVE_PATH', '/archives')
+            use_polars = has_archived_parquet(archive_path)
+            live_parquet = os.path.join(archive_path, "_live_tuples.parquet")
+
+            if not skip_periods:
+                min_live_date, use_polars, live_parquet = refresh_period_stats(conn)
+            else:
+                min_live_date = get_min_live_date(conn)
+                # Ensure live Parquet exists for query_daily_stats
+                if use_polars and not os.path.exists(live_parquet):
+                    print("  Exporting live MV to temp Parquet for daily stats...")
+                    _export_live_to_parquet(conn, live_parquet)
+
+            print("\n" + "=" * 60)
+            print("COMPUTING QUERY DAILY STATS")
+            print("=" * 60)
+            t0 = datetime.now(timezone.utc)
+            if use_polars:
+                total_daily = polars_compute_query_daily_stats(conn, live_parquet, min_live_date)
+            else:
+                total_daily = sql_compute_query_daily_stats(conn, min_live_date)
+            elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
+            print(f"  Query daily stats: {total_daily} rows in {elapsed:.1f}s")
+
+            # Clean up temp live Parquet file after all computations
+            if live_parquet and os.path.exists(live_parquet):
+                os.remove(live_parquet)
+                print(f"  Cleaned up temp file: {live_parquet}")
 
         print("\n" + "=" * 60)
-        print("COMPUTING QUERY DAILY STATS")
+        print("COMPUTING QUERY SIMILARITIES")
         print("=" * 60)
-        t0 = datetime.now(timezone.utc)
-        if use_polars:
-            total_daily = polars_compute_query_daily_stats(conn, live_parquet, min_live_date)
-        else:
-            total_daily = sql_compute_query_daily_stats(conn, min_live_date)
-        elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
-        print(f"  Query daily stats: {total_daily} rows in {elapsed:.1f}s")
-
-        # Clean up temp live Parquet file after all computations
-        if live_parquet and os.path.exists(live_parquet):
-            os.remove(live_parquet)
-            print(f"  Cleaned up temp file: {live_parquet}")
+        refresh_query_similarities(conn)
 
         conn.close()
 
@@ -1261,7 +1477,6 @@ def main():
         import traceback
         traceback.print_exc()
         return 1
-
 
 if __name__ == '__main__':
     sys.exit(main())
