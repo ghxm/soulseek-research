@@ -13,14 +13,11 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 
-import numpy as np
 import psycopg2
 import pandas as pd
 import plotly.graph_objects as go
 import mistune
 import yaml
-from scipy.sparse import csr_matrix
-from sklearn.metrics.pairwise import cosine_similarity
 
 
 def format_days(first_search_str, last_search_str):
@@ -731,7 +728,8 @@ def write_queries_db_file(top_queries: List[tuple], db_dir: str,
                           data_file_id: str,
                           query_slug_map: Dict[str, str] = None,
                           query_daily: Dict[str, List[tuple]] = None,
-                          query_similarities: Dict[str, list] = None):
+                          query_similarities: Dict[str, list] = None,
+                          similarity_note: str = None):
     """Write query data to a chunked SQLite database for sql.js-httpvfs.
 
     Produces chunk files (queries_{id}.db.000, .001, ...) and a config JSON
@@ -747,6 +745,8 @@ def write_queries_db_file(top_queries: List[tuple], db_dir: str,
         query_similarities: Optional dict query_normalized -> list of
             (similar_query, score, shared_users). When provided, a query_similar
             table is added (used by /query.html).
+        similarity_note: Optional text shown above the similar-queries list
+            (data coverage and computation date), shipped in the config JSON.
     """
     import sqlite3 as sqlite3_mod
     import tempfile
@@ -864,6 +864,8 @@ def write_queries_db_file(top_queries: List[tuple], db_dir: str,
 
         # Split into chunks for GitHub Pages compatibility
         config = _split_db_file(tmp_path, db_dir, chunk_prefix)
+        if similarity_note:
+            config['similarityNote'] = similarity_note
 
         # Write config JSON for sql.js-httpvfs. The config sits at a stable
         # path; query.html fetches it with cache: 'no-store' so the small
@@ -1639,116 +1641,71 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
     return front_matter + content
 
 
-def compute_query_similarities(conn, eligible_queries: set, top_n: int = 20,
-                                min_shared_users: int = 5) -> Dict[str, list]:
-    """Compute cosine similarity between queries based on user co-occurrence.
+def _format_month_range(from_month: str, to_month: str) -> str:
+    """'2026-06', '2026-08' -> 'June to August 2026'."""
+    f = datetime.strptime(from_month, '%Y-%m')
+    t = datetime.strptime(to_month, '%Y-%m')
+    if from_month == to_month:
+        return f"{f:%B %Y}"
+    if f.year == t.year:
+        return f"{f:%B} to {t:%B %Y}"
+    return f"{f:%B %Y} to {t:%B %Y}"
 
-    Builds a binary user-query co-occurrence matrix and computes cosine
-    similarity in chunks to stay within memory budget.
 
-    Args:
-        conn: Database connection
-        eligible_queries: Set of query_normalized strings to include
-        top_n: Number of most similar queries to return per query
-        min_shared_users: Minimum shared users to include a pair
+def read_query_similarities(conn, eligible_queries: set):
+    """Load the query similarities computed nightly by refresh_period_stats.py.
+
+    Rows whose query or similar query is not in eligible_queries (blacklisted or
+    no longer eligible) are dropped. Dropping a blacklisted query here can leave
+    a list one short until the next nightly recompute; the page shows 10 of 20.
 
     Returns:
-        Dict mapping query_normalized -> [(similar_query, score, shared_users), ...]
+        (dict query_normalized -> [(similar_query, score, shared_users), ...],
+         note describing data coverage and computation date, or None)
     """
     import time
     t0 = time.time()
-    print("  Loading user-query pairs from database...")
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT computed_at, pairs_from_month, pairs_to_month
+            FROM query_similarities_meta WHERE id = 1
+        """)
+        meta = cursor.fetchone()
+        cursor.close()
+    except psycopg2.errors.UndefinedTable:
+        conn.rollback()
+        print("  WARNING: query_similarities tables missing, run refresh_period_stats.py on the server")
+        return {}, None
+    if meta is None:
+        print("  WARNING: query_similarities is empty, run refresh_period_stats.py on the server")
+        return {}, None
+    computed_at, from_month, to_month = meta
 
-    # Build index mappings and sparse matrix data in a single pass
-    query_to_idx = {}
-    user_to_idx = {}
-    rows, cols = [], []
-
+    similarities: Dict[str, list] = defaultdict(list)
     cursor = conn.cursor('similarity_cursor')
     cursor.itersize = 50000
     cursor.execute("""
-        SELECT username, query_normalized
-        FROM user_query_pairs
-        WHERE query_normalized = ANY(%s)
-          AND last_seen >= CURRENT_DATE - INTERVAL '90 days'
-    """, (list(eligible_queries),))
-
-    for username, query_norm in cursor:
-        if query_norm not in query_to_idx:
-            query_to_idx[query_norm] = len(query_to_idx)
-        if username not in user_to_idx:
-            user_to_idx[username] = len(user_to_idx)
-        rows.append(query_to_idx[query_norm])
-        cols.append(user_to_idx[username])
-
+        SELECT query_normalized, similar_query, score, shared_users
+        FROM query_similarities
+        ORDER BY query_normalized, score DESC
+    """)
+    n_rows = 0
+    for query, sim_query, score, shared_users in cursor:
+        if query in eligible_queries and sim_query in eligible_queries:
+            similarities[query].append((sim_query, float(score), int(shared_users)))
+            n_rows += 1
     cursor.close()
 
-    n_queries = len(query_to_idx)
-    n_users = len(user_to_idx)
-    print(f"  Built index: {n_queries} queries x {n_users} users, {len(rows)} pairs "
-          f"({time.time() - t0:.1f}s)")
-
-    if n_queries < 2:
-        return {}
-
-    # Build sparse binary matrix (queries x users)
-    data = np.ones(len(rows), dtype=np.float32)
-    matrix = csr_matrix((data, (rows, cols)), shape=(n_queries, n_users))
-
-    # Reverse mapping for output
-    idx_to_query = {idx: q for q, idx in query_to_idx.items()}
-
-    # Compute similarities in chunks
-    chunk_size = 500
-    similarities = {}
-
-    for start in range(0, n_queries, chunk_size):
-        end = min(start + chunk_size, n_queries)
-        chunk = matrix[start:end]
-
-        # Cosine similarity: chunk (500 x users) vs full matrix (queries x users)
-        sim_chunk = cosine_similarity(chunk, matrix)
-
-        # Shared user counts: dot product of binary matrices
-        shared_chunk = (chunk @ matrix.T).toarray()
-
-        for i in range(end - start):
-            global_idx = start + i
-            query = idx_to_query[global_idx]
-
-            # Zero out self-similarity
-            sim_chunk[i, global_idx] = 0.0
-
-            # Filter by min shared users
-            valid_mask = shared_chunk[i] >= min_shared_users
-            if not valid_mask.any():
-                continue
-
-            # Get top-N from valid entries
-            valid_indices = np.where(valid_mask)[0]
-            scores = sim_chunk[i, valid_indices]
-
-            if len(valid_indices) <= top_n:
-                top_local = np.argsort(-scores)
-            else:
-                top_local = np.argpartition(-scores, top_n)[:top_n]
-                top_local = top_local[np.argsort(-scores[top_local])]
-
-            result = []
-            for li in top_local:
-                gi = valid_indices[li]
-                score = float(scores[li])
-                if score <= 0:
-                    continue
-                result.append((idx_to_query[gi], score, int(shared_chunk[i, gi])))
-            if result:
-                similarities[query] = result
-
-        if end % 2000 == 0 or end == n_queries:
-            print(f"  Similarity progress: {end}/{n_queries} queries ({time.time() - t0:.1f}s)")
-
-    print(f"  Computed similarities for {len(similarities)} queries ({time.time() - t0:.1f}s)")
-    return similarities
+    age_days = (datetime.now(timezone.utc) - computed_at).days
+    if age_days >= 2:
+        print(f"  WARNING: similarities were computed {age_days} days ago ({computed_at:%Y-%m-%d})")
+    note = f"computed {computed_at:%-d %b %Y}"
+    if from_month and to_month:
+        note = f"Based on searches from {_format_month_range(from_month, to_month)}, {note}"
+    print(f"  Loaded {n_rows:,} similarity rows for {len(similarities):,} queries "
+          f"({note}) in {time.time() - t0:.1f}s")
+    return dict(similarities), note
 
 
 def build_similar_queries_html(query_norm: str, query_similarities: Dict[str, list],
@@ -2049,7 +2006,7 @@ def main():
 
         # Get eligible queries for similarity computation (queries with detail pages)
         print("=" * 60)
-        print("COMPUTING QUERY SIMILARITIES")
+        print("LOADING QUERY SIMILARITIES")
         print("=" * 60)
         cursor = conn.cursor()
         cursor.execute("SELECT DISTINCT query_normalized FROM query_daily_stats")
@@ -2057,7 +2014,7 @@ def main():
                            if not is_blacklisted(row[0], blacklist)}
         cursor.close()
         print(f"  {len(eligible_queries)} eligible queries")
-        query_similarities = compute_query_similarities(conn, eligible_queries)
+        query_similarities, similarity_note = read_query_similarities(conn, eligible_queries)
 
         # Build slug map + SQLite for client-side query detail pages
         # (replaces the static-HTML generate_query_pages flow; see docs/query.html
@@ -2118,6 +2075,7 @@ def main():
             query_slug_map=query_slug_map,
             query_daily=query_daily,
             query_similarities=query_similarities,
+            similarity_note=similarity_note,
         )
 
         # Nav search-as-you-type index (small JSON, deep-links into /query.html)

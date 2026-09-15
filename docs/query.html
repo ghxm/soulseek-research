@@ -40,6 +40,7 @@ query_display: "Query Detail"
     var chartEl = document.getElementById('q-chart');
     var chartNoteEl = document.getElementById('q-chart-note');
     var similarEl = document.getElementById('q-similar');
+    var similarityNote = '';
 
     function escapeHtml(s) {
         return String(s)
@@ -95,6 +96,7 @@ query_display: "Query Detail"
             return r.json();
         })
         .then(function(config) {
+            similarityNote = config.similarityNote || '';
             // urlPrefix is either an absolute URL (chunks hosted on R2 or
             // another external Range-request-capable host) or a bare
             // filename prefix (chunks shipped in the Pages artifact under
@@ -342,7 +344,10 @@ query_display: "Query Detail"
             }).join('');
             similarEl.innerHTML = '<div class="similar-queries">'
                 + '<h2>Users who searched this also searched '
-                + '<span style="font-weight: normal; font-size: 14px; color: #999;">(last 90 days)</span></h2>'
+                + (similarityNote
+                    ? '<span style="font-weight: normal; font-size: 14px; color: #999;">' + escapeHtml(similarityNote) + '</span>'
+                    : '')
+                + '</h2>'
                 + '<ul>' + items + '</ul>'
                 + '</div>';
         });
