@@ -11,6 +11,7 @@ Two modes:
 """
 
 import glob
+import multiprocessing
 import os
 import sys
 from contextlib import contextmanager
@@ -1104,12 +1105,74 @@ def polars_compute_query_daily_stats(conn, live_parquet: str, min_live_date: Opt
 # Query similarities (user co-occurrence)
 # ---------------------------------------------------------------------------
 
+_SIM_MATRIX = None
+_SIM_IDX_TO_QUERY = None
+_SIM_PARAMS = None
+
+
+def _similarity_chunk(bounds):
+    """Top-N cosine similarities for one chunk of queries (runs in a worker process)."""
+    import numpy as np
+    from sklearn.metrics.pairwise import cosine_similarity
+    matrix, idx_to_query = _SIM_MATRIX, _SIM_IDX_TO_QUERY
+    top_n, min_shared_users = _SIM_PARAMS
+    start, end = bounds
+    chunk = matrix[start:end]
+
+    # Sparse products hold the same values as the dense version
+    sim_chunk = cosine_similarity(chunk, matrix, dense_output=False).tocsr()
+    sim_chunk.sort_indices()
+    shared_chunk = (chunk @ matrix.T).tocsr()
+    shared_chunk.sort_indices()
+
+    result_chunk = {}
+    for i in range(end - start):
+        global_idx = start + i
+        s0, s1 = shared_chunk.indptr[i], shared_chunk.indptr[i + 1]
+        cols = shared_chunk.indices[s0:s1]
+        shared = shared_chunk.data[s0:s1]
+        q0, q1 = sim_chunk.indptr[i], sim_chunk.indptr[i + 1]
+        if q1 - q0 != s1 - s0 or not np.array_equal(sim_chunk.indices[q0:q1], cols):
+            raise RuntimeError("sparsity pattern mismatch between similarity and shared-user products")
+        scores_all = sim_chunk.data[q0:q1].copy()
+
+        # Zero out self-similarity
+        scores_all[cols == global_idx] = 0.0
+
+        # Filter by min shared users
+        valid_mask = shared >= min_shared_users
+        if not valid_mask.any():
+            continue
+        valid_cols = cols[valid_mask]
+        scores = scores_all[valid_mask]
+        shared_valid = shared[valid_mask]
+
+        # Get top-N from valid entries
+        if len(valid_cols) <= top_n:
+            top_local = np.argsort(-scores)
+        else:
+            top_local = np.argpartition(-scores, top_n)[:top_n]
+            top_local = top_local[np.argsort(-scores[top_local])]
+
+        result = []
+        for li in top_local:
+            score = float(scores[li])
+            if score <= 0:
+                continue
+            result.append((idx_to_query[valid_cols[li]], score, int(shared_valid[li])))
+        if result:
+            result_chunk[idx_to_query[global_idx]] = result
+    return result_chunk
+
+
 def compute_query_similarities(conn, eligible_queries: set, top_n: int = 20,
                                 min_shared_users: int = 5) -> Dict[str, list]:
     """Compute cosine similarity between queries based on user co-occurrence.
 
     Builds a binary user-query co-occurrence matrix and computes cosine
-    similarity in chunks to stay within memory budget.
+    similarity in chunks, in parallel on all but two cores (the rest is left
+    to the collector and Postgres). Chunk products stay sparse so each worker
+    needs little memory.
 
     Args:
         conn: Database connection
@@ -1123,7 +1186,6 @@ def compute_query_similarities(conn, eligible_queries: set, top_n: int = 20,
     import time
     import numpy as np
     from scipy.sparse import csr_matrix
-    from sklearn.metrics.pairwise import cosine_similarity
     t0 = time.time()
     print("  Loading user-query pairs from database...")
 
@@ -1166,54 +1228,24 @@ def compute_query_similarities(conn, eligible_queries: set, top_n: int = 20,
     # Reverse mapping for output
     idx_to_query = {idx: q for q, idx in query_to_idx.items()}
 
-    # Compute similarities in chunks
+    del rows, cols, data
+
+    # Compute similarities in chunks. Workers inherit the matrix via fork.
+    global _SIM_MATRIX, _SIM_IDX_TO_QUERY, _SIM_PARAMS
+    _SIM_MATRIX, _SIM_IDX_TO_QUERY, _SIM_PARAMS = matrix, idx_to_query, (top_n, min_shared_users)
     chunk_size = 500
+    bounds = [(s, min(s + chunk_size, n_queries)) for s in range(0, n_queries, chunk_size)]
+    workers = max(1, (os.cpu_count() or 3) - 2)
     similarities = {}
-
-    for start in range(0, n_queries, chunk_size):
-        end = min(start + chunk_size, n_queries)
-        chunk = matrix[start:end]
-
-        # Cosine similarity: chunk (500 x users) vs full matrix (queries x users)
-        sim_chunk = cosine_similarity(chunk, matrix)
-
-        # Shared user counts: dot product of binary matrices
-        shared_chunk = (chunk @ matrix.T).toarray()
-
-        for i in range(end - start):
-            global_idx = start + i
-            query = idx_to_query[global_idx]
-
-            # Zero out self-similarity
-            sim_chunk[i, global_idx] = 0.0
-
-            # Filter by min shared users
-            valid_mask = shared_chunk[i] >= min_shared_users
-            if not valid_mask.any():
-                continue
-
-            # Get top-N from valid entries
-            valid_indices = np.where(valid_mask)[0]
-            scores = sim_chunk[i, valid_indices]
-
-            if len(valid_indices) <= top_n:
-                top_local = np.argsort(-scores)
-            else:
-                top_local = np.argpartition(-scores, top_n)[:top_n]
-                top_local = top_local[np.argsort(-scores[top_local])]
-
-            result = []
-            for li in top_local:
-                gi = valid_indices[li]
-                score = float(scores[li])
-                if score <= 0:
-                    continue
-                result.append((idx_to_query[gi], score, int(shared_chunk[i, gi])))
-            if result:
-                similarities[query] = result
-
-        if end % 2000 == 0 or end == n_queries:
-            print(f"  Similarity progress: {end}/{n_queries} queries ({time.time() - t0:.1f}s)")
+    done = 0
+    with multiprocessing.get_context('fork').Pool(workers) as pool:
+        for part in pool.imap(_similarity_chunk, bounds, chunksize=1):
+            similarities.update(part)
+            done += 1
+            if done % 100 == 0 or done == len(bounds):
+                print(f"  Similarity progress: {min(done * chunk_size, n_queries)}/{n_queries} queries "
+                      f"({time.time() - t0:.1f}s, {workers} workers)")
+    _SIM_MATRIX = _SIM_IDX_TO_QUERY = _SIM_PARAMS = None
 
     print(f"  Computed similarities for {len(similarities)} queries ({time.time() - t0:.1f}s)")
     return similarities
