@@ -555,8 +555,8 @@ def _all_time_parquet_files(archive_path: str) -> list:
 
 
 @contextmanager
-def _duckdb_session():
-    """DuckDB connection capped at 10 GB RAM and 20 GiB of spill.
+def _duckdb_session(memory_limit: str = "10GB"):
+    """DuckDB connection capped at memory_limit RAM and 40 GiB of spill.
 
     /tmp inside the --rm container is docker overlay storage on the host
     root disk, which postgres shares. Spill files are removed on exit.
@@ -566,8 +566,8 @@ def _duckdb_session():
     os.makedirs(_DUCKDB_SPILL_DIR, exist_ok=True)
     con = duckdb.connect()
     con.execute(f"SET temp_directory='{_DUCKDB_SPILL_DIR}'")
-    con.execute("SET memory_limit='10GB'")
-    con.execute("SET max_temp_directory_size='20GiB'")
+    con.execute(f"SET memory_limit='{memory_limit}'")
+    con.execute("SET max_temp_directory_size='40GiB'")
     con.execute("SET threads=4")
     con.execute("SET preserve_insertion_order=false")
     try:
@@ -731,49 +731,68 @@ def polars_compute_all_summary_stats(
     return results
 
 
-def _compute_top_queries_streamed(conn, archive_path: str) -> list:
-    """Compute all_time top queries via DuckDB out-of-core aggregation.
+_PAIRS_PER_BUCKET = 20_000_000
 
-    (query, user) pairs are deduplicated on 64-bit hashes so the spilled
-    intermediate holds three integers per pair instead of two strings.
-    Query strings are joined back only for queries with 5+ users.
+
+def _all_time_bucket_count(conn) -> int:
+    """Hash buckets needed so each holds at most _PAIRS_PER_BUCKET pairs.
+
+    Reads the all_time pair count upserted earlier in the same run.
+    """
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT unique_pairs FROM period_summary_stats WHERE period_type = 'all_time'"
+    )
+    row = cursor.fetchone()
+    cursor.close()
+    pairs = row[0] if row and row[0] else 0
+    return max(1, (pairs + _PAIRS_PER_BUCKET - 1) // _PAIRS_PER_BUCKET)
+
+
+def _compute_top_queries_streamed(conn, archive_path: str, n_buckets: int = None) -> list:
+    """Compute all_time top queries via DuckDB, one query-hash bucket at a time.
+
+    Each pass aggregates only the queries whose hash falls into the bucket,
+    which keeps the (query, user) intermediate under the memory cap. Users
+    are deduplicated on 64-bit hashes. Rows are sorted here because they
+    come from several passes.
     """
     parquet_files = _all_time_parquet_files(archive_path)
-    print(f"      Aggregating {len(parquet_files)} Parquet files via DuckDB...")
+    if n_buckets is None:
+        n_buckets = _all_time_bucket_count(conn)
+    print(f"      Aggregating {len(parquet_files)} Parquet files via DuckDB "
+          f"in {n_buckets} hash buckets...")
 
-    with _duckdb_session() as con:
-        rows = con.execute(
-            """
-            WITH pairs AS (
-                SELECT hash(query_normalized) AS qh, hash(username) AS uh,
-                       SUM(search_count) AS user_searches
-                FROM read_parquet(?)
-                GROUP BY qh, uh
-            ),
-            agg AS (
-                SELECT qh,
+    results = []
+    # One bucket needs ~5 GB; the lower cap leaves room for the result list.
+    with _duckdb_session(memory_limit="6GB") as con:
+        for bucket in range(n_buckets):
+            t0 = datetime.now(timezone.utc)
+            rows = con.execute(
+                """
+                SELECT query_normalized,
                        COUNT(*)::BIGINT AS unique_users,
                        SUM(user_searches)::BIGINT AS total_searches
-                FROM pairs
-                GROUP BY qh
+                FROM (
+                    SELECT query_normalized, hash(username) AS uh,
+                           SUM(search_count) AS user_searches
+                    FROM read_parquet(?)
+                    WHERE hash(query_normalized) % CAST(? AS UBIGINT) = CAST(? AS UBIGINT)
+                    GROUP BY query_normalized, uh
+                )
+                GROUP BY query_normalized
                 HAVING COUNT(*) >= 5
-            ),
-            names AS (
-                SELECT hash(query_normalized) AS qh,
-                       any_value(query_normalized) AS query_normalized
-                FROM read_parquet(?)
-                WHERE hash(query_normalized) IN (SELECT qh FROM agg)
-                GROUP BY qh
-            )
-            SELECT names.query_normalized, agg.unique_users, agg.total_searches
-            FROM agg JOIN names USING (qh)
-            ORDER BY unique_users DESC, total_searches DESC
-            """,
-            [parquet_files, parquet_files],
-        ).fetchall()
+                """,
+                [parquet_files, n_buckets, bucket],
+            ).fetchall()
+            results.extend((q, int(u), int(t)) for q, u, t in rows)
+            elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
+            print(f"        Bucket {bucket + 1}/{n_buckets}: {len(rows):,} queries "
+                  f"with 5+ users ({elapsed:.1f}s)")
 
-    print(f"      {len(rows):,} queries with 5+ users")
-    return [(q, int(u), int(t)) for q, u, t in rows]
+    results.sort(key=lambda r: (-r[1], -r[2]))
+    print(f"      {len(results):,} queries with 5+ users")
+    return results
 
 
 def polars_compute_top_queries(
