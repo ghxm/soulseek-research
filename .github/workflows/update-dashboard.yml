@@ -15,6 +15,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     environment: github-pages
+    outputs:
+      query_daily_max_date: ${{ steps.freshness.outputs.query_daily_max_date }}
+      similarities_computed_date: ${{ steps.freshness.outputs.similarities_computed_date }}
+      stale: ${{ steps.freshness.outputs.stale }}
     steps:
       - uses: actions/checkout@v4
 
@@ -51,6 +55,12 @@ jobs:
           DATABASE_URL: postgresql://soulseek:${{ secrets.DB_PASSWORD }}@localhost:5432/soulseek
           QUERY_BLACKLIST: ${{ vars.QUERY_BLACKLIST }}
         run: python -u scripts/generate_stats.py
+
+      - name: Record data freshness
+        id: freshness
+        env:
+          DATABASE_URL: postgresql://soulseek:${{ secrets.DB_PASSWORD }}@localhost:5432/soulseek
+        run: python scripts/data_freshness.py | tee -a "$GITHUB_OUTPUT"
 
       - name: Upload query DB chunks to Cloudflare R2
         env:
@@ -133,3 +143,23 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+  # Runs after the deploy so a stale server-side table still gets the
+  # period pages out, but turns the run red and triggers GitHub's
+  # failure notice. The nightly refresh on the server failed silently
+  # for 26 nights in Oct 2026 before this check existed.
+  check-freshness:
+    needs: [build, deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if the per-query data is stale
+        env:
+          DAILY: ${{ needs.build.outputs.query_daily_max_date }}
+          SIMILAR: ${{ needs.build.outputs.similarities_computed_date }}
+          STALE: ${{ needs.build.outputs.stale }}
+        run: |
+          echo "query_daily_stats through ${DAILY}, similarities computed ${SIMILAR}"
+          if [ "$STALE" = "true" ]; then
+            echo "::error::Per-query data is more than 2 days old: the nightly refresh on the server is failing. See /var/log/soulseek-period-stats.log"
+            exit 1
+          fi
