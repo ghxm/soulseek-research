@@ -74,6 +74,11 @@ jobs:
           # payload signing is off because R2 does not implement it.
           ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
+          # Send each chunk (10 MiB) as a single PUT instead of a multipart
+          # upload: R2 intermittently loses a part and fails the sync with
+          # InvalidPart on CompleteMultipartUpload (2026-10-29).
+          aws configure set default.s3.multipart_threshold 64MB
+
           # Upload all query DB chunks in one sync. Content-addressed
           # filenames mean old chunks stay valid; new chunks land alongside.
           # Cache-Control: 1 year (chunks are immutable per content hash).

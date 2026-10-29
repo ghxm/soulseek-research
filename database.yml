@@ -14,6 +14,8 @@ services:
       - db_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
+    # Postgres parallel workers share query plans via /dev/shm; Docker's 64 MB default is too small.
+    shm_size: 1gb
     restart: unless-stopped
 
 volumes:
