@@ -1004,45 +1004,47 @@ def polars_compute_query_daily_stats(conn, live_parquet: str, min_live_date: Opt
     cursor.close()
     need_backfill = eligible_set - existing_queries
 
-    # Backfill from archived Parquet files for newly-eligible queries
-    backfill_df = None
+    # One DuckDB pass over the live snapshot (all eligible queries) plus
+    # the archives (newly eligible queries only). The inner GROUP BY
+    # deduplicates per user so the outer COUNT(*) is the unique-user
+    # count; both stages spill to disk instead of growing in RAM, which
+    # the Polars n_unique() aggregation this replaced did not.
+    sources = [
+        "SELECT query_normalized, date, username, search_count FROM read_parquet(?) "
+        "WHERE query_normalized IN (SELECT query_normalized FROM eligible)"
+    ]
+    params = [[live_parquet]]
+    archived_files = []
     if need_backfill:
         archive_path = os.environ.get('ARCHIVE_PATH', '/archives')
         archived_files = sorted(glob.glob(os.path.join(archive_path, "daily_tuples_*.parquet")))
         if archived_files:
             print(f"  Backfilling {len(need_backfill)} queries from {len(archived_files)} archived files...")
-            backfill_df = (
-                pl.scan_parquet(archived_files)
-                .filter(pl.col("query_normalized").is_in(need_backfill))
-                .group_by(["query_normalized", "date"])
-                .agg(
-                    pl.col("search_count").sum().alias("search_count"),
-                    pl.col("username").n_unique().alias("unique_users"),
-                )
-                .sort(["query_normalized", "date"])
-                .collect(engine="streaming")
+            sources.append(
+                "SELECT query_normalized, date, username, search_count FROM read_parquet(?) "
+                "WHERE query_normalized IN (SELECT query_normalized FROM backfill)"
             )
-            print(f"  Backfill: {backfill_df.height:,} rows from archives")
+            params.append(archived_files)
 
-    # Compute live daily stats for all eligible queries
-    print("  Loading live data and computing daily stats...")
-    daily_df = (
-        pl.scan_parquet(live_parquet)
-        .filter(pl.col("query_normalized").is_in(eligible_set))
-        .group_by(["query_normalized", "date"])
-        .agg(
-            pl.col("search_count").sum().alias("search_count"),
-            pl.col("username").n_unique().alias("unique_users"),
-        )
-        .sort(["query_normalized", "date"])
-        .collect(engine="streaming")
-    )
-    print(f"  Live: {daily_df.height:,} daily rows")
-
-    # Combine backfill + live
-    if backfill_df is not None and backfill_df.height > 0:
-        daily_df = pl.concat([backfill_df, daily_df])
-        del backfill_df
+    print("  Computing daily stats via DuckDB...")
+    with _duckdb_session(memory_limit="8GB") as con:
+        con.register("eligible", pl.DataFrame({"query_normalized": eligible}))
+        if archived_files:
+            con.register("backfill", pl.DataFrame({"query_normalized": sorted(need_backfill)}))
+        daily_df = con.execute(f"""
+            WITH per_user AS (
+                SELECT query_normalized, date, username, SUM(search_count) AS search_count
+                FROM ({" UNION ALL ".join(sources)})
+                GROUP BY 1, 2, 3
+            )
+            SELECT query_normalized, date,
+                   SUM(search_count)::BIGINT AS search_count,
+                   COUNT(*)::BIGINT AS unique_users
+            FROM per_user
+            GROUP BY 1, 2
+            ORDER BY 1, 2
+        """, params).pl()
+    print(f"  Daily stats: {daily_df.height:,} rows")
 
     if daily_df.height == 0:
         return 0
