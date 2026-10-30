@@ -49,6 +49,7 @@ docker run --rm \\
   -e ARCHIVE_PATH=/archives \\
   -e DELETE_AFTER_ARCHIVE=true \\
   -e PYTHONUNBUFFERED=1 \\
+  --env-file /opt/soulseek-research/.env \\
   soulseek-research:latest \\
   uv run python /app/scripts/archive.py \\
   >> /var/log/soulseek-archive-output.log 2>&1

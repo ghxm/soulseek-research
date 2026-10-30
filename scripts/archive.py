@@ -4,8 +4,10 @@ Monthly archival script for Soulseek research data.
 Exports old months to Parquet files and deletes from database.
 """
 
+import hashlib
 import json
 import os
+import sys
 from datetime import datetime
 from typing import List, Tuple
 
@@ -430,35 +432,134 @@ def archive_month(conn, month: str, archive_path: str, delete_after: bool = Fals
         mark_archive_deleted(conn, month)
 
 
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(8 * 1024 * 1024), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def r2_archive_client():
+    """Return (s3 client, bucket) for the R2 archive bucket, or None if not configured."""
+    bucket = os.environ.get('R2_ARCHIVE_BUCKET')
+    account_id = os.environ.get('R2_ARCHIVE_ACCOUNT_ID')
+    access_key = os.environ.get('R2_ARCHIVE_ACCESS_KEY_ID')
+    secret_key = os.environ.get('R2_ARCHIVE_SECRET_ACCESS_KEY')
+    if not all([bucket, account_id, access_key, secret_key]):
+        return None
+
+    import boto3
+    from botocore.config import Config
+
+    s3 = boto3.client(
+        's3',
+        endpoint_url=f"https://{account_id}.eu.r2.cloudflarestorage.com",
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name='auto',
+        config=Config(request_checksum_calculation='when_required',
+                      response_checksum_validation='when_required',
+                      retries={'max_attempts': 10, 'mode': 'standard'}),
+    )
+    return s3, bucket
+
+
+def upload_and_verify(s3, bucket: str, path: str, key: str) -> str:
+    """Upload a file to R2, stream it back and compare SHA-256 and size.
+
+    Returns the object URI. Raises on any mismatch; the local file is not touched.
+    """
+    from boto3.s3.transfer import TransferConfig
+
+    size = os.path.getsize(path)
+    print(f"  {key}: hashing {size:,} bytes...")
+    local_hash = _sha256_file(path)
+
+    print(f"  {key}: uploading...")
+    s3.upload_file(path, bucket, key,
+                   Config=TransferConfig(multipart_chunksize=64 * 1024 * 1024, max_concurrency=8),
+                   ExtraArgs={'Metadata': {'sha256': local_hash}})
+
+    print(f"  {key}: verifying by readback...")
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    remote = hashlib.sha256()
+    remote_size = 0
+    for block in obj['Body'].iter_chunks(8 * 1024 * 1024):
+        remote.update(block)
+        remote_size += len(block)
+    if remote_size != size or remote.hexdigest() != local_hash:
+        raise RuntimeError(f"R2 copy of {key} does not match the local file "
+                           f"({remote_size:,} vs {size:,} bytes)")
+    print(f"  {key}: verified (sha256 {local_hash[:12]})")
+    return f"s3://{bucket}/{key}"
+
+
+def offload_raw_archives(conn, archive_path: str):
+    """Move raw searches_YYYY-MM.parquet files of fully archived months to R2.
+
+    Only after a verified upload is archives.file_path set to the object URI
+    and the local file deleted. A failed verification raises and keeps the file.
+    """
+    client = r2_archive_client()
+    if client is None:
+        print("R2 archive storage not configured, keeping raw Parquet files local")
+        return
+    s3, bucket = client
+
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT month FROM archives WHERE deleted = TRUE ORDER BY month")
+    months = [row[0] for row in cursor.fetchall()]
+    cursor.close()
+    pending = [(m, os.path.join(archive_path, f"searches_{m}.parquet")) for m in months]
+    pending = [(m, p) for m, p in pending if os.path.exists(p)]
+    if not pending:
+        print("No raw Parquet files to offload")
+        return
+
+    print(f"Offloading {len(pending)} raw Parquet file(s) to R2 bucket {bucket}...")
+    for month, path in pending:
+        uri = upload_and_verify(s3, bucket, path, f"raw/searches_{month}.parquet")
+        cursor = conn.cursor()
+        cursor.execute("UPDATE archives SET file_path = %s WHERE month = %s", (uri, month))
+        conn.commit()
+        cursor.close()
+        os.remove(path)
+        print(f"  {month}: archives.file_path = {uri}, local file deleted")
+
+
 def main():
     """Main archival process"""
     archive_path = os.environ.get('ARCHIVE_PATH', '/opt/archives')
     delete_after = os.environ.get('DELETE_AFTER_ARCHIVE', 'false').lower() == 'true'
+    offload_only = '--offload-only' in sys.argv
 
     os.makedirs(archive_path, exist_ok=True)
 
     conn = get_db_connection()
 
     try:
-        # Ensure persistent user-query pairs table exists
-        ensure_user_query_pairs_table(conn)
-        # Per-month seeding happens in archive_month() before each deletion
-        if delete_after:
-            prune_user_query_pairs(conn)
+        if not offload_only:
+            # Ensure persistent user-query pairs table exists
+            ensure_user_query_pairs_table(conn)
+            # Per-month seeding happens in archive_month() before each deletion
+            if delete_after:
+                prune_user_query_pairs(conn)
 
-        # Find completed months to archive
-        months = get_months_to_archive(conn)
+            # Find completed months to archive
+            months = get_months_to_archive(conn)
 
-        if not months:
-            print("No months ready for archival")
-            return
+            if not months:
+                print("No months ready for archival")
+            else:
+                print(f"Found {len(months)} month(s) to archive: {months}")
 
-        print(f"Found {len(months)} month(s) to archive: {months}")
+                for month in months:
+                    archive_month(conn, month, archive_path, delete_after)
 
-        for month in months:
-            archive_month(conn, month, archive_path, delete_after)
+                print("✅ Archival complete!")
 
-        print("✅ Archival complete!")
+        offload_raw_archives(conn, archive_path)
 
     finally:
         conn.close()
