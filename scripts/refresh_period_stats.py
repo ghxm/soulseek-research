@@ -1031,7 +1031,7 @@ def polars_compute_query_daily_stats(conn, live_parquet: str, min_live_date: Opt
         con.register("eligible", pl.DataFrame({"query_normalized": eligible}))
         if archived_files:
             con.register("backfill", pl.DataFrame({"query_normalized": sorted(need_backfill)}))
-        daily_df = con.execute(f"""
+        daily_df = con.sql(f"""
             WITH per_user AS (
                 SELECT query_normalized, date, username, SUM(search_count) AS search_count
                 FROM ({" UNION ALL ".join(sources)})
@@ -1043,7 +1043,7 @@ def polars_compute_query_daily_stats(conn, live_parquet: str, min_live_date: Opt
             FROM per_user
             GROUP BY 1, 2
             ORDER BY 1, 2
-        """, params).pl()
+        """, params=params).pl()
     print(f"  Daily stats: {daily_df.height:,} rows")
 
     if daily_df.height == 0:

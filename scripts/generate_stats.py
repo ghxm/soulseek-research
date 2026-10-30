@@ -11,7 +11,7 @@ import os
 import re
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Iterable, Optional
 
 import psycopg2
 import pandas as pd
@@ -727,7 +727,7 @@ def write_queries_data_file(top_queries: List[tuple], data_file_path: str,
 def write_queries_db_file(top_queries: List[tuple], db_dir: str,
                           data_file_id: str,
                           query_slug_map: Dict[str, str] = None,
-                          query_daily: Dict[str, List[tuple]] = None,
+                          query_daily: Iterable[tuple] = None,
                           query_similarities: Dict[str, list] = None,
                           similarity_note: str = None):
     """Write query data to a chunked SQLite database for sql.js-httpvfs.
@@ -740,8 +740,9 @@ def write_queries_db_file(top_queries: List[tuple], db_dir: str,
         db_dir: Directory to write files into (e.g. 'docs/data')
         data_file_id: Period identifier (e.g. 'all', '2026-01', '2026-W03')
         query_slug_map: Optional dict mapping query_normalized -> slug
-        query_daily: Optional dict query_normalized -> list of (date, search_count, unique_users).
-            When provided, a query_daily table is added (used by /query.html).
+        query_daily: Optional iterable of (query_normalized, date, search_count, unique_users)
+            rows, inserted in batches as they arrive. When provided, a query_daily
+            table is added (used by /query.html).
         query_similarities: Optional dict query_normalized -> list of
             (similar_query, score, shared_users). When provided, a query_similar
             table is added (used by /query.html).
@@ -813,16 +814,21 @@ def write_queries_db_file(top_queries: List[tuple], db_dir: str,
                 unique_users INTEGER NOT NULL
             )''')
             daily_rows = []
-            for query, days in query_daily.items():
+            n_daily = 0
+            for query, date_val, sc, uu in query_daily:
                 rank = query_to_rank.get(query)
                 if rank is None:
                     continue
-                for date_val, sc, uu in days:
-                    date_str = date_val.isoformat() if hasattr(date_val, 'isoformat') else str(date_val)
-                    daily_rows.append((rank, date_str, int(sc), int(uu)))
+                date_str = date_val.isoformat() if hasattr(date_val, 'isoformat') else str(date_val)
+                daily_rows.append((rank, date_str, int(sc), int(uu)))
+                if len(daily_rows) >= 100000:
+                    conn.executemany('INSERT INTO query_daily VALUES (?, ?, ?, ?)', daily_rows)
+                    n_daily += len(daily_rows)
+                    daily_rows = []
             conn.executemany('INSERT INTO query_daily VALUES (?, ?, ?, ?)', daily_rows)
+            n_daily += len(daily_rows)
             conn.execute('CREATE INDEX idx_query_daily_rank ON query_daily(rank)')
-            print(f"      query_daily: {len(daily_rows):,} rows")
+            print(f"      query_daily: {n_daily:,} rows")
 
         # Per-query similarity edges (for the "users also searched" list on /query.html)
         if query_similarities is not None:
@@ -2022,34 +2028,23 @@ def main():
         print("=" * 60)
         print("BUILDING QUERY DETAIL SQLITE")
         print("=" * 60)
+        daily_where = "WHERE date <= %s" if cutoff_date else ""
+        daily_params = (cutoff_date.date(),) if cutoff_date else None
         cursor = conn.cursor()
-        if cutoff_date:
-            cursor.execute("""
-                SELECT query_normalized, date, search_count, unique_users
-                FROM query_daily_stats
-                WHERE date <= %s
-                ORDER BY query_normalized, date
-            """, (cutoff_date.date(),))
-        else:
-            cursor.execute("""
-                SELECT query_normalized, date, search_count, unique_users
-                FROM query_daily_stats
-                ORDER BY query_normalized, date
-            """)
-        query_daily: Dict[str, list] = defaultdict(list)
-        for q, d, sc, uu in cursor.fetchall():
-            query_daily[q].append((d, sc, uu))
+        cursor.execute(f"SELECT DISTINCT query_normalized FROM query_daily_stats {daily_where}",
+                       daily_params)
+        daily_queries = [row[0] for row in cursor.fetchall()]
         cursor.close()
         if blacklist:
-            before = len(query_daily)
-            query_daily = {q: v for q, v in query_daily.items()
-                           if not is_blacklisted(q, blacklist)}
-            print(f"  Blacklist removed {before - len(query_daily)} queries from detail data")
-        print(f"  Found daily data for {len(query_daily)} queries")
+            before = len(daily_queries)
+            daily_queries = [q for q in daily_queries if not is_blacklisted(q, blacklist)]
+            print(f"  Blacklist removed {before - len(daily_queries)} queries from detail data")
+        print(f"  Found daily data for {len(daily_queries)} queries")
 
         # Slug map (needed for in-table hyperlinking on the all-time/period pages
         # and for the slug column in the SQLite).
-        query_slug_map = {q: slugify_query(q) for q in query_daily}
+        query_slug_map = {q: slugify_query(q) for q in daily_queries}
+        del daily_queries
 
         # Top queries with 35+ users define which rows go into the SQLite for /query.html.
         # We pull from period_top_queries (same source generate_query_pages used).
@@ -2068,15 +2063,26 @@ def main():
                                   if not is_blacklisted(r[0], blacklist)]
         print(f"  {len(detail_top_queries)} queries in SQLite (35+ users)")
 
+        # Daily rows are streamed through a server-side cursor; blacklisted
+        # queries have no rank in detail_top_queries and are skipped on insert.
+        daily_cursor = conn.cursor('query_daily_cursor')
+        daily_cursor.itersize = 100000
+        daily_cursor.execute(f"""
+            SELECT query_normalized, date, search_count, unique_users
+            FROM query_daily_stats
+            {daily_where}
+            ORDER BY query_normalized, date
+        """, daily_params)
         write_queries_db_file(
             top_queries=detail_top_queries,
             db_dir='docs/data',
             data_file_id='all',
             query_slug_map=query_slug_map,
-            query_daily=query_daily,
+            query_daily=daily_cursor,
             query_similarities=query_similarities,
             similarity_note=similarity_note,
         )
+        daily_cursor.close()
 
         # Nav search-as-you-type index (small JSON, deep-links into /query.html)
         write_query_search_index(conn, query_slug_map, blacklist)

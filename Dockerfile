@@ -8,7 +8,7 @@ COPY . /app
 WORKDIR /app
 
 # Install dependencies
-RUN uv sync --extra scripts
+RUN uv sync --locked --extra scripts
 
 # Create entrypoint script
 RUN echo '#!/bin/bash\n\
