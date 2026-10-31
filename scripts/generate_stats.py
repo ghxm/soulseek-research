@@ -504,11 +504,25 @@ def create_svg_line_chart(daily_data: List[tuple]) -> str:
     return svg
 
 
+# Shared Plotly layout for the dashboard charts
+CHART_LAYOUT = dict(
+    template='plotly_white',
+    plot_bgcolor='white',
+    paper_bgcolor='white',
+    font=dict(color='#444', size=12),
+    title_font=dict(size=14, color='#222'),
+    title_x=0,
+    margin=dict(l=60, r=20, t=50, b=40),
+    xaxis=dict(gridcolor='#f2f2f2', linecolor='#ddd'),
+    yaxis=dict(gridcolor='#f2f2f2', linecolor='#ddd'),
+)
+
+
 def create_daily_flow_chart(df: pd.DataFrame) -> go.Figure:
     """Create line chart showing daily search flow per client"""
     fig = go.Figure()
     clients = df['client_id'].unique()
-    greys = ['#000000', '#555555', '#999999', '#333333', '#777777']
+    greys = ['#555555', '#999999', '#333333', '#777777', '#bbbbbb']
 
     # Full calendar range across all clients so days with zero collection
     # (client outages) render as 0 instead of being visually skipped.
@@ -530,24 +544,20 @@ def create_daily_flow_chart(df: pd.DataFrame) -> go.Figure:
         fig.add_trace(go.Scatter(
             x=client_data['date'],
             y=client_data['search_count'],
-            mode='lines+markers',
+            mode='lines',
             name=client,
-            line=dict(width=2, color=greys[i % len(greys)]),
-            marker=dict(size=8, color=greys[i % len(greys)])
+            line=dict(width=1.5, color=greys[i % len(greys)])
         ))
 
     fig.update_layout(
-        title='Daily Search Volume by Client - Raw Data Collection',
-        xaxis_title='Date',
-        yaxis_title='Number of Searches (Raw)',
+        **CHART_LAYOUT,
+        title='Daily search volume (raw search events)',
+        yaxis_title='Searches',
         hovermode='x unified',
-        height=500,
-        template='plotly_white',
-        plot_bgcolor='white',
-        paper_bgcolor='white',
-        font=dict(color='black'),
-        xaxis=dict(rangeslider=dict(visible=True), type='date')
+        height=420,
+        showlegend=len(clients) > 1,
     )
+    fig.update_xaxes(rangeslider=dict(visible=True, thickness=0.06), type='date')
     return fig
 
 
@@ -568,25 +578,20 @@ def create_daily_unique_users_chart(df: pd.DataFrame) -> go.Figure:
     fig.add_trace(go.Scatter(
         x=df_filled['date'],
         y=df_filled['unique_users'],
-        mode='lines+markers',
-        line=dict(width=3, color='#333333'),
-        marker=dict(size=10, color='#333333', line=dict(color='black', width=1)),
+        mode='lines',
+        line=dict(width=1.5, color='#333333'),
         fill='tozeroy',
-        fillcolor='rgba(51, 51, 51, 0.1)'
+        fillcolor='rgba(51, 51, 51, 0.05)'
     ))
 
     fig.update_layout(
-        title='Daily Active Users - Deduplicated',
-        xaxis_title='Date',
-        yaxis_title='Unique Users',
+        **CHART_LAYOUT,
+        title='Daily active users (unique usernames per day)',
+        yaxis_title='Users',
         hovermode='x unified',
-        height=400,
-        template='plotly_white',
-        plot_bgcolor='white',
-        paper_bgcolor='white',
-        font=dict(color='black'),
-        xaxis=dict(rangeslider=dict(visible=True), type='date')
+        height=380,
     )
+    fig.update_xaxes(rangeslider=dict(visible=True, thickness=0.06), type='date')
     return fig
 
 
@@ -611,28 +616,22 @@ def create_top_queries_chart(top_queries: List[tuple], limit: int = 25) -> go.Fi
             y=queries[::-1],  # Reverse for top-to-bottom display
             x=unique_users[::-1],
             orientation='h',
-            marker=dict(color='#333333', line=dict(color='black', width=1)),
+            marker=dict(color='#9a9a9a'),
             customdata=queries[::-1],  # Store full query for search
             hovertemplate='<b>%{customdata}</b><br>Unique Users: %{x}<extra></extra>'
         )
     ])
 
-    title_text = f'Top {limit:,} Queries (of {total_count:,} total with 5+ users)'
+    title_text = f'Top {limit:,} queries by unique users (of {total_count:,} with 5+ users)'
 
     fig.update_layout(
         title=title_text,
-        xaxis_title='Number of Unique Users',
-        yaxis_title='Query',
+        **CHART_LAYOUT,
+        xaxis_title='Unique users',
         height=chart_height,
-        template='plotly_white',
-        plot_bgcolor='white',
-        paper_bgcolor='white',
-        font=dict(color='black'),
-        yaxis=dict(
-            tickmode='linear',
-            tickfont=dict(size=10)
-        )
+        bargap=0.35,
     )
+    fig.update_yaxes(tickmode='linear', tickfont=dict(size=11), gridcolor='rgba(0,0,0,0)')
     return fig
 
 
@@ -1024,22 +1023,21 @@ def create_queries_data_table(top_queries: List[tuple], data_json_url: str) -> s
 
     <style>
         .queries-table-container {{
-            margin: 30px 0;
-            border: 1px solid #ddd;
-            border-radius: 4px;
+            margin: 24px 0;
             background: white;
         }}
 
         .table-header {{
-            padding: 20px;
-            background: #f5f5f5;
-            border-bottom: 1px solid #ddd;
+            padding: 16px 0 12px;
+            background: white;
+            border-bottom: 1px solid #eee;
         }}
 
         .table-header h3 {{
             margin: 0 0 15px 0;
-            color: #333;
-            font-size: 18px;
+            color: #222;
+            font-size: 14px;
+            font-weight: 600;
         }}
 
         .table-controls {{
@@ -1052,14 +1050,14 @@ def create_queries_data_table(top_queries: List[tuple], data_json_url: str) -> s
             flex: 1;
             padding: 10px 15px;
             font-size: 15px;
-            border: 2px solid #333;
-            border-radius: 4px;
+            border: 1px solid #ccc;
+            border-radius: 3px;
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
         }}
 
         .table-search-input:focus {{
             outline: none;
-            border-color: #000;
+            border-color: #666;
             background: #fff;
         }}
 
@@ -1099,20 +1097,19 @@ def create_queries_data_table(top_queries: List[tuple], data_json_url: str) -> s
             top: 0;
             background: white;
             z-index: 10;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
         }}
 
         .queries-table th {{
             padding: 12px 15px;
             text-align: left;
-            font-weight: 600;
-            color: #333;
-            border-bottom: 2px solid #333;
+            font-weight: 500;
+            color: #666;
+            border-bottom: 1px solid #ddd;
         }}
 
         .queries-table td {{
             padding: 10px 15px;
-            border-bottom: 1px solid #eee;
+            border-bottom: 1px solid #f2f2f2;
         }}
 
         .queries-table tbody tr:hover {{

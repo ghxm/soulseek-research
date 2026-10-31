@@ -10,6 +10,8 @@
             margin: 0;
             padding: 0;
             background: white;
+            color: #222;
+            line-height: 1.5;
         }
 
         {% include nav-styles.html %}
@@ -22,33 +24,32 @@
         }
 
         .container {
-            max-width: 1400px;
+            max-width: 1100px;
             margin: 0 auto;
             background: white;
-            padding: 30px;
+            padding: 40px 30px 60px;
         }
 
         h1 {
-            color: black;
-            border-bottom: 2px solid black;
-            padding-bottom: 10px;
+            color: #111;
+            font-size: 28px;
             font-weight: 600;
+            letter-spacing: -0.01em;
+            margin: 0 0 16px;
         }
 
         h2 {
-            color: black;
-            margin-top: 40px;
-            border-bottom: 1px solid #ccc;
-            padding-bottom: 8px;
+            color: #111;
+            font-size: 18px;
+            margin-top: 64px;
             font-weight: 600;
         }
 
         .stats-tables {
             display: flex;
             gap: 60px;
-            margin: 30px auto;
-            padding: 20px 0;
-            justify-content: center;
+            margin: 24px 0;
+            justify-content: flex-start;
         }
 
         .stats-table {
@@ -58,8 +59,8 @@
 
         .stats-table caption {
             text-align: left;
-            font-size: 13px;
-            font-weight: 600;
+            font-size: 12px;
+            font-weight: 500;
             color: #999;
             text-transform: uppercase;
             letter-spacing: 0.5px;
@@ -67,7 +68,7 @@
         }
 
         .stats-table td {
-            border-bottom: 1px solid #eee;
+            border-bottom: 1px solid #f2f2f2;
         }
 
         .stats-table tr:last-child td {
@@ -82,29 +83,37 @@
 
         .stats-value {
             font-size: 15px;
-            font-weight: 600;
-            color: black;
+            font-weight: 500;
+            color: #111;
             text-align: right;
+            font-variant-numeric: tabular-nums;
             padding: 10px 0;
         }
 
         .chart {
-            margin: 30px 0;
-            border: 1px solid #eee;
-            padding: 10px;
+            margin: 16px 0 24px;
         }
 
         .timestamp {
-            color: #666;
-            font-size: 14px;
-            margin-top: 20px;
+            color: #999;
+            font-size: 13px;
+            margin-top: 4px;
         }
 
         .period-range {
             color: #666;
-            font-size: 16px;
-            margin: -10px 0 10px 0;
+            font-size: 15px;
+            margin: 0;
             font-weight: 400;
+        }
+
+        .footer {
+            margin-top: 80px;
+            font-size: 13px;
+        }
+
+        .footer a {
+            color: #999;
         }
 
         .period-title {
