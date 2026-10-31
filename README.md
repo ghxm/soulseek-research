@@ -25,14 +25,11 @@ stats_cumulative: id, total_searches, total_users, total_queries,
 -- Precomputed period statistics
 period_top_queries: id, period_type, period_id, query_normalized,
                     unique_users, total_searches, rank
-period_query_length_dist: id, period_type, period_id, query_length,
-                          unique_query_count
 query_daily_stats: query_normalized, date, search_count, unique_users
 
 -- Materialized views (live data only)
 mv_daily_stats          -- Daily aggregates by client
 mv_top_queries          -- Global top queries (5+ unique users)
-mv_query_length_dist    -- Query word count distribution
 mv_summary_stats        -- Overall summary statistics
 ```
 
@@ -49,7 +46,7 @@ mv_summary_stats        -- Overall summary statistics
 ### Scripts
 
 - `scripts/generate_stats.py` -- Generates the static dashboard pages (all-time, weekly, monthly, and per-query detail pages) from the database. Computes query similarities based on user co-occurrence within a 90-day window. Run by GitHub Actions daily at 6 AM UTC.
-- `scripts/refresh_period_stats.py` -- Precomputes top queries, query length distributions, and per-query daily stats for each week/month period. Reads from the `searches` table and writes to `period_top_queries`, `period_query_length_dist`, and `query_daily_stats`.
+- `scripts/refresh_period_stats.py` -- Precomputes top queries and per-query daily stats for each week/month period. Reads from the `searches` table and writes to `period_top_queries`, `period_query_length_dist`, and `query_daily_stats`.
 - `scripts/archive.py` -- Archives completed months to Parquet files and optionally deletes them from the database. Preserves user-query pairs and updates cumulative stats before deletion.
 
 `refresh-views.sh` (materialized view refresh), `refresh_period_stats.py`, and `archive.py` run as cron jobs on the database server. `generate_stats.py` runs as a GitHub Actions workflow.

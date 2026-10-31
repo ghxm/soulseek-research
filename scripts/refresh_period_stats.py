@@ -332,58 +332,6 @@ def sql_compute_top_queries(
     return len(values)
 
 
-def sql_compute_query_length_dist(
-    conn, period_type: str, period_id: str,
-    start_date: date, end_date: date
-) -> int:
-    """Compute query length distribution for a period using SQL."""
-    where, params = _sql_date_filter(period_type, start_date, end_date)
-
-    cursor = conn.cursor()
-    cursor.execute(f"""
-        SELECT query_length, COUNT(DISTINCT query_normalized) AS unique_query_count
-        FROM (
-            SELECT query_normalized,
-                   array_length(string_to_array(query_normalized, ' '), 1) AS query_length
-            FROM mv_daily_search_tuples
-            {where}
-            GROUP BY query_normalized
-        ) sub
-        WHERE query_length <= 100
-        GROUP BY query_length
-        ORDER BY query_length
-    """, params)
-    rows = cursor.fetchall()
-
-    # Delete old data
-    cursor.execute("""
-        DELETE FROM period_query_length_dist
-        WHERE period_type = %s AND period_id = %s
-    """, (period_type, period_id))
-
-    if not rows:
-        conn.commit()
-        cursor.close()
-        return 0
-
-    values = [
-        (period_type, period_id, row[0], row[1])
-        for row in rows
-    ]
-
-    execute_values(
-        cursor,
-        """INSERT INTO period_query_length_dist
-           (period_type, period_id, query_length, unique_query_count)
-           VALUES %s""",
-        values,
-    )
-
-    conn.commit()
-    cursor.close()
-    return len(values)
-
-
 def sql_compute_query_daily_stats(conn, min_live_date: Optional[date]):
     """Compute daily stats for queries with 35+ unique users, using SQL."""
     cursor = conn.cursor()
@@ -883,89 +831,6 @@ def polars_compute_top_queries(
     return len(values)
 
 
-def polars_compute_query_length_dist(
-    conn, tuples_lf, period_type: str, period_id: str,
-    start_date: date, end_date: date
-) -> int:
-    """Compute query length distribution for a period using polars."""
-    import polars as pl
-
-    if period_type == 'all_time':
-        # Stream through files: collect unique query hashes per word count
-        import pyarrow.parquet as pq
-        from collections import defaultdict
-
-        archive_path = os.environ.get('ARCHIVE_PATH', '/archives')
-        parquet_files = sorted(glob.glob(os.path.join(archive_path, "daily_tuples_*.parquet")))
-        live_pq = os.path.join(archive_path, "_live_tuples.parquet")
-        if os.path.exists(live_pq):
-            parquet_files.append(live_pq)
-
-        # length -> set of query hashes
-        length_queries = defaultdict(set)
-        for pf in parquet_files:
-            pf_reader = pq.ParquetFile(pf)
-            for batch in pf_reader.iter_batches(
-                batch_size=500_000, columns=["query_normalized"]
-            ):
-                for q in batch.column("query_normalized").to_pylist():
-                    qlen = q.count(" ") + 1
-                    if qlen <= 100:
-                        length_queries[qlen].add(hash(q))
-                del batch
-            del pf_reader
-
-        result_rows = sorted(
-            [(length, len(hashes)) for length, hashes in length_queries.items()]
-        )
-        del length_queries
-    else:
-        filtered = tuples_lf.filter(
-            (pl.col("date") >= start_date) & (pl.col("date") <= end_date)
-        )
-
-        result_df = (
-            filtered
-            .with_columns(
-                (pl.col("query_normalized").str.count_matches(" ") + 1).alias("query_length")
-            )
-            .filter(pl.col("query_length") <= 100)
-            .group_by("query_length")
-            .agg(pl.col("query_normalized").n_unique().alias("unique_query_count"))
-            .sort("query_length")
-            .collect()
-        )
-        result_rows = [(int(row[0]), int(row[1])) for row in result_df.iter_rows()]
-
-    cursor = conn.cursor()
-    cursor.execute("""
-        DELETE FROM period_query_length_dist
-        WHERE period_type = %s AND period_id = %s
-    """, (period_type, period_id))
-
-    if not result_rows:
-        conn.commit()
-        cursor.close()
-        return 0
-
-    values = [
-        (period_type, period_id, length, count)
-        for length, count in result_rows
-    ]
-
-    execute_values(
-        cursor,
-        """INSERT INTO period_query_length_dist
-           (period_type, period_id, query_length, unique_query_count)
-           VALUES %s""",
-        values,
-    )
-
-    conn.commit()
-    cursor.close()
-    return len(values)
-
-
 def polars_compute_query_daily_stats(conn, live_parquet: str, min_live_date: Optional[date]):
     """Compute daily stats for queries with 35+ unique users, using polars.
 
@@ -1433,9 +1298,8 @@ def refresh_period_stats(conn):
     elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
     print(f"  Done: {len(summary_lookup)} period summaries in {elapsed:.1f}s")
 
-    # Compute top queries and query length dist per period
+    # Compute top queries per period
     total_queries = 0
-    total_dists = 0
 
     for i, (period_type, period_id, start_date, end_date) in enumerate(periods_to_process, 1):
         label = f"{period_type} {period_id}"
@@ -1454,18 +1318,8 @@ def refresh_period_stats(conn):
         print(f"  Top queries: {qi} inserted in {elapsed:.1f}s")
         total_queries += qi
 
-        t0 = datetime.now(timezone.utc)
-        if use_polars:
-            di = polars_compute_query_length_dist(conn, tuples_lf, period_type, period_id, start_date, end_date)
-        else:
-            di = sql_compute_query_length_dist(conn, period_type, period_id, start_date, end_date)
-        elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
-        print(f"  Query length dist: {di} rows in {elapsed:.1f}s")
-        total_dists += di
-
     print(f"\nProcessed {len(periods_to_process)} periods successfully")
     print(f"  - {total_queries} top query entries")
-    print(f"  - {total_dists} query length distribution rows")
 
     return min_live_date, use_polars, live_parquet
 

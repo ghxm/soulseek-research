@@ -130,18 +130,10 @@ def get_cumulative_stats(conn) -> Dict[str, Any]:
             'avg_unique_queries_per_user': 0,
             'first_search': None,
             'last_search': None,
-            'client_totals': {}
         }
 
     total_searches, total_users, total_queries, total_pairs, first_date, last_date = row
 
-    # Client totals: union archived + live daily client stats
-    cursor.execute(f"""
-        SELECT client_id, SUM(search_count)::bigint
-        FROM ({DAILY_STATS_SQL}) combined
-        GROUP BY client_id
-    """)
-    client_totals = {r[0]: int(r[1]) for r in cursor.fetchall()}
     cursor.close()
 
     total_searches = int(total_searches) if total_searches else 0
@@ -161,7 +153,6 @@ def get_cumulative_stats(conn) -> Dict[str, Any]:
         'avg_unique_queries_per_user': avg_queries,
         'first_search': datetime.combine(first_date, datetime.min.time()).replace(tzinfo=timezone.utc).isoformat() if first_date else None,
         'last_search': datetime.combine(last_date, datetime.max.time()).replace(tzinfo=timezone.utc).isoformat() if last_date else None,
-        'client_totals': client_totals,
     }
 
 
@@ -255,24 +246,6 @@ def get_top_queries(conn) -> List[tuple]:
     return rows
 
 
-def get_query_length_distribution(conn) -> pd.DataFrame:
-    """Get all-time query length distribution from precomputed period table."""
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT query_length, unique_query_count
-        FROM period_query_length_dist
-        WHERE period_type = 'all_time' AND period_id = 'all_time'
-        ORDER BY query_length
-    """)
-    rows = cursor.fetchall()
-    cursor.close()
-
-    if not rows:
-        return pd.DataFrame(columns=['query_length', 'count'])
-
-    return pd.DataFrame(rows, columns=['query_length', 'count'])
-
-
 def get_period_stats(conn, start_date, end_date, period_type: str = None, period_id: str = None) -> Dict[str, Any]:
     """Get stats for a specific period using archived + live daily stats"""
     cursor = conn.cursor()
@@ -299,15 +272,6 @@ def get_period_stats(conn, start_date, end_date, period_type: str = None, period
     total_searches, total_users, first_date, last_date = result
     total_searches = int(total_searches) if total_searches else 0
     total_users = int(total_users) if total_users else 0
-
-    # Get per-client totals from archived + live daily stats
-    cursor.execute(f"""
-        SELECT client_id, SUM(search_count) as count
-        FROM ({base_query}) combined
-        WHERE date >= %s AND date <= %s
-        GROUP BY client_id
-    """, (start_date.date(), end_date.date()))
-    client_totals = {row[0]: int(row[1]) for row in cursor.fetchall()}
 
     cursor.close()
 
@@ -353,7 +317,6 @@ def get_period_stats(conn, start_date, end_date, period_type: str = None, period
         'avg_unique_queries_per_user': avg_unique_queries_per_user,
         'first_search': first_search.isoformat() if first_search else None,
         'last_search': last_search.isoformat() if last_search else None,
-        'client_totals': client_totals
     }
 
 
@@ -378,33 +341,6 @@ def get_period_top_queries(conn, period_type: str, period_id: str) -> List[tuple
     rows = cursor.fetchall()
     cursor.close()
     return rows
-
-
-def get_period_query_length_dist(conn, period_type: str, period_id: str) -> pd.DataFrame:
-    """Get query length distribution for a specific period from precomputed table.
-
-    Args:
-        conn: Database connection
-        period_type: 'week' or 'month'
-        period_id: Period identifier like '2026-01' or '2026-W04'
-
-    Returns:
-        DataFrame with query_length and count columns
-    """
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT query_length, unique_query_count as count
-        FROM period_query_length_dist
-        WHERE period_type = %s AND period_id = %s
-        ORDER BY query_length
-    """, (period_type, period_id))
-    rows = cursor.fetchall()
-    cursor.close()
-
-    if not rows:
-        return pd.DataFrame(columns=['query_length', 'count'])
-
-    return pd.DataFrame(rows, columns=['query_length', 'count'])
 
 
 def load_article_content(article_path: str = 'docs/article.md') -> Optional[str]:
@@ -1214,54 +1150,6 @@ def create_queries_data_table(top_queries: List[tuple], data_json_url: str) -> s
     '''
 
 
-def create_query_length_chart(df: pd.DataFrame) -> go.Figure:
-    """Create histogram of query length distribution (by word count)"""
-    df_filtered = df[df['query_length'] <= 100]
-
-    fig = go.Figure(data=[
-        go.Bar(
-            x=df_filtered['query_length'],
-            y=df_filtered['count'],
-            marker=dict(color='#444444', line=dict(color='black', width=1))
-        )
-    ])
-
-    fig.update_layout(
-        title='Search Query Length Distribution (Words)',
-        xaxis_title='Query Length (Number of Words)',
-        yaxis_title='Number of Unique Queries',
-        height=400,
-        template='plotly_white',
-        plot_bgcolor='white',
-        paper_bgcolor='white',
-        font=dict(color='black')
-    )
-    return fig
-
-
-def create_client_distribution_chart(client_totals: Dict[str, int]) -> go.Figure:
-    """Create pie chart of search distribution by client"""
-    grey_palette = ['#000000', '#555555', '#999999', '#333333', '#777777']
-
-    fig = go.Figure(data=[
-        go.Pie(
-            labels=list(client_totals.keys()),
-            values=list(client_totals.values()),
-            hole=0.3,
-            marker=dict(colors=grey_palette, line=dict(color='white', width=2))
-        )
-    ])
-
-    fig.update_layout(
-        title='Search Distribution by Geographic Client - Raw Data Collection',
-        height=400,
-        template='plotly_white',
-        paper_bgcolor='white',
-        font=dict(color='black')
-    )
-    return fig
-
-
 def generate_stats_grid_html(stats: Dict) -> str:
     """Generate the stats summary cards HTML."""
     days = format_days(stats['first_search'], stats['last_search'])
@@ -1396,15 +1284,12 @@ def generate_all_time_page(conn, cutoff_date=None, query_slug_map=None, blacklis
     top_queries = get_top_queries(conn)
     if blacklist:
         top_queries = [q for q in top_queries if not is_blacklisted(q[0], blacklist)]
-    query_length_dist = get_query_length_distribution(conn)
 
     # Create figures
     figures = {
         'daily_flow': create_daily_flow_chart(daily_stats) if not daily_stats.empty else None,
         'daily_unique_users': create_daily_unique_users_chart(daily_unique_users) if not daily_unique_users.empty else None,
-        'client_distribution': create_client_distribution_chart(stats['client_totals']) if stats['client_totals'] else None,
         'top_queries': create_top_queries_chart(top_queries) if top_queries else None,
-        'query_length': create_query_length_chart(query_length_dist) if not query_length_dist.empty else None
     }
 
     # Check for article mode
@@ -1444,21 +1329,18 @@ def generate_period_page(conn, period_type: str, period_info: Dict, cutoff_date=
 
     print(f"  Found {stats['total_searches']:,} searches for {period_label}")
 
-    # Get chart data (using precomputed tables for top_queries and query_length_dist)
+    # Get chart data (using precomputed tables for top_queries)
     daily_stats = get_daily_stats(conn, start_date, end_date)
     daily_unique_users = get_daily_unique_users(conn, start_date, end_date)
     top_queries = get_period_top_queries(conn, period_type, period_id)
     if blacklist:
         top_queries = [q for q in top_queries if not is_blacklisted(q[0], blacklist)]
-    query_length_dist = get_period_query_length_dist(conn, period_type, period_id)
 
     # Create figures
     figures = {
         'daily_flow': create_daily_flow_chart(daily_stats) if not daily_stats.empty else None,
         'daily_unique_users': create_daily_unique_users_chart(daily_unique_users) if not daily_unique_users.empty else None,
-        'client_distribution': create_client_distribution_chart(stats['client_totals']) if stats['client_totals'] else None,
         'top_queries': create_top_queries_chart(top_queries) if top_queries else None,
-        'query_length': create_query_length_chart(query_length_dist) if not query_length_dist.empty else None
     }
 
     # Generate HTML
@@ -1630,18 +1512,9 @@ def generate_period_html(stats: Dict, figures: Dict[str, go.Figure],
     {chart_html.get('top_queries', '<p>Not enough data</p>')}
 </div>
 
-<h2>Query Length Distribution</h2>
-<div class="chart">
-    {chart_html.get('query_length', '<p>Not enough data</p>')}
-</div>
-
 <h2>Data Collection Overview <span class="info-icon" onclick="this.classList.toggle('open')">i<span class="info-tooltip">Raw search events, including repeat searches by the same user.</span></span></h2>
 <div class="chart">
     {chart_html['daily_flow']}
-</div>
-
-<div class="chart">
-    {chart_html.get('client_distribution', '<p>Not enough data</p>')}
 </div>
 '''
     return front_matter + content

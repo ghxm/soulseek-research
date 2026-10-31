@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS stats_cumulative (
 INSERT INTO stats_cumulative (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
 
 -- Period-specific precomputed statistics tables
--- These store pre-aggregated top queries and query length distributions
+-- These store pre-aggregated top queries
 -- for each week/month to enable fast period page generation
 
 CREATE TABLE IF NOT EXISTS period_top_queries (
@@ -86,18 +86,6 @@ CREATE TABLE IF NOT EXISTS period_top_queries (
 
 CREATE INDEX IF NOT EXISTS idx_period_top_queries_lookup
 ON period_top_queries(period_type, period_id, rank);
-
-CREATE TABLE IF NOT EXISTS period_query_length_dist (
-    id SERIAL PRIMARY KEY,
-    period_type VARCHAR(10) NOT NULL,  -- 'week' or 'month'
-    period_id VARCHAR(20) NOT NULL,     -- '2026-01' or '2026-W04'
-    query_length INTEGER NOT NULL,
-    unique_query_count INTEGER NOT NULL,
-    UNIQUE(period_type, period_id, query_length)
-);
-
-CREATE INDEX IF NOT EXISTS idx_period_ql_dist_lookup
-ON period_query_length_dist(period_type, period_id);
 
 CREATE TABLE IF NOT EXISTS period_summary_stats (
     period_type VARCHAR(10) NOT NULL,  -- 'week', 'month', or 'all_time'
@@ -168,7 +156,7 @@ ON mv_daily_stats (date, client_id);
 
 -- NOTE: mv_top_queries, mv_query_length_dist, mv_summary_stats have been removed.
 -- Their data is now computed by refresh_period_stats.py (using polars over archived
--- Parquet + live MV data) and stored in period_top_queries, period_query_length_dist,
+-- Parquet + live MV data) and stored in period_top_queries
 -- and period_summary_stats with period_type='all_time'.
 "
 
