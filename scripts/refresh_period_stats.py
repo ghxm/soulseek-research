@@ -606,10 +606,10 @@ def polars_compute_all_summary_stats(
                   f"{row[2]} searches, {row[3]} users ({elapsed:.1f}s)")
             continue
 
-        # For periods that overlap with live data and are large, use SQL
-        # against the MV to avoid OOM from polars n_unique on 40M+ rows.
-        # For archived-only periods, polars streaming is fast and bounded.
-        if min_live_date is not None and end_date >= min_live_date:
+        # Periods entirely in live data use SQL against the MV to avoid OOM
+        # from polars n_unique on 40M+ rows. Periods with archived days scan
+        # Parquet + live, since the MV does not hold their archived days.
+        if min_live_date is not None and start_date >= min_live_date:
             row = _sql_compute_period_summary(conn, start_date, end_date)
         else:
             filtered = tuples_lf.filter(
