@@ -220,7 +220,8 @@ def export_daily_tuples_to_parquet(conn, month: str, archive_path: str) -> Tuple
     """Export daily search tuples for a month to Parquet.
 
     Reads from mv_daily_search_tuples via server-side cursor in chunks
-    to avoid OOM on 8 GB servers.
+    to avoid OOM on 8 GB servers. Returns the file path and the total
+    search count across the exported tuples.
     """
     filepath = os.path.join(archive_path, f"daily_tuples_{month}.parquet")
 
@@ -234,12 +235,14 @@ def export_daily_tuples_to_parquet(conn, month: str, archive_path: str) -> Tuple
 
     writer = None
     record_count = 0
+    search_total = 0
     try:
         while True:
             rows = cursor.fetchmany(cursor.itersize)
             if not rows:
                 break
             df = pd.DataFrame(rows, columns=['date', 'username', 'query_normalized', 'search_count'])
+            search_total += int(df['search_count'].sum())
             if writer is None:
                 import pyarrow as pa
                 import pyarrow.parquet as pq
@@ -257,7 +260,7 @@ def export_daily_tuples_to_parquet(conn, month: str, archive_path: str) -> Tuple
 
     file_size = os.path.getsize(filepath) if os.path.exists(filepath) else 0
     print(f"  Exported {record_count:,} daily tuples to {filepath} ({file_size:,} bytes)")
-    return filepath, record_count
+    return filepath, search_total
 
 
 def archive_daily_client_stats(conn, month: str):
@@ -407,7 +410,16 @@ def archive_month(conn, month: str, archive_path: str, delete_after: bool = Fals
     print(f"  Exported: {file_path} ({file_size:,} bytes)")
 
     # 2. Export daily search tuples to Parquet (for stats recomputation)
-    export_daily_tuples_to_parquet(conn, month, archive_path)
+    tuples_path, tuples_total = export_daily_tuples_to_parquet(conn, month, archive_path)
+
+    # A stale MV would drop days from the tuples: stop before anything is deleted
+    if tuples_total != record_count:
+        if os.path.exists(tuples_path):
+            os.remove(tuples_path)
+        raise RuntimeError(
+            f"{month}: tuples hold {tuples_total:,} searches, raw export {record_count:,}. "
+            f"mv_daily_search_tuples is stale; nothing was deleted, next run retries."
+        )
 
     # 3. Archive daily client stats to permanent table (for charts)
     archive_daily_client_stats(conn, month)
